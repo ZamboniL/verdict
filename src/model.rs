@@ -24,6 +24,10 @@ pub struct DLine {
     pub old_no: Option<usize>,
     pub new_no: Option<usize>,
     pub text: String,
+    /// Byte ranges of `text` that changed, word by word, against the line it's paired
+    /// with (a removed line with the added line that replaces it). Empty when there's
+    /// no pair or the two have too little in common for it to help.
+    pub emph: Vec<Range<usize>>,
 }
 
 impl DLine {
@@ -33,6 +37,7 @@ impl DLine {
             old_no,
             new_no,
             text,
+            emph: Vec::new(),
         }
     }
 }
@@ -437,6 +442,7 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
                 }
             }
         }
+        emphasize(&mut lines);
 
         let co = group[0].old_range().start..group[group.len() - 1].old_range().end;
         let cn = group[0].new_range().start..group[group.len() - 1].new_range().end;
@@ -461,6 +467,138 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
         });
     }
     hunks
+}
+
+/// Mark the words that changed in each removed line and the added line paired with
+/// it (paired as in the split view).
+fn emphasize(lines: &mut [DLine]) {
+    for (d, a) in split_pairs(lines) {
+        let (Some(d), Some(a)) = (d, a) else { continue };
+        if lines[d].kind != Kind::Del || lines[a].kind != Kind::Add {
+            continue;
+        }
+        let (old, new) = word_diff(&lines[d].text, &lines[a].text);
+        lines[d].emph = old;
+        lines[a].emph = new;
+    }
+}
+
+/// Words, runs of whitespace, and single punctuation characters.
+fn tokens(s: &str) -> Vec<&str> {
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut out = Vec::new();
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let k = class(c);
+        let mut end = i + c.len_utf8();
+        if k != 2 {
+            while let Some(&(j, d)) = it.peek() {
+                if class(d) != k {
+                    break;
+                }
+                end = j + d.len_utf8();
+                it.next();
+            }
+        }
+        out.push(&s[i..end]);
+    }
+    out
+}
+
+/// Byte ranges that differ between `old` and `new`, word by word, for each side.
+/// Both empty when the lines share less than half their content: marking nearly
+/// everything would only add noise.
+pub fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    const MAX: usize = 2_000;
+    if old.len() > MAX || new.len() > MAX {
+        return Default::default();
+    }
+    let (a, b) = (tokens(old), tokens(new));
+    let offsets = |t: &[&str]| -> Vec<usize> {
+        let mut v = vec![0];
+        for tok in t {
+            v.push(v.last().unwrap() + tok.len());
+        }
+        v
+    };
+    let (oa, ob) = (offsets(&a), offsets(&b));
+    let solid = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
+    let (mut ea, mut eb, mut same) = (Vec::new(), Vec::new(), 0);
+    for op in capture_diff_slices(Algorithm::Myers, &a, &b) {
+        let (tag, o, n) = op.as_tag_tuple();
+        if tag == DiffTag::Equal {
+            same += a[o].iter().map(|t| solid(t)).sum::<usize>();
+            continue;
+        }
+        if !o.is_empty() {
+            ea.push(oa[o.start]..oa[o.end]);
+        }
+        if !n.is_empty() {
+            eb.push(ob[n.start]..ob[n.end]);
+        }
+    }
+    let longest = solid(old).max(solid(new));
+    if longest == 0 || same * 2 < longest {
+        return Default::default();
+    }
+    (join_ranges(ea, old), join_ranges(eb, new))
+}
+
+/// Merge ranges separated only by whitespace, so a changed phrase reads as one, and
+/// trim the whitespace at their edges (unless whitespace is all that changed).
+fn join_ranges(ranges: Vec<Range<usize>>, s: &str) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for r in ranges {
+        let text = &s[r.clone()];
+        let trimmed = text.trim();
+        let r = if trimmed.is_empty() {
+            r
+        } else {
+            let lead = text.len() - text.trim_start().len();
+            r.start + lead..r.start + lead + trimmed.len()
+        };
+        match out.last_mut() {
+            Some(last) if s[last.end..r.start].chars().all(char::is_whitespace) => last.end = r.end,
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Split consecutive pieces of a line (`segs`, e.g. highlighted spans) at the edges
+/// of `emph`, flagging the pieces inside an emphasized range.
+pub fn cut_emph<'a, T: Copy>(
+    segs: impl IntoIterator<Item = (&'a str, T)>,
+    emph: &[Range<usize>],
+) -> Vec<(&'a str, T, bool)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for (text, t) in segs {
+        let mut rest = text;
+        while !rest.is_empty() {
+            let (inside, until) = match emph.iter().find(|r| r.end > pos) {
+                Some(r) if r.start <= pos => (true, r.end),
+                Some(r) => (false, r.start),
+                None => (false, usize::MAX),
+            };
+            let mut take = (until - pos).min(rest.len());
+            while !rest.is_char_boundary(take) {
+                take += 1;
+            }
+            out.push((&rest[..take], t, inside));
+            rest = &rest[take..];
+            pos += take;
+        }
+    }
+    out
 }
 
 /// A row of the side-by-side view: indices of its old-side and new-side lines.
@@ -1134,6 +1272,58 @@ mod tests {
         f.hunks[1].note = "keep lowercase".into();
         let m = feedback(std::slice::from_ref(&f), "", &git::Source::Worktree).unwrap();
         assert!(m.contains("keep lowercase") && m.contains("-l") && m.contains("+L"));
+    }
+
+    #[test]
+    fn word_diff_marks_changed_words() {
+        let (old, new) = word_diff("let x = foo(a, b);", "let x = bar(a, c);");
+        let at = |s: &str, r: &[Range<usize>]| {
+            r.iter()
+                .map(|r| s[r.clone()].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at("let x = foo(a, b);", &old), ["foo", "b"]);
+        assert_eq!(at("let x = bar(a, c);", &new), ["bar", "c"]);
+        // Rewritten lines get no emphasis at all.
+        assert_eq!(word_diff("alpha beta", "gamma delta"), (vec![], vec![]));
+        // Words separated only by spaces merge into one range.
+        let (o, _) = word_diff(
+            "call(one two, keep_this_long_name)",
+            "call(three four, keep_this_long_name)",
+        );
+        assert_eq!(at("call(one two, keep_this_long_name)", &o), ["one two"]);
+    }
+
+    #[test]
+    fn hunks_pair_removed_and_added_lines_for_emphasis() {
+        let f = file("a\nfn run(x: u8) {}\nc\n", "a\nfn run(x: u16) {}\nc\n");
+        let lines = &f.hunks[0].lines;
+        let del = lines.iter().find(|l| l.kind == Kind::Del).unwrap();
+        let add = lines.iter().find(|l| l.kind == Kind::Add).unwrap();
+        assert_eq!(&del.text[del.emph[0].clone()], "u8");
+        assert_eq!(&add.text[add.emph[0].clone()], "u16");
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l.kind == Kind::Ctx)
+                .all(|l| l.emph.is_empty())
+        );
+    }
+
+    #[test]
+    fn cut_emph_splits_spans_at_edges() {
+        let segs = [("let ", 1), ("x = 10", 2)];
+        let got = cut_emph(segs, &[2..5, 9..10]);
+        assert_eq!(
+            got,
+            [
+                ("le", 1, false),
+                ("t ", 1, true),
+                ("x", 2, true),
+                (" = 1", 2, false),
+                ("0", 2, true)
+            ]
+        );
     }
 
     fn git_repo(name: &str) -> (std::path::PathBuf, impl Fn(&[&str])) {

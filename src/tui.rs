@@ -35,6 +35,9 @@ mod pal {
     pub const DIM: Color = Color::Rgb(0x7a, 0x80, 0x8c);
     pub const ADD_BG: Color = Color::Rgb(0x1d, 0x33, 0x26);
     pub const DEL_BG: Color = Color::Rgb(0x3a, 0x20, 0x24);
+    /// The words that changed inside an added / removed line.
+    pub const ADD_EMPH: Color = Color::Rgb(0x2c, 0x5c, 0x3c);
+    pub const DEL_EMPH: Color = Color::Rgb(0x6e, 0x2e, 0x37);
     /// The empty side of a split row.
     pub const EMPTY: Color = Color::Rgb(0x1c, 0x1e, 0x24);
     pub const GREEN: Color = Color::Rgb(0x5f, 0xc2, 0x7e);
@@ -1364,7 +1367,7 @@ impl App {
             Kind::Del => hl.old.get(l.old_no? - 1),
             _ => hl.new.get(l.new_no? - 1),
         });
-        let segs: Vec<(String, Style)> = match hl_line {
+        let raw: Vec<(&str, Style)> = match hl_line {
             Some(sp) if !sp.is_empty() => sp
                 .iter()
                 .map(|s| {
@@ -1375,14 +1378,21 @@ impl App {
                     if s.underline {
                         st = st.add_modifier(Modifier::UNDERLINED);
                     }
-                    (
-                        s.text.trim_end_matches(['\n', '\r']).replace('\t', "    "),
-                        st,
-                    )
+                    (s.text.trim_end_matches(['\n', '\r']), st)
                 })
                 .collect(),
-            _ => vec![(l.text.replace('\t', "    "), fg(pal::TEXT))],
+            _ => vec![(l.text.as_str(), fg(pal::TEXT))],
         };
+        let emph = match l.kind {
+            Kind::Add => pal::ADD_EMPH,
+            _ => pal::DEL_EMPH,
+        };
+        let segs = model::cut_emph(raw, &l.emph)
+            .into_iter()
+            .map(|(text, st, inside)| {
+                let st = if inside { st.bg(emph) } else { st };
+                (text.replace('\t', "    "), st)
+            });
         let mut skip = self.hscroll;
         for (text, st) in segs {
             let n = text.chars().count();

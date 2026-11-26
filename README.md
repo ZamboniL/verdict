@@ -37,6 +37,8 @@ verdict does one job:
 - **Full file** view: show the whole file, with unchanged code between the hunk
   cards, when 3 lines of context aren't enough.
 - **Split view**: old and new side by side, in the window and in the terminal.
+- **Word-level highlighting**: inside a changed line, the words that actually
+  changed are marked.
 - **Renames** are shown as renames, with only the edits made along with the move,
   instead of a whole file deleted and another added.
 - Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
@@ -367,7 +369,6 @@ verdict init       create the config directory with an example config.toml
 - Optional check command, such as `cargo check`, run after applying decisions,
   with failures added to the feedback.
 - Commit approved changes from inside verdict.
-- Word-level highlighting inside changed lines.
 - Native macOS and Windows builds.
 - Integrations for other agents beyond Claude Code's hooks.
 

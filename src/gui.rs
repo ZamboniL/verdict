@@ -47,6 +47,9 @@ mod pal {
     pub const ADD_GUTTER: Color32 = c(0x1b3424);
     pub const DEL_BG: Color32 = c(0x2b171b);
     pub const DEL_GUTTER: Color32 = c(0x3b1e24);
+    /// The words that changed inside an added / removed line.
+    pub const ADD_EMPH: Color32 = c(0x23533a);
+    pub const DEL_EMPH: Color32 = c(0x63262f);
     pub const GREEN: Color32 = c(0x5cc98a);
     pub const RED: Color32 = c(0xec6f7a);
     pub const BLUE: Color32 = c(0x6cb4f5);
@@ -1832,17 +1835,38 @@ fn paint_code(
         _ => hl.new.get(l.new_no? - 1),
     });
     let mut job = LayoutJob::default();
-    match spans {
-        Some(spans) if !spans.is_empty() => append_spans(&mut job, spans, c.mono, true),
-        _ => job.append(
-            &l.text.replace('\t', "    "),
+    let plain = crate::highlight::Span {
+        rgb: [0xe2, 0xe5, 0xea],
+        italic: false,
+        underline: false,
+        text: l.text.clone(),
+    };
+    let segs: Vec<(&str, &crate::highlight::Span)> = match spans {
+        Some(spans) if !spans.is_empty() => spans.iter().map(|s| (s.text.as_str(), s)).collect(),
+        _ => vec![(plain.text.as_str(), &plain)],
+    };
+    let emph = match l.kind {
+        Kind::Add => pal::ADD_EMPH,
+        _ => pal::DEL_EMPH,
+    };
+    for (text, sp, inside) in model::cut_emph(segs, &l.emph) {
+        let color = Color32::from_rgb(sp.rgb[0], sp.rgb[1], sp.rgb[2]);
+        job.append(
+            &text.replace('\t', "    "),
             0.0,
             TextFormat {
                 font_id: c.mono.clone(),
-                color: pal::TEXT,
+                color,
+                background: if inside { emph } else { Color32::TRANSPARENT },
+                italics: sp.italic,
+                underline: if sp.underline {
+                    Stroke::new(1.0, color)
+                } else {
+                    Stroke::NONE
+                },
                 ..Default::default()
             },
-        ),
+        );
     }
     let galley = painter.layout_job(job);
     painter.galley(at + vec2(code_dx, 0.0), galley, pal::TEXT);
