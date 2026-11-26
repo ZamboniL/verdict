@@ -333,12 +333,7 @@ pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>,
             .with_app_id("verdict")
             .with_inner_size([1280.0, 860.0])
             .with_min_inner_size([640.0, 400.0]),
-        event_loop_builder: prefer_x11().then(|| -> eframe::EventLoopBuilderHook {
-            Box::new(|b| {
-                use winit::platform::x11::EventLoopBuilderExtX11;
-                b.with_x11();
-            })
-        }),
+        event_loop_builder: event_loop_hook(),
         ..Default::default()
     };
     let res = result.clone();
@@ -374,6 +369,19 @@ pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>,
     Ok(result.take())
 }
 
+/// On Linux, switches winit to X11 when `prefer_x11` says so. Other platforms have
+/// a single backend, and winit doesn't build its X11 module for them.
+fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
+    #[cfg(target_os = "linux")]
+    if prefer_x11() {
+        return Some(Box::new(|b| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            b.with_x11();
+        }));
+    }
+    None
+}
+
 /// Whether to open the window through X11 instead of Wayland: if only one of the two
 /// display servers is reachable, use it; if both are, use Wayland only when
 /// `XDG_SESSION_TYPE=wayland`.
@@ -381,10 +389,8 @@ pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>,
 /// This matters on WSLg, which offers both and sets no session type: there it picks
 /// X11, which avoids a WSLg compositor crash when a Wayland window is resized.
 /// `VERDICT_GUI_BACKEND=wayland|x11` overrides.
+#[cfg(target_os = "linux")]
 fn prefer_x11() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
     match std::env::var("VERDICT_GUI_BACKEND").as_deref() {
         Ok("x11") => return true,
         Ok("wayland") => return false,
@@ -412,6 +418,7 @@ fn prefer_x11() -> bool {
 }
 
 /// The session type decides, unless exactly one display server is reachable.
+#[cfg(target_os = "linux")]
 fn pick_x11(session_type: Option<&str>, wayland: bool, x11: bool) -> bool {
     let use_wayland = if wayland != x11 {
         wayland
@@ -422,6 +429,7 @@ fn pick_x11(session_type: Option<&str>, wayland: bool, x11: bool) -> bool {
 }
 
 /// WAYLAND_SOCKET, then WAYLAND_DISPLAY, then a wayland-0 socket in XDG_RUNTIME_DIR.
+#[cfg(target_os = "linux")]
 fn wayland_reachable(
     socket: Option<String>,
     display: Option<String>,
@@ -437,6 +445,7 @@ fn wayland_reachable(
 }
 
 /// A shared library is in LD_LIBRARY_PATH or a usual system directory.
+#[cfg(target_os = "linux")]
 fn has_lib(name: &str) -> bool {
     let extra = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     extra
@@ -1906,6 +1915,7 @@ mod tests {
         assert!(parse_steps(r#""open"#).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn backend_rule() {
         // WSLg: both reachable, no session type -> X11
@@ -1919,6 +1929,7 @@ mod tests {
         assert!(pick_x11(Some("wayland"), false, true));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wayland_detection_order() {
         let s = |v: &str| Some(v.to_owned());
