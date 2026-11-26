@@ -332,7 +332,10 @@ for an open session is kept in `.git/verdict/pending/<id>.md`.
 
 **Which session changed what.** Several agent sessions can work in the same repo,
 or just chat, so verdict tracks changes per session. A snapshot of content hashes
-taken at the start of each turn tells it what changed during that turn. The
+taken at the start of each turn tells it what changed during that turn. A turn
+runs from your prompt until the agent stops: prompts queued while it works (a
+message you type meanwhile, a background task finishing) belong to the same turn,
+and the changes of a turn you interrupt are shown with the next one. The
 session's transcript tells it whether that session could have made the change:
 
 - **The session only chatted:** no review.

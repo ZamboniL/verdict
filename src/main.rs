@@ -428,9 +428,7 @@ fn hook(flag: Option<Choice>) -> ExitCode {
 
     match v["hook_event_name"].as_str() {
         Some("UserPromptSubmit") => {
-            if let Ok(snap) = session::snapshot(&repo) {
-                session::save(&repo, sess, &snap);
-            }
+            session::start_turn(&repo, sess, transcript.as_deref().map(Path::new));
             handoff::update(&repo, sess, |o| {
                 note(o);
                 o.ended = false;
@@ -452,18 +450,19 @@ fn hook(flag: Option<Choice>) -> ExitCode {
 
     // Stop. Without a snapshot from the start of this turn we can't tell this
     // session's changes from anyone else's, so stay out of the way.
-    let Some(base) = session::load(&repo, sess) else {
+    let Some(turn) = session::load(&repo, sess) else {
         return ExitCode::SUCCESS;
     };
     let Ok(now) = session::snapshot(&repo) else {
+        session::end_turn(&repo, sess);
         return ExitCode::SUCCESS;
     };
-    let mut touched = session::touched(&base, &now);
+    let mut touched = session::touched(&turn.base, &now);
     // Cross-check with what this session actually did: another session working in
     // the same repo during this turn would otherwise show up here.
-    let activity = v["transcript_path"]
-        .as_str()
-        .map(|t| session::turn_activity(Path::new(t), &repo))
+    let activity = transcript
+        .as_deref()
+        .map(|t| session::turn_activity(Path::new(t), &repo, turn.transcript_at))
         .unwrap_or(session::Activity::Unknown);
     match activity {
         session::Activity::NoEdits => touched.clear(),
@@ -471,11 +470,15 @@ fn hook(flag: Option<Choice>) -> ExitCode {
         session::Activity::Any | session::Activity::Unknown => {}
     }
     if touched.is_empty() {
+        session::end_turn(&repo, sess);
         return ExitCode::SUCCESS;
     }
     let files = match model::load_only(&repo, Some(&touched)) {
         Ok(f) if !f.is_empty() => f,
-        _ => return ExitCode::SUCCESS,
+        _ => {
+            session::end_turn(&repo, sess);
+            return ExitCode::SUCCESS;
+        }
     };
     // Recorded before the review opens: if it's closed, or the hook times out, a
     // review by hand later still knows these changes are this session's.
@@ -502,10 +505,17 @@ fn hook(flag: Option<Choice>) -> ExitCode {
                 .and_then(|t| session::last_reply(Path::new(t)))
         });
     let outcome = ui::run(repo.clone(), review, ui::Mode::Hook, choice, &cfg);
-    // Whatever happened, the reviewed state is the new baseline: if the agent
-    // continues, the next Stop shows only what it changes in response.
+    // Whatever happened, the reviewed state is the new baseline. Feedback sends the
+    // agent back to work in the same turn, and the next Stop shows only what it
+    // changes in response; otherwise the turn is over.
+    let continues = matches!(&outcome, Ok(Some(ui::Outcome { message: Some(_) })));
     if let Ok(snap) = session::snapshot(&repo) {
-        session::save(&repo, sess, &snap);
+        let next = if continues {
+            session::Turn::open(snap.clone(), transcript.as_deref().map(Path::new))
+        } else {
+            session::Turn::closed(snap.clone())
+        };
+        session::save(&repo, sess, &next);
         // What's left of the session's changes after the review. Files no longer
         // in the snapshot were fully approved (staged) or reverted.
         handoff::update(&repo, sess, |o| {
@@ -516,6 +526,8 @@ fn hook(flag: Option<Choice>) -> ExitCode {
                 };
             }
         });
+    } else if !continues {
+        session::end_turn(&repo, sess);
     }
     match outcome {
         Ok(Some(ui::Outcome { message: Some(m) })) => {

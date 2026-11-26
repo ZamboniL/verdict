@@ -6,8 +6,14 @@
 //! and review only files whose content changed during the turn. A session that
 //! only chatted changes nothing, so it never opens a review, even if the repo has
 //! unstaged changes from someone else.
+//!
+//! A turn lasts from a prompt to the `Stop` that ends it. `UserPromptSubmit` also
+//! fires in the middle of a turn, for prompts queued while the agent works (a
+//! message typed meanwhile, a background task finishing). Those don't start a new
+//! turn, or what the agent changed before them would never be reviewed.
 
 use crate::git::{self, Status};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -66,19 +72,74 @@ fn file(repo: &Path, session: &str) -> Option<PathBuf> {
     Some(dir(repo)?.join(format!("{}.json", safe_id(session)?)))
 }
 
-pub fn load(repo: &Path, session: &str) -> Option<Snapshot> {
-    let text = std::fs::read_to_string(file(repo, session)?).ok()?;
-    serde_json::from_str(&text).ok()
+/// Where a session's current turn started.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct Turn {
+    /// The working tree when the turn started.
+    pub base: Snapshot,
+    /// A `Stop` hasn't ended the turn yet.
+    pub open: bool,
+    /// How long the transcript was when the turn started, in bytes, so its activity
+    /// is read from there. `None` if unknown.
+    pub transcript_at: Option<u64>,
 }
 
-pub fn save(repo: &Path, session: &str, snap: &Snapshot) {
+impl Turn {
+    /// A turn under way since now: `base` is the working tree, and the turn's
+    /// activity is whatever `transcript` records from here on.
+    pub fn open(base: Snapshot, transcript: Option<&Path>) -> Turn {
+        Turn {
+            base,
+            open: true,
+            transcript_at: transcript
+                .and_then(|t| std::fs::metadata(t).ok())
+                .map(|m| m.len()),
+        }
+    }
+
+    /// An ended turn: the next prompt starts a new one.
+    pub fn closed(base: Snapshot) -> Turn {
+        Turn {
+            base,
+            open: false,
+            transcript_at: None,
+        }
+    }
+}
+
+/// On a prompt: start a turn, unless one is already under way.
+pub fn start_turn(repo: &Path, session: &str, transcript: Option<&Path>) {
+    if load(repo, session).is_some_and(|t| t.open) {
+        return;
+    }
+    if let Ok(snap) = snapshot(repo) {
+        save(repo, session, &Turn::open(snap, transcript));
+    }
+}
+
+/// End the session's turn without moving its baseline.
+pub fn end_turn(repo: &Path, session: &str) {
+    if let Some(t) = load(repo, session).filter(|t| t.open) {
+        save(repo, session, &Turn::closed(t.base));
+    }
+}
+
+pub fn load(repo: &Path, session: &str) -> Option<Turn> {
+    let text = std::fs::read_to_string(file(repo, session)?).ok()?;
+    serde_json::from_str(&text)
+        .ok()
+        // Older versions saved the bare snapshot.
+        .or_else(|| serde_json::from_str(&text).ok().map(Turn::closed))
+}
+
+pub fn save(repo: &Path, session: &str, turn: &Turn) {
     let (Some(d), Some(f)) = (dir(repo), file(repo, session)) else {
         return;
     };
     if std::fs::create_dir_all(&d).is_err() {
         return;
     }
-    if let Ok(text) = serde_json::to_string(snap) {
+    if let Ok(text) = serde_json::to_string(turn) {
         let _ = std::fs::write(f, text);
     }
     // Forget sessions idle for a week.
@@ -110,12 +171,17 @@ pub enum Activity {
 const PATH_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const OPAQUE_TOOLS: &[&str] = &["Bash", "Agent", "Task"];
 
-pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
+/// `from` is where the turn starts in the transcript, in bytes (see
+/// [`Turn::transcript_at`]). Without it, the turn starts at the last prompt.
+pub fn turn_activity(transcript: &Path, repo: &Path, from: Option<u64>) -> Activity {
     let Ok(text) = std::fs::read_to_string(transcript) else {
         return Activity::Unknown;
     };
+    // A transcript shorter than `from` was rewritten: fall back to prompts.
+    let turn = from.and_then(|n| text.get(usize::try_from(n).ok()?..));
     let repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    let mut saw_prompt = false;
+    let text = turn.unwrap_or(&text);
+    let mut saw_prompt = turn.is_some();
     let mut opaque = false;
     let mut paths = HashSet::new();
     for line in text.lines() {
@@ -125,7 +191,7 @@ pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
         let content = &v["message"]["content"];
         match v["type"].as_str() {
             Some("user") => {
-                if is_prompt(&v) {
+                if turn.is_none() && is_prompt(&v) {
                     saw_prompt = true;
                     opaque = false;
                     paths.clear();
@@ -316,7 +382,7 @@ mod tests {
             user(r#""thanks, how does this work?""#),
             tool("Read", r#"{"file_path":"/x"}"#),
         ]);
-        assert_eq!(turn_activity(&f, &repo), Activity::NoEdits);
+        assert_eq!(turn_activity(&f, &repo, None), Activity::NoEdits);
 
         // This turn edited a.rs (tool results don't start a new turn).
         write(&[
@@ -326,20 +392,42 @@ mod tests {
             tool("Write", r#"{"file_path":"/elsewhere/x"}"#),
         ]);
         assert_eq!(
-            turn_activity(&f, &repo),
+            turn_activity(&f, &repo, None),
             Activity::Paths(["src/a.rs".to_string()].into())
         );
 
         // A shell command makes it opaque.
         write(&[user(r#""go""#), tool("Bash", r#"{"command":"sed -i ..."}"#)]);
-        assert_eq!(turn_activity(&f, &repo), Activity::Any);
+        assert_eq!(turn_activity(&f, &repo, None), Activity::Any);
 
         // Meta messages don't start turns; no prompt at all means unknown.
         write(&[
             r#"{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"x"}]}}"#
                 .into(),
         ]);
-        assert_eq!(turn_activity(&f, &repo), Activity::Unknown);
+        assert_eq!(turn_activity(&f, &repo, None), Activity::Unknown);
+
+        // From where the turn started, a prompt queued mid-turn doesn't hide what
+        // came before it.
+        let before = [user(r#""old turn""#), tool("Bash", r#"{"command":"x"}"#)];
+        write(&before);
+        let from = std::fs::metadata(&f).unwrap().len();
+        let mut lines = before.to_vec();
+        lines.extend([
+            user(r#""fix it""#),
+            tool("Edit", &format!(r#"{{"file_path":"{a}"}}"#)),
+            user(r#""<task-notification>build done</task-notification>""#),
+            tool("Read", r#"{"file_path":"/x"}"#),
+        ]);
+        write(&lines);
+        assert_eq!(
+            turn_activity(&f, &repo, Some(from)),
+            Activity::Paths(["src/a.rs".to_string()].into())
+        );
+        // Without it, the queued prompt looks like the turn's start.
+        assert_eq!(turn_activity(&f, &repo, None), Activity::NoEdits);
+        // A rewritten transcript, shorter than the offset, falls back to prompts.
+        assert_eq!(turn_activity(&f, &repo, Some(1 << 40)), Activity::NoEdits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -374,8 +462,8 @@ mod tests {
         // Someone else's leftover change, present before the turn starts.
         std::fs::write(dir.join("a.txt"), "a changed by another session\n").unwrap();
         let base = snapshot(&dir).unwrap();
-        save(&dir, "sess-1", &base);
-        assert_eq!(load(&dir, "sess-1").unwrap(), base);
+        save(&dir, "sess-1", &Turn::closed(base.clone()));
+        assert_eq!(load(&dir, "sess-1").unwrap().base, base);
 
         // A chat-only turn: nothing touched.
         assert!(touched(&base, &snapshot(&dir).unwrap()).is_empty());
@@ -391,6 +479,49 @@ mod tests {
         // Editing the leftover file again during the turn does count.
         std::fs::write(dir.join("a.txt"), "a edited this turn\n").unwrap();
         assert!(touched(&base, &snapshot(&dir).unwrap()).contains("a.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prompt_mid_turn_keeps_the_turns_baseline() {
+        let dir = std::env::temp_dir().join(format!("verdict-turn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+
+        // The turn starts, then the agent writes a file.
+        start_turn(&dir, "s", None);
+        std::fs::write(dir.join("early.txt"), "1\n").unwrap();
+        // A prompt queued mid-turn (a background task finished) changes nothing.
+        start_turn(&dir, "s", None);
+        std::fs::write(dir.join("late.txt"), "2\n").unwrap();
+        let turn = load(&dir, "s").unwrap();
+        assert!(turn.open);
+        let mut t: Vec<_> = touched(&turn.base, &snapshot(&dir).unwrap())
+            .into_iter()
+            .collect();
+        t.sort();
+        assert_eq!(t, ["early.txt", "late.txt"]);
+
+        // Once Stop ends the turn, the next prompt starts a new one.
+        end_turn(&dir, "s");
+        assert!(!load(&dir, "s").unwrap().open);
+        start_turn(&dir, "s", None);
+        let turn = load(&dir, "s").unwrap();
+        assert!(turn.open);
+        assert!(touched(&turn.base, &snapshot(&dir).unwrap()).is_empty());
+
+        // A baseline saved by an older version (a bare snapshot) still loads.
+        let old = r#"{"x.txt":"abc"}"#;
+        std::fs::write(file(&dir, "old").unwrap(), old).unwrap();
+        let turn = load(&dir, "old").unwrap();
+        assert_eq!(turn.base.get("x.txt").map(String::as_str), Some("abc"));
+        assert!(!turn.open);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
