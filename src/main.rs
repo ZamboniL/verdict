@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+mod draft;
 mod frontend;
 mod git;
 #[cfg(feature = "gui")]
@@ -159,7 +160,7 @@ fn manual(args: &[String], staged: bool, flag: Option<Choice>) -> ExitCode {
     match frontend::run(repo.clone(), review, frontend::Mode::Manual, choice, &cfg) {
         Ok(Some(frontend::Outcome { message: Some(m) })) => {
             print!("{m}");
-            if let Some(p) = git_dir(&repo) {
+            if let Some(p) = git::git_dir(&repo) {
                 let _ = std::fs::write(p.join("verdict-feedback.md"), &m);
             }
             ExitCode::SUCCESS
@@ -268,11 +269,6 @@ fn init() -> ExitCode {
         dir.display()
     );
     ExitCode::SUCCESS
-}
-
-fn git_dir(repo: &Path) -> Option<PathBuf> {
-    let out = git::run(repo, &["rev-parse", "--absolute-git-dir"]).ok()?;
-    Some(PathBuf::from(String::from_utf8(out).ok()?.trim()))
 }
 
 /// Claude Code hook entry point, for two events:

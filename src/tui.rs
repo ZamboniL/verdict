@@ -4,6 +4,7 @@
 //! It draws on /dev/tty rather than stdout, so the feedback printed on stdout at the
 //! end can still be piped. Long text (multi-line notes, hunk edits) goes to $EDITOR.
 
+use crate::draft::Drafts;
 use crate::frontend::{Mode, Outcome, REG, hl_jobs, run_highlighter};
 use crate::git::Status;
 use crate::model::{self, DLine, Decision, FileHl, Kind};
@@ -272,11 +273,13 @@ struct App {
     list_area: Rect,
     visible: Vec<(usize, Option<usize>)>,
     list_top: usize,
+    drafts: Drafts,
 }
 
-pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
+pub fn run(repo: PathBuf, mut review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
     let (tx, rx) = mpsc::channel();
     let jobs = hl_jobs(&review.files);
+    let (drafts, restored) = Drafts::open(&repo, &mut review);
     std::thread::spawn(move || run_highlighter(jobs, tx, || {}));
     let mut app = App {
         repo,
@@ -293,7 +296,13 @@ pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>,
         list_area: Rect::default(),
         visible: Vec::new(),
         list_top: 0,
+        drafts,
     };
+    if restored > 0 {
+        app.info(format!(
+            "restored your unsubmitted review of {restored} file(s). x clears a hunk"
+        ));
+    }
     install_panic_hook();
     let mut tty = Tty::open()?;
     let io = |e: std::io::Error| e.to_string();
@@ -302,6 +311,9 @@ pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>,
             if let Some(f) = app.r.files.get_mut(i) {
                 f.hl = Some(hl);
             }
+        }
+        if !app.quit {
+            app.drafts.save(&app.r);
         }
         tty.term.draw(|f| app.draw(f)).map_err(io)?;
         if !event::poll(Duration::from_millis(100)).map_err(io)? {
@@ -439,6 +451,7 @@ impl App {
     fn submit(&mut self) {
         match self.r.submit(&self.repo) {
             Ok(message) => {
+                self.drafts.discard();
                 self.result = Some(Outcome { message });
                 self.quit = true;
             }
@@ -480,6 +493,7 @@ impl App {
             State::Input(_) => return self.input_key(k),
             State::ConfirmQuit => {
                 if matches!(k.code, KeyCode::Char('y' | 'Y')) {
+                    self.drafts.discard();
                     self.quit = true;
                 } else {
                     self.state = State::Normal;

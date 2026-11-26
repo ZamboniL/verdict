@@ -41,6 +41,8 @@ verdict does one job:
   changed are marked.
 - **Renames** are shown as renames, with only the edits made along with the move,
   instead of a whole file deleted and another added.
+- **Nothing gets lost**: an unsubmitted review is saved as you go and comes back
+  after a crash, a closed window or a hook timeout.
 - Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
   gutter. Cards fold away when you're done with them.
 - Syntax highlighting for about 200 languages out of the box. You can add more
@@ -254,6 +256,13 @@ it sees a deleted file and an untracked file. verdict pairs a deleted file with 
 added file when at least half their lines match, like git's own rename detection,
 and shows the pair as one renamed file. Approving any of its hunks stages the move.
 Rejecting all of them moves the file back.
+
+**Unsubmitted reviews.** Your decisions, notes and edits are saved in
+`.git/verdict/draft.json` as you go. If verdict closes before you submit, the next
+review of the same diff starts where you left off. A draft only comes back for
+files whose content is exactly what you reviewed. Submitting removes the draft,
+and so do **Skip** in the window and quitting with `q` in the terminal, since
+you're discarding the review on purpose. Drafts older than 14 days are dropped.
 
 **Which session changed what.** Several agent sessions can work in the same repo,
 or just chat, so verdict tracks changes per session. A snapshot of content hashes

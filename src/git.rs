@@ -241,6 +241,12 @@ pub fn mode_at(repo: &Path, rev: &str, path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The repository's git directory (`.git`, or the worktree's own git dir).
+pub fn git_dir(repo: &Path) -> Option<PathBuf> {
+    let out = run(repo, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    Some(PathBuf::from(String::from_utf8(out).ok()?.trim()))
+}
+
 pub fn index_blob(repo: &Path, path: &str) -> Result<Vec<u8>> {
     run(repo, &["cat-file", "blob", &format!(":{path}")])
 }

@@ -50,9 +50,7 @@ pub fn touched(base: &Snapshot, now: &Snapshot) -> HashSet<String> {
 }
 
 fn dir(repo: &Path) -> Option<PathBuf> {
-    let out = git::run(repo, &["rev-parse", "--absolute-git-dir"]).ok()?;
-    let gd = PathBuf::from(String::from_utf8(out).ok()?.trim());
-    Some(gd.join("verdict").join("sessions"))
+    Some(git::git_dir(repo)?.join("verdict").join("sessions"))
 }
 
 fn file(repo: &Path, session: &str) -> Option<PathBuf> {

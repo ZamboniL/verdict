@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! egui review window.
 
+use crate::draft::Drafts;
 use crate::frontend::{Mode, Outcome, REG, hl_jobs, run_highlighter};
 use crate::highlight::Line;
 use crate::model::{self, Decision, FileDiff, FileHl, Hunk, Kind};
@@ -325,8 +326,19 @@ fn progress_bar(ui: &mut egui::Ui, c: &model::Counts, width: f32) {
     }
 }
 
-pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
+pub fn run(repo: PathBuf, mut review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
     let result: Rc<RefCell<Option<Outcome>>> = Rc::default();
+    let capture = Capture::from_env();
+    let (drafts, restored) = if capture.is_some() {
+        (Drafts::off(), 0)
+    } else {
+        Drafts::open(&repo, &mut review)
+    };
+    let notice = (restored > 0).then(|| {
+        format!(
+            "Restored your unsubmitted review of {restored} file(s). Press x on a hunk to clear it."
+        )
+    });
     let name = repo
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -365,7 +377,9 @@ pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>,
                 focus_file_note: None,
                 show_agent: false,
                 hl_left,
-                capture: Capture::from_env(),
+                capture,
+                drafts,
+                notice,
             }))
         }),
     )
@@ -529,6 +543,10 @@ struct App {
     hl_left: usize,
     /// Scripted screenshot run (`VERDICT_SCREENSHOT`), for development and docs.
     capture: Option<Capture>,
+    /// The review saved as you go, until it's submitted or skipped.
+    drafts: Drafts,
+    /// Something to tell the reviewer, shown in the bottom bar until dismissed.
+    notice: Option<String>,
 }
 
 impl App {
@@ -558,6 +576,7 @@ impl App {
         }
         match self.r.submit(&self.repo) {
             Ok(message) => {
+                self.drafts.discard();
                 *self.result.borrow_mut() = Some(Outcome { message });
                 self.done = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -719,9 +738,10 @@ impl App {
                 }
                 ui.add_space(10.0);
                 if button(ui, "Skip", None, Look::Plain, false, true)
-                    .on_hover_text("Close without changing anything")
+                    .on_hover_text("Close without changing anything, and forget this review")
                     .clicked()
                 {
+                    self.drafts.discard();
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
@@ -731,6 +751,16 @@ impl App {
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
         if let Some(e) = &self.error {
             ui.label(RichText::new(format!("Error: {e}")).color(pal::RED));
+        }
+        if let Some(n) = &self.notice {
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(n).color(pal::AMBER));
+                dismiss = button(ui, "Dismiss", None, Look::Plain, false, true).clicked();
+            });
+            if dismiss {
+                self.notice = None;
+            }
         }
         note_box(
             ui,
@@ -1306,6 +1336,9 @@ impl eframe::App for App {
                 bottom: 0,
             }))
             .show(ui, |ui| self.diff_view(ui));
+        if !self.done {
+            self.drafts.save(&self.r);
+        }
         if let Some(c) = &mut self.capture {
             c.after_frame(&ctx, self.hl_left == 0);
         }
