@@ -110,6 +110,20 @@ code, silence it there with `#[allow(clippy::...)]` and add a comment saying why
 CI runs the same checks on every pull request
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
+The actions the workflows use are locked to exact commits in
+`.github/workflows/actions.lock`, and CI fails if it's out of date. Dependabot
+bumps the actions and updates the lockfile with them. If you add or change a
+`uses:` line yourself, regenerate it with the
+[`gh actions-lock`](https://github.com/github/gh-actions-lock) extension:
+
+```sh
+gh extension install github/gh-actions-lock
+gh actions-lock
+```
+
+`dtolnay/rust-toolchain@stable` follows a branch, so Dependabot doesn't move it.
+Run `gh actions-lock --relock` now and then to pick up its new commits.
+
 The commit that first ran `rustfmt` over everything is listed in
 `.git-blame-ignore-revs`. GitHub's blame view skips it automatically. For local
 `git blame`, run once:
