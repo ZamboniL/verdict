@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 mod draft;
-mod frontend;
 mod git;
-#[cfg(feature = "gui")]
-mod gui;
 mod handoff;
 mod highlight;
 mod model;
 mod review;
 mod session;
 mod tm;
-#[cfg(feature = "tui")]
-mod tui;
+mod ui;
 
-use frontend::Choice;
+use ui::Choice;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -84,7 +80,7 @@ fn main() -> ExitCode {
             }
         } else if let Some(id) = a.strip_prefix("--session=") {
             sess = SessionArg::Id(id.to_owned());
-        } else if let Some(c) = frontend::parse_flag(&a) {
+        } else if let Some(c) = ui::parse_flag(&a) {
             flag = Some(c);
         } else {
             args.push(a);
@@ -97,7 +93,7 @@ fn main() -> ExitCode {
         }
         Some("hook") => hook(flag),
         Some("__tui") => match (args.get(1), args.get(2)) {
-            (Some(repo), Some(dir)) => frontend::tui_child(Path::new(repo), Path::new(dir)),
+            (Some(repo), Some(dir)) => ui::tui_child(Path::new(repo), Path::new(dir)),
             _ => ExitCode::FAILURE,
         },
         Some("langs") => langs(),
@@ -243,18 +239,18 @@ fn manual(args: &[String], staged: bool, flag: Option<Choice>, sess: SessionArg)
         );
         return ExitCode::SUCCESS;
     }
-    let cfg = frontend::ui_config();
-    let choice = frontend::choice(flag, &cfg);
+    let cfg = ui::ui_config();
+    let choice = ui::choice(flag, &cfg);
     let mut review = review::Review::new(files, cfg.split, source);
     let mode = match &picked {
         Some((id, owner, _)) => {
             review.session = Some(owner.label(id));
             review.agent_message = owner.last_reply();
-            frontend::Mode::Session
+            ui::Mode::Session
         }
-        None => frontend::Mode::Manual,
+        None => ui::Mode::Manual,
     };
-    let outcome = frontend::run(repo.clone(), review, mode, choice, &cfg);
+    let outcome = ui::run(repo.clone(), review, mode, choice, &cfg);
     // The review changed files: keep what's left of them as the session's.
     if let (Some((id, _, files)), Ok(Some(_))) = (&picked, &outcome) {
         if let Ok(snap) = session::snapshot(&repo) {
@@ -269,7 +265,7 @@ fn manual(args: &[String], staged: bool, flag: Option<Choice>, sess: SessionArg)
         }
     }
     match outcome {
-        Ok(Some(frontend::Outcome { message: Some(m) })) => {
+        Ok(Some(ui::Outcome { message: Some(m) })) => {
             if let Some(p) = git::git_dir(&repo) {
                 let _ = std::fs::write(p.join("verdict-feedback.md"), &m);
             }
@@ -492,8 +488,8 @@ fn hook(flag: Option<Choice>) -> ExitCode {
             }
         }
     });
-    let cfg = frontend::ui_config();
-    let choice = frontend::choice(flag, &cfg);
+    let cfg = ui::ui_config();
+    let choice = ui::choice(flag, &cfg);
     let mut review = review::Review::new(files, cfg.split, git::Source::Worktree);
     // What the agent said, so the reviewer can read it first.
     review.agent_message = v["last_assistant_message"]
@@ -505,7 +501,7 @@ fn hook(flag: Option<Choice>) -> ExitCode {
                 .as_str()
                 .and_then(|t| session::last_reply(Path::new(t)))
         });
-    let outcome = frontend::run(repo.clone(), review, frontend::Mode::Hook, choice, &cfg);
+    let outcome = ui::run(repo.clone(), review, ui::Mode::Hook, choice, &cfg);
     // Whatever happened, the reviewed state is the new baseline: if the agent
     // continues, the next Stop shows only what it changes in response.
     if let Ok(snap) = session::snapshot(&repo) {
@@ -522,7 +518,7 @@ fn hook(flag: Option<Choice>) -> ExitCode {
         });
     }
     match outcome {
-        Ok(Some(frontend::Outcome { message: Some(m) })) => {
+        Ok(Some(ui::Outcome { message: Some(m) })) => {
             println!(
                 "{}",
                 serde_json::json!({ "decision": "block", "reason": m })

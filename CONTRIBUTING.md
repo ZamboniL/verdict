@@ -53,11 +53,12 @@ and set up the hooks as described in the README.
 | `src/git.rs` | thin wrapper over the `git` CLI (no libgit2) |
 | `src/model.rs` | diffs, hunks, applying decisions, the feedback message |
 | `src/session.rs` | per-session turn snapshots, transcript analysis |
+| `src/handoff.rs` | sending feedback to a session whose turn is over |
 | `src/review.rs` | review state shared by both interfaces: decisions, selection, folds, line mode |
 | `src/draft.rs` | saving unsubmitted reviews and restoring them |
-| `src/frontend.rs` | choosing the window or the terminal, the background highlighter |
-| `src/gui.rs` | the egui review window |
-| `src/tui.rs` | the ratatui terminal interface |
+| `src/ui/` | choosing and starting the interface (`config.rs`, `launch.rs`), the background highlighter |
+| `src/ui/gui/` | the egui review window: `diff.rs` and `hunk.rs` draw the review, `code.rs` the code rows |
+| `src/ui/tui/` | the ratatui terminal interface: `rows.rs` lays out the review, `render.rs` draws it, `input.rs` handles keys |
 | `src/highlight.rs` | language and theme registry, user extensions, caching |
 | `src/tm.rs` | TextMate grammar and VS Code theme conversion |
 
@@ -65,7 +66,7 @@ Some rules that keep it this way:
 
 - **Review behavior belongs in `review.rs`, not in an interface.** The window
   and the terminal UI are two views of the same review. A new action or decision
-  rule goes in `review.rs` and is then wired into both `gui.rs` and `tui.rs`.
+  rule goes in `review.rs` and is then wired into both `ui/gui/` and `ui/tui/`.
   A feature that only works in one interface needs a good reason, written in the
   pull request.
 - **Keys are the same in both interfaces.** A new or changed key goes in the

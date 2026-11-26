@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! One hunk: its header with the decision buttons, its rows with line comments
+//! under them, and the note or editor its decision asks for.
+
+use super::code::{editor_job, rows_ui};
+use super::theme::{decision_color, decision_label, pal, tint};
+use super::widgets::{Look, button, caption, decision_button, note_box, pill};
+use crate::model::{self, Decision, FileHl, Hunk};
+use eframe::egui::{self, Align, FontId, Rect, RichText, Stroke, TextEdit, vec2};
+
+#[derive(Clone)]
+pub(super) struct HunkCtx<'a> {
+    pub hl: Option<&'a FileHl>,
+    /// The Edit button works: not a binary file, not a read-only review.
+    pub editable: bool,
+    pub selected: bool,
+    pub row_h: f32,
+    pub char_w: f32,
+    /// Line-number width, fixed per file so gutters line up.
+    pub digits: usize,
+    /// The longest line in the file's card, in characters, so every row is as wide.
+    pub widest: f32,
+    /// The visible width of the diff area.
+    pub view_w: f32,
+    pub mono: &'a FontId,
+    /// "Hunk 2/3".
+    pub label: Option<String>,
+    /// The file is rejected as a whole, so its reason covers this hunk.
+    pub file_reason: bool,
+    pub focus_note: bool,
+    pub focus_edit: bool,
+    /// Side-by-side: old on the left, new on the right.
+    pub split: bool,
+    /// Unchanged code between hunks (full-file view): drawn quieter.
+    pub gap: bool,
+    /// Lines picked for a comment in this hunk (first, last), and the line cursor.
+    pub picked: Option<(usize, usize)>,
+    pub cursor: Option<usize>,
+    /// Scroll the line cursor into view.
+    pub scroll_to_cursor: bool,
+    /// Focus this line comment's text box.
+    pub focus_comment: Option<usize>,
+}
+
+impl HunkCtx<'_> {
+    pub fn is_picked(&self, li: usize) -> bool {
+        self.picked.is_some_and(|(a, b)| (a..=b).contains(&li))
+    }
+}
+
+pub(super) struct HunkOut {
+    pub rect: Rect,
+    pub clicked: bool,
+    pub action: Option<Decision>,
+    /// A line number was clicked: pick that line.
+    pub line_click: Option<usize>,
+    /// A line comment's Delete button was clicked.
+    pub remove_comment: Option<usize>,
+}
+
+pub(super) fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
+    let mut out = HunkOut {
+        rect: Rect::NOTHING,
+        clicked: false,
+        action: None,
+        line_click: None,
+        remove_comment: None,
+    };
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let inner = ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let head = hunk_header(ui, h, &c, &mut out.action);
+        hunk_rows(ui, h, &c, &mut out);
+        if !matches!(h.decision, Decision::Pending | Decision::Approve) {
+            hunk_note(ui, h, &c);
+        }
+        head
+    });
+    out.rect = inner.response.rect;
+    let head = Rect::from_x_y_ranges(out.rect.x_range(), inner.inner.y_range());
+    paint_frame(ui, bg_idx, out.rect, head, h.decision, c.selected);
+    out
+}
+
+/// The label, the `@@` header, the decision pill and the decision buttons.
+/// Returns the header's rect.
+fn hunk_header(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx, action: &mut Option<Decision>) -> Rect {
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 10,
+            top: 6,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            ui.set_max_width(c.view_w - 26.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if let Some(l) = &c.label {
+                    let col = if c.selected { pal::TEXT } else { pal::DIM };
+                    ui.label(RichText::new(l).size(12.5).strong().color(col));
+                }
+                ui.label(
+                    RichText::new(&h.header)
+                        .monospace()
+                        .size(12.0)
+                        .color(pal::FAINT),
+                );
+                if h.decision != Decision::Pending {
+                    pill(ui, decision_label(h.decision), decision_color(h.decision));
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (d, label, key, enabled) in [
+                        (Decision::Comment, "Comment", "c", true),
+                        (Decision::Edit, "Edit", "e", c.editable),
+                        (Decision::Reject, "Reject", "r", true),
+                        (Decision::Approve, "Approve", "a", true),
+                    ] {
+                        let on = h.decision == d;
+                        if decision_button(ui, label, Some(key), d, on, enabled, c.selected)
+                            .clicked()
+                        {
+                            *action = Some(d);
+                        }
+                    }
+                });
+            });
+        })
+        .response
+        .rect
+}
+
+/// The rows, cut after each line that ends a comment so the comment sits under it.
+fn hunk_rows(ui: &mut egui::Ui, h: &mut Hunk, c: &HunkCtx, out: &mut HunkOut) {
+    let rows: Vec<model::Pair> = if c.split {
+        model::split_pairs(&h.lines)
+    } else {
+        (0..h.lines.len()).map(|i| (Some(i), Some(i))).collect()
+    };
+    let mut commented = vec![false; h.lines.len()];
+    for cm in &h.comments {
+        for flag in commented.iter_mut().take(cm.last + 1).skip(cm.first) {
+            *flag = true;
+        }
+    }
+    let mut start = 0;
+    for r in 0..rows.len() {
+        let (a, b) = rows[r];
+        let ends: Vec<usize> = (0..h.comments.len())
+            .filter(|&ci| [a, b].contains(&Some(h.comments[ci].last)))
+            .collect();
+        if ends.is_empty() && r + 1 < rows.len() {
+            continue;
+        }
+        let rows_out = rows_ui(ui, &h.lines, &rows[start..=r], c, &commented);
+        out.clicked |= rows_out.clicked;
+        out.line_click = out.line_click.or(rows_out.line);
+        start = r + 1;
+        for ci in ends {
+            if comment_ui(ui, h, ci, c) {
+                out.remove_comment = Some(ci);
+            }
+        }
+    }
+}
+
+/// The reason, comment or replacement the hunk's decision asks for.
+fn hunk_note(ui: &mut egui::Ui, h: &mut Hunk, c: &HunkCtx) {
+    let col = decision_color(h.decision);
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 12,
+            top: 8,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            ui.set_max_width(c.view_w - 28.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            match h.decision {
+                Decision::Reject if c.file_reason => {
+                    caption(ui, "COVERED BY THE FILE'S REASON", col);
+                    let hint = "Optional: extra detail for this hunk";
+                    note_box(ui, &mut h.note, hint, col, 1);
+                }
+                Decision::Reject | Decision::Comment => {
+                    let has_lines = !h.comments.is_empty();
+                    let (title, hint) = match (h.decision, has_lines) {
+                        (Decision::Reject, false) => (
+                            "WHY IT'S REJECTED",
+                            "What should it do instead? Sent to the agent",
+                        ),
+                        (Decision::Reject, true) => (
+                            "WHY IT'S REJECTED",
+                            "Optional with line comments: a reason for the whole hunk",
+                        ),
+                        (_, false) => ("COMMENT", "Sent to the agent"),
+                        (_, true) => ("COMMENT ON THE HUNK", "Optional: about the whole hunk"),
+                    };
+                    caption(ui, title, col);
+                    let r = note_box(ui, &mut h.note, hint, col, 2);
+                    if c.focus_note {
+                        r.request_focus();
+                    }
+                }
+                Decision::Edit => {
+                    caption(ui, "YOUR REPLACEMENT FOR THE + LINES", col);
+                    let r = edit_box(ui, h, c);
+                    if c.focus_edit {
+                        r.request_focus();
+                    }
+                    ui.add_space(2.0);
+                    note_box(ui, &mut h.note, "Optional: why you changed it", col, 1);
+                }
+                Decision::Pending | Decision::Approve => {}
+            }
+        });
+}
+
+/// The highlighted code editor for an edited hunk's replacement.
+fn edit_box(ui: &mut egui::Ui, h: &mut Hunk, c: &HunkCtx) -> egui::Response {
+    let syn_name = c.hl.map(|hl| hl.lang.clone());
+    let mono = c.mono.clone();
+    let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+        let mut job = editor_job(buf.as_str(), syn_name.as_deref(), &mono);
+        job.wrap.max_width = wrap;
+        ui.painter().layout_job(job)
+    };
+    let frame = egui::Frame::new()
+        .fill(pal::BG)
+        .stroke(Stroke::new(1.0, tint(pal::BG, pal::BLUE, 0.4)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 7));
+    ui.add(
+        TextEdit::multiline(&mut h.edit_buf)
+            .code_editor()
+            .layouter(&mut layouter)
+            .desired_rows(h.new.len().clamp(3, 30))
+            .desired_width(f32::INFINITY)
+            .lock_focus(true)
+            .frame(frame),
+    )
+}
+
+/// The header's background (into `bg_idx`, a shape added before the hunk so it's
+/// behind it), dividers, the decision stripe and the selection outline.
+fn paint_frame(
+    ui: &egui::Ui,
+    bg_idx: egui::layers::ShapeIdx,
+    rect: Rect,
+    head: Rect,
+    decision: Decision,
+    selected: bool,
+) {
+    let p = ui.painter();
+    let head_fill = if selected {
+        tint(pal::CARD, pal::ACCENT, 0.08)
+    } else {
+        pal::HUNK_HEAD
+    };
+    p.set(bg_idx, egui::epaint::RectShape::filled(head, 0, head_fill));
+    p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, pal::SOFT));
+    p.hline(rect.x_range(), head.bottom(), Stroke::new(1.0, pal::SOFT));
+    if decision != Decision::Pending {
+        let stripe = Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height()));
+        p.rect_filled(stripe, 0, decision_color(decision));
+    }
+    if selected {
+        p.rect_stroke(
+            rect.shrink(1.0),
+            4,
+            Stroke::new(1.5, pal::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// A line comment under the line it ends on. True if its Delete button was clicked.
+fn comment_ui(ui: &mut egui::Ui, h: &mut Hunk, ci: usize, c: &HunkCtx) -> bool {
+    let label = h.lines_label(h.comments[ci].first, h.comments[ci].last);
+    let mut delete = false;
+    egui::Frame::new()
+        .fill(tint(pal::CARD, pal::AMBER, 0.05))
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 12,
+            top: 6,
+            bottom: 8,
+        })
+        .show(ui, |ui| {
+            ui.set_max_width(c.view_w - 28.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                caption(
+                    ui,
+                    &format!("COMMENT ON {}", label.to_uppercase()),
+                    pal::AMBER,
+                );
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    delete = button(ui, "Delete", None, Look::Plain, false, true).clicked();
+                });
+            });
+            let r = note_box(
+                ui,
+                &mut h.comments[ci].text,
+                "Sent to the agent with these lines",
+                pal::AMBER,
+                2,
+            );
+            if c.focus_comment == Some(ci) {
+                r.request_focus();
+            }
+        });
+    delete
+}
