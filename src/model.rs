@@ -37,6 +37,9 @@ pub struct Hunk {
     /// Changed span in old/new line indices (context excluded).
     pub old: Range<usize>,
     pub new: Range<usize>,
+    /// The span shown, context included, in old/new line indices.
+    pub ctx_old: Range<usize>,
+    pub ctx_new: Range<usize>,
     pub header: String,
     pub lines: Vec<DLine>,
     pub decision: Decision,
@@ -83,15 +86,32 @@ impl FileDiff {
         self.hunks.iter().all(|h| h.decision == d)
     }
 
-    /// Highest line number each side needs highlighted to render all hunks.
-    pub fn needed_lines(&self) -> (usize, usize) {
-        let mut o = 0;
-        let mut n = 0;
-        for l in self.hunks.iter().flat_map(|h| &h.lines) {
-            o = o.max(l.old_no.unwrap_or(0));
-            n = n.max(l.new_no.unwrap_or(0));
+    /// Unchanged lines around the hunks, for the full-file view: one block before
+    /// each hunk plus one after the last (`hunks.len() + 1` blocks, some empty).
+    pub fn gaps(&self) -> Vec<Vec<DLine>> {
+        let mut out = Vec::with_capacity(self.hunks.len() + 1);
+        let (mut o, mut n) = (0usize, 0usize);
+        let block = |o0: usize, n0: usize, n1: usize| -> Vec<DLine> {
+            (n0..n1)
+                .enumerate()
+                .map(|(i, j)| DLine {
+                    kind: Kind::Ctx,
+                    old_no: Some(o0 + i + 1),
+                    new_no: Some(j + 1),
+                    text: strip_eol(&self.new[j]),
+                })
+                .collect()
+        };
+        if self.binary {
+            return Vec::new();
         }
-        (o, n)
+        for h in &self.hunks {
+            out.push(block(o, n, h.ctx_new.start.max(n)));
+            o = h.ctx_old.end;
+            n = h.ctx_new.end;
+        }
+        out.push(block(o, n, self.new.len().max(n)));
+        out
     }
 
     pub fn ext(&self) -> &str {
@@ -186,6 +206,8 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
         f.hunks.push(Hunk {
             old: 0..0,
             new: 0..0,
+            ctx_old: 0..0,
+            ctx_new: 0..0,
             header: "binary file".into(),
             lines: vec![DLine {
                 kind: Kind::Ctx,
@@ -272,6 +294,8 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
             edit_buf: new[new_span.clone()].concat(),
             old: old_span,
             new: new_span,
+            ctx_old: co,
+            ctx_new: cn,
             header,
             lines,
             decision: Decision::Pending,
@@ -636,6 +660,26 @@ mod tests {
         // Everything decided -> nothing left to review.
         assert!(load(&dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gaps_tile_the_file() {
+        let f = file(OLD, NEW);
+        let gaps = f.gaps();
+        assert_eq!(gaps.len(), f.hunks.len() + 1);
+        // gaps + hunk context lines cover every new line exactly once, in order
+        let mut seen = Vec::new();
+        for (i, g) in gaps.iter().enumerate() {
+            seen.extend(g.iter().map(|l| l.new_no.unwrap()));
+            if let Some(h) = f.hunks.get(i) {
+                seen.extend(h.lines.iter().filter_map(|l| l.new_no));
+            }
+        }
+        assert_eq!(seen, (1..=f.new.len()).collect::<Vec<_>>());
+        // and old numbers stay in sync in the gaps
+        for l in gaps.iter().flatten() {
+            assert_eq!(f.old[l.old_no.unwrap() - 1], f.new[l.new_no.unwrap() - 1]);
+        }
     }
 
     #[test]

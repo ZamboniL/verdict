@@ -33,6 +33,8 @@ verdict does one job:
 - Approve, reject or comment on a **whole file**. A whole-file rejection carries
   one reason for all its hunks.
 - Edit hunks inline. The agent sees exactly what you changed.
+- **Full file** view: show the whole file, with unchanged code between the hunk
+  cards, when 3 lines of context aren't enough.
 - Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
   gutter. Cards fold away when you're done with them.
 - Syntax highlighting for about 200 languages out of the box. You can add more
@@ -49,7 +51,7 @@ verdict needs `git`, a Rust toolchain (1.85+, edition 2024) and a C compiler. Th
 C compiler builds Oniguruma, the regex engine VS Code grammars are written for.
 
 ```sh
-git clone https://github.com/<you>/verdict
+git clone https://github.com/ZamboniL/verdict
 cd verdict
 cargo install --path .
 ```
@@ -124,6 +126,7 @@ in the environment to turn verdict off for a session.
 |---|---|
 | `j` / `k` | next / previous hunk |
 | `n` | jump to the next undecided hunk |
+| `f` | show the whole file around its hunks |
 | `Space` | fold / unfold the current file |
 | `Esc` | leave a text box |
 | `Ctrl+Enter` | submit |

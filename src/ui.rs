@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -25,6 +25,9 @@ pub enum Mode {
 pub struct Outcome {
     pub message: Option<String>,
 }
+
+/// Files longer than this are only partly highlighted.
+const MAX_HL_LINES: usize = 50_000;
 
 /// Loaded once, in the background, so the window appears instantly.
 static REG: OnceLock<Registry> = OnceLock::new();
@@ -113,7 +116,7 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
                     path: f.path.clone(),
                     old: f.old.clone(),
                     new: f.new.clone(),
-                    upto: f.needed_lines(),
+                    upto: (f.old.len().min(MAX_HL_LINES), f.new.len().min(MAX_HL_LINES)),
                 })
                 .collect();
             let (tx, rx) = mpsc::channel();
@@ -138,6 +141,7 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
                 done: false,
                 hl_rx: rx,
                 collapsed: HashSet::new(),
+                full: HashMap::new(),
                 focus_file_note: None,
             }))
         }),
@@ -181,6 +185,8 @@ struct App {
     done: bool,
     hl_rx: mpsc::Receiver<(usize, FileHl)>,
     collapsed: HashSet<usize>,
+    /// Files shown in full: their unchanged blocks between hunks.
+    full: HashMap<usize, Vec<Vec<model::DLine>>>,
     focus_file_note: Option<usize>,
 }
 
@@ -207,6 +213,16 @@ impl App {
             Decision::Approve => self.next_pending(),
             Decision::Pending => {}
         }
+    }
+
+    fn toggle_full(&mut self, fi: usize) {
+        if self.full.remove(&fi).is_none() {
+            if let Some(f) = self.files.get(fi).filter(|f| !f.binary) {
+                self.full.insert(fi, f.gaps());
+            }
+        }
+        self.collapsed.remove(&fi);
+        self.scroll_to_sel = true;
     }
 
     fn cur_file(&self) -> Option<usize> {
@@ -311,6 +327,8 @@ impl App {
             self.select((self.sel + 1).min(self.flat.len() - 1));
         } else if pressed(Key::K) || pressed(Key::ArrowUp) {
             self.select(self.sel.saturating_sub(1));
+        } else if let (Some(fi), true) = (cur, pressed(Key::F)) {
+            self.toggle_full(fi);
         } else if let (Some(fi), true) = (cur, pressed(Key::Space)) {
             if !self.collapsed.remove(&fi) {
                 self.collapsed.insert(fi);
@@ -411,7 +429,7 @@ impl App {
         );
         ui.label(
             RichText::new(
-                "j/k move · a r e c approve/reject/edit/comment hunk · Shift+A/R/C whole file · Space fold file · n next pending · Esc leave text box · Ctrl+Enter submit",
+                "j/k move · a r e c approve/reject/edit/comment hunk · Shift+A/R/C whole file · f full file · Space fold file · n next pending · Esc leave text box · Ctrl+Enter submit",
             )
             .small()
             .color(pal::DIM),
@@ -476,6 +494,7 @@ impl App {
         let mut action: Option<Decision> = None;
         let mut file_act: Option<(usize, Decision)> = None;
         let mut toggle_fold: Option<usize> = None;
+        let mut full_toggle: Option<usize> = None;
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             ui.add_space(8.0);
@@ -547,6 +566,15 @@ impl App {
                             fbtn(ui, Decision::Comment, "Comment on file", f.file_mode == Some(Decision::Comment), "A note about the whole file (Shift+C)");
                             fbtn(ui, Decision::Reject, "Reject file", f.all(Decision::Reject), "Reject every hunk with one reason (Shift+R)");
                             fbtn(ui, Decision::Approve, "Approve file", f.all(Decision::Approve), "Approve every hunk (Shift+A)");
+                            ui.add_space(8.0);
+                            let is_full = self.full.contains_key(&fi);
+                            if ui
+                                .add_enabled(!f.binary, egui::Button::selectable(is_full, "Full file"))
+                                .on_hover_text("Show the whole file around the hunks (f)")
+                                .clicked()
+                            {
+                                full_toggle = Some(fi);
+                            }
                         });
                     });
 
@@ -578,12 +606,30 @@ impl App {
                     // Hunks, indented, joined by a rail in the gutter.
                     let mut dots: Vec<(f32, Color32)> = Vec::new();
                     let file_rejected = f.file_mode == Some(Decision::Reject);
+                    let digits = f.old.len().max(f.new.len()).to_string().len().max(3);
+                    let gaps = self.full.get(&fi);
                     let FileDiff { hunks, hl, binary, .. } = f;
                     let binary = *binary;
+                    let gap_ctx = HunkCtx {
+                        hl: hl.as_ref(),
+                        binary,
+                        selected: false,
+                        row_h,
+                        char_w,
+                        digits,
+                        mono: &mono,
+                        label: None,
+                        file_reason: false,
+                        focus_note: false,
+                        focus_edit: false,
+                    };
                     let inner = egui::Frame::new()
                         .inner_margin(egui::Margin { left: 20, right: 0, top: 0, bottom: 0 })
                         .show(ui, |ui| {
                             for (hi, h) in hunks.iter_mut().enumerate() {
+                                if let Some(g) = gaps.and_then(|g| g.get(hi)) {
+                                    gap_ui(ui, g, &gap_ctx);
+                                }
                                 let selected = sel_pair == Some((fi, hi));
                                 let ctx = HunkCtx {
                                     hl: hl.as_ref(),
@@ -591,6 +637,7 @@ impl App {
                                     selected,
                                     row_h,
                                     char_w,
+                                    digits,
                                     mono: &mono,
                                     label: (total > 1).then(|| format!("{}/{total}", hi + 1)),
                                     file_reason: file_rejected,
@@ -611,9 +658,12 @@ impl App {
                                     ui.scroll_to_rect(out.rect, Some(Align::Min));
                                     self.scroll_to_sel = false;
                                 }
-                                if hi + 1 < total {
+                                if hi + 1 < total && gaps.is_none() {
                                     ui.add_space(6.0);
                                 }
+                            }
+                            if let Some(g) = gaps.and_then(|g| g.get(total)) {
+                                gap_ui(ui, g, &gap_ctx);
                             }
                         });
                     let x = inner.response.rect.left() + 8.0;
@@ -635,6 +685,9 @@ impl App {
             }
         });
 
+        if let Some(fi) = full_toggle {
+            self.toggle_full(fi);
+        }
         if let Some(fi) = toggle_fold {
             if !self.collapsed.remove(&fi) {
                 self.collapsed.insert(fi);
@@ -686,6 +739,8 @@ struct HunkCtx<'a> {
     selected: bool,
     row_h: f32,
     char_w: f32,
+    /// Line-number width, fixed per file so gutters line up.
+    digits: usize,
     mono: &'a FontId,
     /// "2/3" position within the file, when it has several hunks.
     label: Option<String>,
@@ -743,7 +798,7 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
             });
             ui.add_space(2.0);
 
-            if diff_lines(ui, h, &c).clicked() {
+            if diff_lines(ui, &h.lines, &c).clicked() {
                 clicked = true;
             }
 
@@ -803,25 +858,31 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
     HunkOut { rect: resp.response.rect, clicked, action }
 }
 
-fn diff_lines(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx) -> egui::Response {
-    let max_no = h
-        .lines
-        .iter()
-        .filter_map(|l| l.new_no.max(l.old_no))
-        .max()
-        .unwrap_or(1);
-    let digits = max_no.to_string().len().max(3) as f32;
+/// Unchanged lines shown between hunks in the full-file view.
+fn gap_ui(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) {
+    if lines.is_empty() {
+        return;
+    }
+    // Match the hunk cards' content inset (1px stroke + 8px margin).
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: 9, right: 9, top: 2, bottom: 2 })
+        .show(ui, |ui| {
+            diff_lines(ui, lines, c);
+        });
+}
+
+fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
+    let digits = c.digits as f32;
     let num_w = digits * c.char_w + 10.0;
     let text_x = num_w * 2.0 + c.char_w * 2.0 + 6.0;
-    let max_chars = h
-        .lines
+    let max_chars = lines
         .iter()
         .map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3)
         .max()
         .unwrap_or(0) as f32;
     let width = (text_x + max_chars * c.char_w + 12.0).max(ui.available_width());
     let (rect, resp) = ui.allocate_exact_size(
-        vec2(width, c.row_h * h.lines.len() as f32),
+        vec2(width, c.row_h * lines.len() as f32),
         Sense::click(),
     );
     if !ui.is_rect_visible(rect) {
@@ -836,7 +897,7 @@ fn diff_lines(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx) -> egui::Response {
             _ => hl.new.get(l.new_no? - 1),
         }
     };
-    for (i, l) in h.lines.iter().enumerate() {
+    for (i, l) in lines.iter().enumerate() {
         let top = rect.top() + i as f32 * c.row_h;
         let row = Rect::from_min_size(pos2(rect.left(), top), vec2(width, c.row_h));
         if !clip.intersects(row) {
