@@ -1,5 +1,7 @@
 mod git;
+mod highlight;
 mod model;
+mod tm;
 mod ui;
 
 use std::io::Read;
@@ -13,6 +15,14 @@ USAGE:
   verdict [PATH]     Review unstaged changes in the repo containing PATH (default: .)
                      Feedback is printed to stdout and saved to .git/verdict-feedback.md
   verdict hook       Claude Code Stop hook entry point (reads hook JSON on stdin)
+  verdict langs      List languages (builtin + yours) and grammar load warnings
+  verdict themes     List syntax themes; the active one is marked with *
+  verdict lang FILE  Show which language FILE is highlighted as
+  verdict init       Create the config dir with an example config.toml
+
+Syntax highlighting is extensible: drop grammars into ~/.config/verdict/grammars
+(.sublime-syntax, .tmLanguage, .tmLanguage.json), themes into .../themes
+(.tmTheme, VS Code .json), or unpacked VS Code extensions into .../extensions.
 
 The git index is the 'approved' state: approving stages a hunk, rejecting reverts it
 in the working tree. Nothing is written until you submit.
@@ -27,6 +37,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("hook") => hook(),
+        Some("langs") => langs(),
+        Some("themes") => themes(),
+        Some("lang") => match args.get(1) {
+            Some(f) => lang(f),
+            None => {
+                eprintln!("usage: verdict lang FILE");
+                ExitCode::FAILURE
+            }
+        },
+        Some("init") => init(),
         other => manual(Path::new(other.unwrap_or("."))),
     }
 }
@@ -76,6 +96,83 @@ fn manual(path: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn print_warnings(reg: &highlight::Registry) {
+    if !reg.warnings.is_empty() {
+        println!("\nWarnings:");
+        for w in &reg.warnings {
+            println!("  {w}");
+        }
+    }
+}
+
+fn langs() -> ExitCode {
+    let reg = highlight::Registry::load();
+    println!("Config dir: {}\n", highlight::config_dir().display());
+    let mut syns: Vec<_> = reg.ss.syntaxes().iter().filter(|s| !s.hidden).collect();
+    syns.sort_by_key(|s| s.name.to_lowercase());
+    syns.dedup_by(|a, b| a.name == b.name);
+    for s in syns {
+        let user = if reg.user_names.contains(&s.name) { "  [user]" } else { "" };
+        let mut exts = s.file_extensions.join(" ");
+        if exts.len() > 60 {
+            exts.truncate(57);
+            exts.push_str("...");
+        }
+        println!("{:<34} {:<60}{user}", s.name, exts);
+    }
+    print_warnings(&reg);
+    ExitCode::SUCCESS
+}
+
+fn themes() -> ExitCode {
+    let reg = highlight::Registry::load();
+    for (name, user) in &reg.themes {
+        let mark = if *name == reg.theme_name { "*" } else { " " };
+        println!("{mark} {name}{}", if *user { "  [user]" } else { "" });
+    }
+    print_warnings(&reg);
+    ExitCode::SUCCESS
+}
+
+fn lang(file: &str) -> ExitCode {
+    let reg = highlight::Registry::load();
+    let first = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| t.lines().next().map(|l| format!("{l}\n")));
+    // Associations with "/" match repo-relative paths.
+    let p = Path::new(file);
+    let rel = git::toplevel(p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")))
+        .and_then(|top| std::fs::canonicalize(p).ok()?.strip_prefix(top).ok().map(|r| r.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| file.to_owned());
+    match reg.syntax_for(&rel, first.as_deref()) {
+        Some(s) => println!("{} ({})", s.name, s.scope.build_string()),
+        None => println!("plain text (no language matched)"),
+    }
+    ExitCode::SUCCESS
+}
+
+fn init() -> ExitCode {
+    let dir = highlight::config_dir();
+    for sub in ["grammars", "themes", "extensions"] {
+        if let Err(e) = std::fs::create_dir_all(dir.join(sub)) {
+            eprintln!("verdict: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let cfg = dir.join("config.toml");
+    if cfg.exists() {
+        println!("{} already exists, left untouched", cfg.display());
+    } else if let Err(e) = std::fs::write(&cfg, highlight::EXAMPLE_CONFIG) {
+        eprintln!("verdict: {e}");
+        return ExitCode::FAILURE;
+    } else {
+        println!("wrote {}", cfg.display());
+    }
+    println!("drop grammars in {}/grammars, themes in {}/themes,", dir.display(), dir.display());
+    println!("or unpacked VS Code extensions in {}/extensions", dir.display());
+    ExitCode::SUCCESS
 }
 
 fn git_dir(repo: &Path) -> Option<PathBuf> {

@@ -5,10 +5,13 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"] }
+plist = "1.10.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 similar = "3.2.1"
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "yaml-load", "plist-load", "dump-load", "dump-create", "regex-onig", "default-syntaxes", "default-themes"] }
+toml = "1.2.3"
+two-face = "0.5.2"
 
 [profile.release]
 opt-level = 3

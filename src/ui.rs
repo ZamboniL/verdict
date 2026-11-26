@@ -1,6 +1,7 @@
 //! egui review window.
 
-use crate::model::{self, Decision, FileDiff, Hunk, Kind};
+use crate::highlight::{Line, Registry};
+use crate::model::{self, Decision, FileDiff, FileHl, Hunk, Kind};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Event, FontId, Key, Modifiers, Rect, RichText, Sense,
     Stroke, TextEdit, TextFormat, TextStyle, Vec2, pos2, text::LayoutJob, vec2,
@@ -9,6 +10,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -22,11 +24,34 @@ pub struct Outcome {
     pub message: Option<String>,
 }
 
-struct Hl {
-    ss: syntect::parsing::SyntaxSet,
-    theme: syntect::highlighting::Theme,
+/// Loaded once, in the background, so the window appears instantly.
+static REG: OnceLock<Registry> = OnceLock::new();
+
+struct HlJob {
+    file: usize,
+    path: String,
+    old: Vec<String>,
+    new: Vec<String>,
+    upto: (usize, usize),
 }
-static HL: OnceLock<Hl> = OnceLock::new();
+
+fn run_highlighter(jobs: Vec<HlJob>, tx: mpsc::Sender<(usize, FileHl)>, ctx: egui::Context) {
+    let reg = REG.get_or_init(Registry::load);
+    ctx.request_repaint();
+    for j in jobs {
+        let first = j.new.first().or(j.old.first()).map(String::as_str);
+        let Some(syn) = reg.syntax_for(&j.path, first) else { continue };
+        let hl = FileHl {
+            lang: syn.name.clone(),
+            old: reg.highlight(syn, &j.old, j.upto.0),
+            new: reg.highlight(syn, &j.new, j.upto.1),
+        };
+        if tx.send((j.file, hl)).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+    }
+}
 
 mod pal {
     use super::Color32;
@@ -76,13 +101,20 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || {
-                let ss = syntect::parsing::SyntaxSet::load_defaults_newlines();
-                let mut ts = syntect::highlighting::ThemeSet::load_defaults();
-                let theme = ts.themes.remove("base16-ocean.dark").unwrap();
-                let _ = HL.set(Hl { ss, theme });
-                ctx.request_repaint();
-            });
+            let jobs = files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !f.binary)
+                .map(|(i, f)| HlJob {
+                    file: i,
+                    path: f.path.clone(),
+                    old: f.old.clone(),
+                    new: f.new.clone(),
+                    upto: f.needed_lines(),
+                })
+                .collect();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || run_highlighter(jobs, tx, ctx));
             let flat = files
                 .iter()
                 .enumerate()
@@ -101,6 +133,7 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
                 error: None,
                 result: res,
                 done: false,
+                hl_rx: rx,
             }))
         }),
     )
@@ -141,6 +174,7 @@ struct App {
     error: Option<String>,
     result: Rc<RefCell<Option<Outcome>>>,
     done: bool,
+    hl_rx: mpsc::Receiver<(usize, FileHl)>,
 }
 
 impl App {
@@ -248,6 +282,16 @@ impl App {
             chip(ui, c.edit, "edited", pal::BLUE);
             chip(ui, c.comment, "commented", pal::AMBER);
             chip(ui, c.pending, "pending", pal::DIM);
+            if let Some(reg) = REG.get() {
+                if !reg.warnings.is_empty() {
+                    ui.label(
+                        RichText::new(format!("{} highlight warning(s)", reg.warnings.len()))
+                            .small()
+                            .color(pal::AMBER),
+                    )
+                    .on_hover_text(reg.warnings.join("\n"));
+                }
+            }
 
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let label = match (self.mode, will_send) {
@@ -370,13 +414,16 @@ impl App {
                         crate::git::Status::Untracked => "new file",
                     };
                     ui.label(RichText::new(kind).small().color(pal::DIM));
+                    if let Some(hl) = &f.hl {
+                        ui.label(RichText::new(&hl.lang).small().color(pal::DIM));
+                    }
                 });
-                let ext = f.ext().to_owned();
-                let binary = f.binary;
-                for (hi, h) in f.hunks.iter_mut().enumerate() {
+                let FileDiff { hunks, hl, binary, .. } = f;
+                let binary = *binary;
+                for (hi, h) in hunks.iter_mut().enumerate() {
                     let selected = sel_pair == Some((fi, hi));
                     let ctx = HunkCtx {
-                        ext: &ext,
+                        hl: hl.as_ref(),
                         binary,
                         selected,
                         row_h,
@@ -417,6 +464,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        while let Ok((i, hl)) = self.hl_rx.try_recv() {
+            if let Some(f) = self.files.get_mut(i) {
+                f.hl = Some(hl);
+            }
+        }
         self.keyboard(&ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_bar(ui));
@@ -431,7 +483,7 @@ impl eframe::App for App {
 }
 
 struct HunkCtx<'a> {
-    ext: &'a str,
+    hl: Option<&'a FileHl>,
     binary: bool,
     selected: bool,
     row_h: f32,
@@ -486,11 +538,6 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
             });
             ui.add_space(2.0);
 
-            if h.hl.is_none() {
-                if let Some(hl) = HL.get() {
-                    h.hl = Some(highlight(hl, h, c.ext));
-                }
-            }
             if diff_lines(ui, h, &c).clicked() {
                 clicked = true;
             }
@@ -514,9 +561,17 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
                 }
                 Decision::Edit => {
                     ui.label(RichText::new("Your replacement for the + lines:").small().color(pal::BLUE));
+                    let syn_name = c.hl.map(|hl| hl.lang.clone());
+                    let mono = c.mono.clone();
+                    let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                        let mut job = editor_job(buf.as_str(), syn_name.as_deref(), &mono);
+                        job.wrap.max_width = wrap;
+                        ui.painter().layout_job(job)
+                    };
                     let r = ui.add(
                         TextEdit::multiline(&mut h.edit_buf)
                             .code_editor()
+                            .layouter(&mut layouter)
                             .desired_rows(h.new.len().clamp(3, 30))
                             .desired_width(f32::INFINITY)
                             .lock_focus(true),
@@ -562,7 +617,13 @@ fn diff_lines(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx) -> egui::Response {
     }
     let painter = ui.painter();
     let clip = ui.clip_rect();
-    let hl = h.hl.as_ref().filter(|v| !v.is_empty());
+    let spans_for = |l: &model::DLine| -> Option<&Line> {
+        let hl = c.hl?;
+        match l.kind {
+            Kind::Del => hl.old.get(l.old_no? - 1),
+            _ => hl.new.get(l.new_no? - 1),
+        }
+    };
     for (i, l) in h.lines.iter().enumerate() {
         let top = rect.top() + i as f32 * c.row_h;
         let row = Rect::from_min_size(pos2(rect.left(), top), vec2(width, c.row_h));
@@ -606,12 +667,8 @@ fn diff_lines(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx) -> egui::Response {
             color: col,
             ..Default::default()
         };
-        match hl.and_then(|v| v.get(i)) {
-            Some(spans) if !spans.is_empty() => {
-                for (rgb, s) in spans {
-                    job.append(&s.replace('\t', "    "), 0.0, fmt(Color32::from_rgb(rgb[0], rgb[1], rgb[2])));
-                }
-            }
+        match spans_for(l) {
+            Some(spans) if !spans.is_empty() => append_spans(&mut job, spans, c.mono, true),
             _ => job.append(&l.text.replace('\t', "    "), 0.0, fmt(pal::TEXT)),
         }
         let galley = painter.layout_job(job);
@@ -627,26 +684,47 @@ fn diff_lines(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx) -> egui::Response {
     resp
 }
 
-fn highlight(hl: &Hl, h: &Hunk, ext: &str) -> Vec<Vec<([u8; 3], String)>> {
-    let Some(syn) = hl.ss.find_syntax_by_extension(ext) else {
-        return Vec::new();
+fn append_spans(job: &mut LayoutJob, spans: &Line, font: &FontId, expand_tabs: bool) {
+    for sp in spans {
+        let color = Color32::from_rgb(sp.rgb[0], sp.rgb[1], sp.rgb[2]);
+        job.append(
+            &if expand_tabs { sp.text.replace('\t', "    ") } else { sp.text.clone() },
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color,
+                italics: sp.italic,
+                underline: if sp.underline { Stroke::new(1.0, color) } else { Stroke::NONE },
+                ..Default::default()
+            },
+        );
+    }
+}
+
+/// Highlighted layout for the inline editor (re-run as you type; hunks are small).
+fn editor_job(text: &str, syntax: Option<&str>, font: &FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let plain = TextFormat { font_id: font.clone(), color: pal::TEXT, ..Default::default() };
+    let syn = REG
+        .get()
+        .zip(syntax)
+        .and_then(|(r, n)| r.ss.find_syntax_by_name(n).map(|s| (r, s)));
+    let Some((reg, syn)) = syn.filter(|_| text.len() < 64 * 1024) else {
+        job.append(text, 0.0, plain);
+        return job;
     };
-    let mut hi = syntect::easy::HighlightLines::new(syn, &hl.theme);
-    h.lines
-        .iter()
-        .map(|l| {
-            let line = format!("{}\n", l.text);
-            hi.highlight_line(&line, &hl.ss)
-                .map(|spans| {
-                    spans
-                        .into_iter()
-                        .map(|(st, s)| {
-                            let f = st.foreground;
-                            ([f.r, f.g, f.b], s.trim_end_matches('\n').to_owned())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .collect()
+    let lines = model::split_lines(text);
+    let hl = reg.highlight(syn, &lines, lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let body = line.trim_end_matches(['\n', '\r']);
+        match hl.get(i) {
+            // Spans must reproduce the buffer exactly or the cursor drifts.
+            Some(spans) if spans.iter().map(|s| s.text.len()).sum::<usize>() == body.len() => {
+                append_spans(&mut job, spans, font, false)
+            }
+            _ => job.append(body, 0.0, plain.clone()),
+        }
+        job.append(&line[body.len()..], 0.0, plain.clone());
+    }
+    job
 }

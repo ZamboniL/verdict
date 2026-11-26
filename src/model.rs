@@ -41,8 +41,6 @@ pub struct Hunk {
     pub decision: Decision,
     pub note: String,
     pub edit_buf: String,
-    /// Syntax-highlighted spans per line, filled lazily by the UI.
-    pub hl: Option<Vec<Vec<([u8; 3], String)>>>,
 }
 
 pub struct FileDiff {
@@ -56,9 +54,29 @@ pub struct FileDiff {
     pub old: Vec<String>,
     pub new: Vec<String>,
     pub hunks: Vec<Hunk>,
+    /// Filled in by the background highlighter.
+    pub hl: Option<FileHl>,
+}
+
+pub struct FileHl {
+    pub lang: String,
+    /// Highlighted lines of the index version / working-tree version, from line 1.
+    pub old: Vec<crate::highlight::Line>,
+    pub new: Vec<crate::highlight::Line>,
 }
 
 impl FileDiff {
+    /// Highest line number each side needs highlighted to render all hunks.
+    pub fn needed_lines(&self) -> (usize, usize) {
+        let mut o = 0;
+        let mut n = 0;
+        for l in self.hunks.iter().flat_map(|h| &h.lines) {
+            o = o.max(l.old_no.unwrap_or(0));
+            n = n.max(l.new_no.unwrap_or(0));
+        }
+        (o, n)
+    }
+
     pub fn ext(&self) -> &str {
         Path::new(&self.path)
             .extension()
@@ -132,6 +150,7 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
         old_bytes,
         new_bytes,
         hunks: Vec::new(),
+        hl: None,
     };
     if binary {
         f.hunks.push(Hunk {
@@ -151,7 +170,6 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
             decision: Decision::Pending,
             note: String::new(),
             edit_buf: String::new(),
-            hl: None,
         });
         return Ok(Some(f));
     }
@@ -228,7 +246,6 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
             lines,
             decision: Decision::Pending,
             note: String::new(),
-            hl: None,
         });
     }
     hunks
@@ -466,6 +483,7 @@ mod tests {
             old_bytes: old.into(),
             new_bytes: new.into(),
             hunks: compute_hunks(&o, &n),
+            hl: None,
             old: o,
             new: n,
         }
