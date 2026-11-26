@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+mod frontend;
 mod git;
+#[cfg(feature = "gui")]
+mod gui;
 mod highlight;
 mod model;
 mod session;
 mod tm;
-mod ui;
+#[cfg(feature = "tui")]
+mod tui;
+
+use frontend::Choice;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -16,11 +22,19 @@ verdict: hunk-by-hunk review of AI-written changes
 USAGE:
   verdict [PATH]     Review unstaged changes in the repo containing PATH (default: .)
                      Feedback is printed to stdout and saved to .git/verdict-feedback.md
-  verdict hook       Claude Code Stop hook entry point (reads hook JSON on stdin)
+  verdict hook       Claude Code hook entry point (reads hook JSON on stdin)
   verdict langs      List languages (builtin + yours) and grammar load warnings
   verdict themes     List syntax themes; the active one is marked with *
   verdict lang FILE  Show which language FILE is highlighted as
   verdict init       Create the config dir with an example config.toml
+
+INTERFACE:
+  --gui              Review in a native window
+  --tui              Review in the terminal
+  Without a flag: $VERDICT_UI (gui, tui or auto), then `mode` in the [ui] section of
+  config.toml, then auto: the window when a display is available, else the terminal.
+  From a hook, the terminal interface opens in a tmux popup, or in the terminal
+  emulator set by `terminal` in [ui].
 
 Syntax highlighting is extensible: drop grammars into ~/.config/verdict/grammars
 (.sublime-syntax, .tmLanguage, .tmLanguage.json), themes into .../themes
@@ -32,13 +46,27 @@ in the working tree. Nothing is written until you submit.
 
 fn main() -> ExitCode {
     wslg_env();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut flag = None;
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| match frontend::parse_flag(a) {
+            Some(c) => {
+                flag = Some(c);
+                false
+            }
+            None => true,
+        })
+        .collect();
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
             print!("{HELP}");
             ExitCode::SUCCESS
         }
-        Some("hook") => hook(),
+        Some("hook") => hook(flag),
+        Some("__tui") => match (args.get(1), args.get(2)) {
+            (Some(repo), Some(dir)) => frontend::tui_child(Path::new(repo), Path::new(dir)),
+            _ => ExitCode::FAILURE,
+        },
         Some("langs") => langs(),
         Some("themes") => themes(),
         Some("lang") => match args.get(1) {
@@ -49,7 +77,7 @@ fn main() -> ExitCode {
             }
         },
         Some("init") => init(),
-        other => manual(Path::new(other.unwrap_or("."))),
+        other => manual(Path::new(other.unwrap_or(".")), flag),
     }
 }
 
@@ -68,7 +96,7 @@ fn wslg_env() {
     }
 }
 
-fn manual(path: &Path) -> ExitCode {
+fn manual(path: &Path, flag: Option<Choice>) -> ExitCode {
     let Some(repo) = git::toplevel(path) else {
         eprintln!("verdict: {} is not inside a git repository", path.display());
         return ExitCode::FAILURE;
@@ -84,8 +112,10 @@ fn manual(path: &Path) -> ExitCode {
         eprintln!("verdict: no unstaged changes to review");
         return ExitCode::SUCCESS;
     }
-    match ui::run(repo.clone(), files, ui::Mode::Manual) {
-        Ok(Some(ui::Outcome { message: Some(m) })) => {
+    let cfg = frontend::ui_config();
+    let choice = frontend::choice(flag, &cfg);
+    match frontend::run(repo.clone(), files, frontend::Mode::Manual, choice, &cfg) {
+        Ok(Some(frontend::Outcome { message: Some(m) })) => {
             print!("{m}");
             if let Some(p) = git_dir(&repo) {
                 let _ = std::fs::write(p.join("verdict-feedback.md"), &m);
@@ -191,7 +221,7 @@ fn git_dir(repo: &Path) -> Option<PathBuf> {
 ///   continue with `reason` as instructions.
 ///
 /// Any failure on our side must never wedge the agent, so every error path exits 0 silently.
-fn hook() -> ExitCode {
+fn hook(flag: Option<Choice>) -> ExitCode {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
@@ -244,21 +274,23 @@ fn hook() -> ExitCode {
         Ok(f) if !f.is_empty() => f,
         _ => return ExitCode::SUCCESS,
     };
-    let outcome = ui::run(repo.clone(), files, ui::Mode::Hook);
+    let cfg = frontend::ui_config();
+    let choice = frontend::choice(flag, &cfg);
+    let outcome = frontend::run(repo.clone(), files, frontend::Mode::Hook, choice, &cfg);
     // Whatever happened, the reviewed state is the new baseline: if the agent
     // continues, the next Stop shows only what it changes in response.
     if let Ok(snap) = session::snapshot(&repo) {
         session::save(&repo, sess, &snap);
     }
     match outcome {
-        Ok(Some(ui::Outcome { message: Some(m) })) => {
+        Ok(Some(frontend::Outcome { message: Some(m) })) => {
             println!(
                 "{}",
                 serde_json::json!({ "decision": "block", "reason": m })
             );
         }
         Ok(_) => {}
-        Err(e) => eprintln!("verdict: could not open review window: {e}"),
+        Err(e) => eprintln!("verdict: could not open the review: {e}"),
     }
     ExitCode::SUCCESS
 }

@@ -3,7 +3,7 @@
 //!
 //! Layout of the config dir (`$XDG_CONFIG_HOME/verdict`, default `~/.config/verdict`):
 //!
-//!   config.toml       theme + file associations
+//!   config.toml       interface choice, theme, file associations
 //!   grammars/         *.sublime-syntax, *.tmLanguage, *.tmLanguage.json
 //!   themes/           *.tmTheme, VS Code *.json color themes
 //!   extensions/       unpacked VS Code extensions (anything with a package.json
@@ -64,6 +64,17 @@ struct HighlightCfg {
 }
 
 pub const EXAMPLE_CONFIG: &str = r#"# verdict configuration
+
+[ui]
+# "gui" (native window), "tui" (terminal) or "auto": the window when a display is
+# available, else the terminal. `--gui` / `--tui` and $VERDICT_UI override this.
+mode = "auto"
+# From the Claude Code hook, the terminal interface can't use the agent's terminal.
+# Inside tmux it opens in a popup. Elsewhere, give a command that opens a terminal
+# emulator and runs the program appended to it:
+# terminal = ["wezterm", "start", "--"]
+# terminal = ["kitty"]
+# terminal = ["gnome-terminal", "--wait", "--"]
 
 [highlight]
 # Any builtin theme (`verdict themes` lists them) or the name of a theme you drop

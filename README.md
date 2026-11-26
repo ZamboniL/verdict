@@ -2,8 +2,9 @@
 
 **Code review for AI-written changes, hunk by hunk, fed straight back to the agent.**
 
-verdict is a small native app, written in Rust with egui, that opens when your coding
-agent finishes a turn. It shows exactly what changed. You approve, reject, edit or
+verdict is a small native app, written in Rust, that opens when your coding agent
+finishes a turn. It runs as a native window (egui) or right in your terminal
+(ratatui). It shows exactly what changed. You approve, reject, edit or
 comment on each hunk or each whole file. Your verdict goes back to the agent as its
 next instruction.
 
@@ -43,6 +44,8 @@ verdict does one job:
 - Files are highlighted from their first line, so a hunk that starts inside a
   multi-line comment or string still renders correctly.
 - Keyboard-driven, but every action is also a button.
+- **Window or terminal**: the same review as a native window or a terminal UI.
+  It works over SSH and in tmux.
 - **Claude Code** integration through hooks. It works standalone with any agent.
 
 ## Install
@@ -74,9 +77,42 @@ Run it inside any git repository that has uncommitted changes:
 verdict
 ```
 
-Review, then press **Ctrl+Enter** to submit. The feedback message prints to stdout
+Review, then press **Ctrl+Enter** to submit (**S** or **Ctrl+S** in the terminal). The feedback message prints to stdout
 and is also saved to `.git/verdict-feedback.md`, so you can paste it into any
 agent: Claude Code, Codex, Aider, Cursor, or anything else.
+
+## Window or terminal
+
+```sh
+verdict --gui     # native window
+verdict --tui     # terminal interface
+```
+
+Without a flag, verdict uses `$VERDICT_UI` (`gui`, `tui` or `auto`), then `mode` in
+the `[ui]` section of `config.toml`, then **auto**: the window when a display is
+available, otherwise the terminal.
+
+The terminal interface draws on `/dev/tty`, so `verdict --tui > review.md` still
+works. Notes are typed in the bottom bar. **Ctrl+O** opens a note in `$EDITOR`
+instead, and **e** edits a hunk in `$EDITOR`. Press **?** for every key.
+
+**From the hook**, Claude Code owns the terminal, so the terminal interface opens
+somewhere else:
+
+- **Inside tmux**, it opens in a popup over the agent (tmux 3.2+).
+- **Otherwise**, set a command that opens a terminal emulator. verdict appends its
+  own command to it:
+
+  ```toml
+  [ui]
+  mode = "tui"
+  terminal = ["wezterm", "start", "--"]   # or ["kitty"], ["gnome-terminal", "--wait", "--"]
+  ```
+
+  If there's neither, verdict falls back to the window when it can open one.
+
+To leave the window out of the build, for example on a server:
+`cargo install --path . --no-default-features --features tui`.
 
 ## Claude Code integration
 
@@ -129,7 +165,10 @@ in the environment to turn verdict off for a session.
 | `f` | show the whole file around its hunks |
 | `Space` | fold / unfold the current file |
 | `Esc` | leave a text box |
-| `Ctrl+Enter` | submit |
+| `Ctrl+Enter` | submit (in the terminal: `S`, which asks first, or `Ctrl+S`) |
+
+The terminal interface adds `x` (clear a decision), `Enter` (write the note),
+`m` (general message), `]`/`[` (next/previous file) and `q` (quit). `?` lists them all.
 
 Pressing an active decision again clears it. **Approve file** folds the card and
 moves on to the next undecided file. Hunks you leave undecided stay as they are,
@@ -187,7 +226,7 @@ Run `verdict init` to create `~/.config/verdict` (or `$XDG_CONFIG_HOME/verdict`)
 
 | Path | Accepts |
 |---|---|
-| `config.toml` | theme choice and file associations |
+| `config.toml` | interface choice, theme and file associations |
 | `grammars/` | `.sublime-syntax`, `.tmLanguage`, `.tmLanguage.json` |
 | `themes/` | `.tmTheme`, VS Code color themes (`.json`) |
 | `extensions/` | unpacked VS Code extensions |
