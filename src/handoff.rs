@@ -15,8 +15,8 @@
 //! Feedback too long to pass inline is saved to `.git/verdict/feedback/<session>.md`
 //! and the agent is told to read it.
 
-use crate::git;
 use crate::session::{self, Snapshot};
+use crate::store;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -70,22 +70,11 @@ impl Owner {
 }
 
 fn verdict_dir(repo: &Path, sub: &str) -> Option<PathBuf> {
-    Some(git::git_dir(repo)?.join("verdict").join(sub))
+    Some(store::dir(repo)?.join(sub))
 }
 
 fn path(repo: &Path, sub: &str, id: &str, ext: &str) -> Option<PathBuf> {
     Some(verdict_dir(repo, sub)?.join(format!("{}.{ext}", session::safe_id(id)?)))
-}
-
-/// Write then rename, so a reader never sees half a file.
-fn write_atomic(p: &Path, text: &str) -> bool {
-    if let Some(d) = p.parent() {
-        if std::fs::create_dir_all(d).is_err() {
-            return false;
-        }
-    }
-    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, p).is_ok()
 }
 
 fn forget_old(dir: &Path) {
@@ -115,7 +104,7 @@ pub fn update(repo: &Path, id: &str, f: impl FnOnce(&mut Owner)) {
     f(&mut o);
     // Written even when nothing changed: the file's age is the session's activity.
     if let Ok(text) = serde_json::to_string(&o) {
-        write_atomic(&p, &text);
+        let _ = store::write_atomic(&p, &text);
     }
     if let Some(d) = p.parent() {
         forget_old(d);
@@ -201,7 +190,7 @@ pub fn queue(repo: &Path, id: &str, feedback: &str) -> bool {
         Ok(old) if !old.trim().is_empty() => format!("{}\n\n---\n\n{feedback}", old.trim_end()),
         _ => feedback.to_owned(),
     };
-    let ok = write_atomic(&p, &text);
+    let ok = store::write_atomic(&p, &text).is_ok();
     if let Some(d) = p.parent() {
         forget_old(d);
     }
@@ -230,7 +219,7 @@ fn inline_or_file(repo: &Path, id: &str, feedback: &str, max: usize) -> String {
         return feedback.to_owned();
     }
     match path(repo, "feedback", id, "md") {
-        Some(p) if write_atomic(&p, feedback) => format!(
+        Some(p) if store::write_atomic(&p, feedback).is_ok() => format!(
             "The code review of your changes is too long to include here. Read it in \
              `{}` and act on it.",
             p.display()
@@ -323,22 +312,7 @@ mod tests {
     use super::*;
 
     fn repo() -> PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "verdict-handoff-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ok = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        assert!(ok.success());
-        dir
+        crate::testutil::repo("handoff")
     }
 
     fn snap(pairs: &[(&str, &str)]) -> Snapshot {

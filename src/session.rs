@@ -13,6 +13,7 @@
 //! turn, or what the agent changed before them would never be reviewed.
 
 use crate::git::{self, Status};
+use crate::store;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,7 +57,7 @@ pub fn touched(base: &Snapshot, now: &Snapshot) -> HashSet<String> {
 }
 
 fn dir(repo: &Path) -> Option<PathBuf> {
-    Some(git::git_dir(repo)?.join("verdict").join("sessions"))
+    Some(store::dir(repo)?.join("sessions"))
 }
 
 /// A session id that's safe to use as a file name. `None` if nothing is left.
@@ -136,11 +137,8 @@ pub fn save(repo: &Path, session: &str, turn: &Turn) {
     let (Some(d), Some(f)) = (dir(repo), file(repo, session)) else {
         return;
     };
-    if std::fs::create_dir_all(&d).is_err() {
-        return;
-    }
     if let Ok(text) = serde_json::to_string(turn) {
-        let _ = std::fs::write(f, text);
+        let _ = store::write_atomic(&f, text);
     }
     // Forget sessions idle for a week.
     let cutoff = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
@@ -317,11 +315,12 @@ fn is_prompt(v: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::testutil::{self, git};
 
     #[test]
     fn last_reply_is_the_text_after_the_last_tool_call() {
-        let f = std::env::temp_dir().join(format!("verdict-reply-{}.jsonl", std::process::id()));
+        let dir = testutil::temp_dir("reply");
+        let f = dir.join("t.jsonl");
         let user = |c: &str| format!(r#"{{"type":"user","message":{{"content":{c}}}}}"#);
         let text = |t: &str| {
             format!(
@@ -355,14 +354,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last_reply(&f), None);
-        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reads_turn_activity_from_transcript() {
-        let dir = std::env::temp_dir().join(format!("verdict-tr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = testutil::temp_dir("activity");
         let repo = std::fs::canonicalize(&dir).unwrap();
         let f = repo.join("t.jsonl");
         let user = |c: &str| format!(r#"{{"type":"user","message":{{"content":{c}}}}}"#);
@@ -433,31 +430,11 @@ mod tests {
 
     #[test]
     fn only_turn_changes_count() {
-        let dir = std::env::temp_dir().join(format!("verdict-sess-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sh = |args: &[&str]| {
-            let o = Command::new("git")
-                .arg("-C")
-                .arg(&dir)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-        };
-        sh(&["init", "-q"]);
+        let dir = testutil::repo("turn-changes");
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
-        sh(&["add", "."]);
-        sh(&[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "init",
-        ]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
 
         // Someone else's leftover change, present before the turn starts.
         std::fs::write(dir.join("a.txt"), "a changed by another session\n").unwrap();
@@ -484,15 +461,7 @@ mod tests {
 
     #[test]
     fn a_prompt_mid_turn_keeps_the_turns_baseline() {
-        let dir = std::env::temp_dir().join(format!("verdict-turn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ok = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        assert!(ok.success());
+        let dir = testutil::repo("turn-queued");
 
         // The turn starts, then the agent writes a file.
         start_turn(&dir, "s", None);

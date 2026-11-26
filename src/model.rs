@@ -1071,6 +1071,7 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{self, git};
 
     fn file(old: &str, new: &str) -> FileDiff {
         let o = split_lines(old);
@@ -1153,36 +1154,11 @@ mod tests {
 
     #[test]
     fn apply_against_real_repo() {
-        use std::process::Command;
-        let dir = std::env::temp_dir().join(format!("verdict-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sh = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(&dir)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                ok.status.success(),
-                "{:?}",
-                String::from_utf8_lossy(&ok.stderr)
-            );
-        };
-        sh(&["init", "-q"]);
+        let dir = testutil::repo("apply");
         std::fs::write(dir.join("t.txt"), OLD).unwrap();
         std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
-        sh(&["add", "."]);
-        sh(&[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "init",
-        ]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
         std::fs::write(dir.join("t.txt"), NEW).unwrap();
         std::fs::write(dir.join("new.txt"), "fresh\n").unwrap();
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
@@ -1230,48 +1206,20 @@ mod tests {
 
     #[test]
     fn staged_and_range_sources() {
-        use std::process::Command;
-        let dir = std::env::temp_dir().join(format!("verdict-src-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sh = |args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&dir)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{:?}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        let commit = |m: &str| {
-            sh(&[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                m,
-            ])
-        };
-        sh(&["init", "-q", "-b", "main"]);
+        let dir = testutil::repo("sources");
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
-        sh(&["add", "."]);
-        commit("c1");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "c1"]);
         // Commit 2: modify a, delete gone, add b.
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
         std::fs::write(dir.join("b.txt"), "new\n").unwrap();
-        sh(&["add", "-A"]);
-        commit("c2");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "c2"]);
         // Staged change, plus an unstaged one that --staged must not show.
         std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        sh(&["add", "a.txt"]);
+        git(&dir, &["add", "a.txt"]);
         std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
 
         let staged = load_source(&dir, &git::Source::Staged, None).unwrap();
@@ -1294,7 +1242,7 @@ mod tests {
         assert!(files[2].new.is_empty() && files[2].old.concat() == "bye\n");
 
         // A...B starts from the merge base: a branch off c1 compared with main.
-        sh(&["branch", "side", "HEAD~1"]);
+        git(&dir, &["branch", "side", "HEAD~1"]);
         let tri = git::parse_range(&dir, "side...main").unwrap();
         assert_eq!(load_source(&dir, &tri, None).unwrap().len(), 3);
         assert!(git::parse_range(&dir, "nope..").is_err());
@@ -1412,39 +1360,15 @@ mod tests {
         );
     }
 
-    fn git_repo(name: &str) -> (std::path::PathBuf, impl Fn(&[&str])) {
-        use std::process::Command;
-        let dir = std::env::temp_dir().join(format!("verdict-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.clone();
-        let sh = move |args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&d)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{:?}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        sh(&["init", "-q"]);
-        (dir, sh)
-    }
-
     const BODY: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n";
 
     #[test]
     fn renames_are_paired_and_applied() {
-        let (dir, sh) = git_repo("rename");
+        let dir = testutil::repo("rename");
         std::fs::write(dir.join("old.txt"), BODY).unwrap();
         std::fs::write(dir.join("other.txt"), "unrelated\n").unwrap();
-        sh(&["add", "."]);
-        sh(&["commit", "-qm", "init"]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
         // Moved with one line changed, and an unrelated new file.
         std::fs::remove_file(dir.join("old.txt")).unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -1489,10 +1413,10 @@ mod tests {
 
     #[test]
     fn rejecting_a_rename_moves_it_back() {
-        let (dir, sh) = git_repo("unrename");
+        let dir = testutil::repo("unrename");
         std::fs::write(dir.join("old.txt"), BODY).unwrap();
-        sh(&["add", "."]);
-        sh(&["commit", "-qm", "init"]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
         std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
 
         let mut files = load(&dir).unwrap();
@@ -1512,16 +1436,16 @@ mod tests {
 
     #[test]
     fn renames_in_commit_ranges() {
-        let (dir, sh) = git_repo("rename-range");
+        let dir = testutil::repo("rename-range");
         std::fs::write(dir.join("a.txt"), BODY).unwrap();
         std::fs::write(dir.join("b.txt"), "something else entirely\n").unwrap();
-        sh(&["add", "."]);
-        sh(&["commit", "-qm", "c1"]);
-        sh(&["mv", "a.txt", "c.txt"]);
-        sh(&["rm", "-q", "b.txt"]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "c1"]);
+        git(&dir, &["mv", "a.txt", "c.txt"]);
+        git(&dir, &["rm", "-q", "b.txt"]);
         std::fs::write(dir.join("d.txt"), "a brand new file\n").unwrap();
-        sh(&["add", "."]);
-        sh(&["commit", "-qm", "c2"]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "c2"]);
         let range = git::parse_range(&dir, "HEAD~1..").unwrap();
         let files = load_source(&dir, &range, None).unwrap();
         let got: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.status)).collect();

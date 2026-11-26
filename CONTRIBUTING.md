@@ -56,6 +56,7 @@ and set up the hooks as described in the README.
 | `src/handoff.rs` | sending feedback to a session whose turn is over |
 | `src/review.rs` | review state shared by both interfaces: decisions, selection, folds, line mode |
 | `src/draft.rs` | saving unsubmitted reviews and restoring them |
+| `src/store.rs` | where verdict keeps its state (`.git/verdict`), written atomically |
 | `src/ui/` | choosing and starting the interface (`config.rs`, `launch.rs`), the background highlighter |
 | `src/ui/gui/` | the egui review window: `diff.rs` and `hunk.rs` draw the review, `code.rs` the code rows |
 | `src/ui/tui/` | the ratatui terminal interface: `rows.rs` lays out the review, `render.rs` draws it, `input.rs` handles keys |
@@ -85,7 +86,8 @@ Some rules that keep it this way:
 Unit tests live in a `#[cfg(test)]` module at the bottom of each file. The
 `model.rs` and `session.rs` tests build real git repositories in a temp
 directory, so they exercise actual `git` behavior. Follow that pattern for
-anything that touches git.
+anything that touches git, with the helpers in `src/testutil.rs`: `repo` makes a
+repository, `git` runs a command in it, and `temp_dir` makes a scratch directory.
 
 Add tests when you change how diffs are parsed, how decisions are applied, the
 feedback message, session tracking, or grammar conversion. A bug fix should come

@@ -6,6 +6,9 @@ mod highlight;
 mod model;
 mod review;
 mod session;
+mod store;
+#[cfg(test)]
+mod testutil;
 mod tm;
 mod ui;
 

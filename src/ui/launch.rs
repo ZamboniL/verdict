@@ -6,6 +6,7 @@
 use super::{Mode, Outcome, TmuxPlace, UiConfig, run_tui, ui_config};
 use crate::git::Source;
 use crate::review::Review;
+use crate::store;
 use std::path::Path;
 
 /// Run the terminal interface in a tmux popup or a new terminal window, as a child
@@ -166,10 +167,7 @@ pub fn tui_child(repo: &Path, dir: &Path) -> std::process::ExitCode {
         Ok(None) => serde_json::json!({ "submitted": false }),
         Err(e) => serde_json::json!({ "error": e }),
     };
-    // Write then rename, so the parent never reads half a file.
-    let tmp = dir.join("result.tmp");
-    if std::fs::write(&tmp, v.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, dir.join("result.json"));
-    }
+    // The parent polls for this file, so it must never see half of it.
+    let _ = store::write_atomic(&dir.join("result.json"), v.to_string());
     std::process::ExitCode::SUCCESS
 }

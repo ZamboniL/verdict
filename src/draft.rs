@@ -8,9 +8,10 @@
 //! reviews open in the same repo don't overwrite each other's drafts. Submitting, or
 //! discarding the review on purpose, removes its entries.
 
-use crate::git::{self, Source};
+use crate::git::Source;
 use crate::model::{Decision, FileDiff, LineComment};
 use crate::review::Review;
+use crate::store;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -207,7 +208,7 @@ impl Drafts {
             all.feed(k.as_bytes());
         }
         let mut d = Drafts {
-            path: git::git_dir(repo).map(|g| g.join("verdict").join("draft.json")),
+            path: store::dir(repo).map(|d| d.join("draft.json")),
             keys,
             review: all.hex(),
             last: None,
@@ -263,14 +264,7 @@ impl Drafts {
         let Ok(text) = serde_json::to_string(store) else {
             return;
         };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        // Write then rename, so a crash never leaves half a file.
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+        let _ = store::write_atomic(path, text);
     }
 
     /// This review's part of the store, as text, to compare with the last save.
@@ -365,22 +359,7 @@ mod tests {
     const NEW: &str = "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\nm\n";
 
     fn repo() -> PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "verdict-draft-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ok = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        assert!(ok.success());
-        dir
+        crate::testutil::repo("draft")
     }
 
     fn review(files: Vec<FileDiff>) -> Review {
@@ -451,12 +430,7 @@ mod tests {
         b2.select(0);
         b2.clear();
         db2.save(&b2);
-        assert!(
-            !git::git_dir(&dir)
-                .unwrap()
-                .join("verdict/draft.json")
-                .exists()
-        );
+        assert!(!store::dir(&dir).unwrap().join("draft.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
