@@ -36,6 +36,7 @@ verdict does one job:
 - Edit hunks inline. The agent sees exactly what you changed.
 - **Full file** view: show the whole file, with unchanged code between the hunk
   cards, when 3 lines of context aren't enough.
+- **Split view**: old and new side by side, in the window and in the terminal.
 - Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
   gutter. Cards fold away when you're done with them.
 - Syntax highlighting for about 200 languages out of the box. You can add more
@@ -66,6 +67,13 @@ This installs the `verdict` binary into `~/.cargo/bin`.
 - **Linux:** tested, including **WSL2**. On WSL2 it runs as a Linux GUI app
   through WSLg, so it reads your repo at native speed without going through the
   slow Windows-to-WSL file bridge.
+  The window uses whichever of X11 and Wayland is available. When both are, it
+  uses Wayland only if `XDG_SESSION_TYPE=wayland`. WSLg offers both and sets no
+  session type, so verdict uses X11 there, which also avoids a WSLg compositor
+  crash when a Wayland window is resized. X11 needs
+  `libxkbcommon-x11-0` (`sudo apt install libxkbcommon-x11-0`); without it,
+  verdict warns and uses Wayland. `VERDICT_GUI_BACKEND=wayland` or `x11`
+  overrides the choice.
 - **macOS:** expected to work, but not tested yet.
 - **Native Windows:** not supported yet. Use WSL2.
 
@@ -163,14 +171,19 @@ in the environment to turn verdict off for a session.
 | Key | Does |
 |---|---|
 | `j` / `k` | next / previous hunk |
+| `]` / `[` | next / previous file |
+| `g` / `G` | first / last hunk |
 | `n` | jump to the next undecided hunk |
+| `x` | clear the hunk's decision |
 | `f` | show the whole file around its hunks |
+| `s` | split view: old and new side by side |
 | `Space` | fold / unfold the current file |
 | `Esc` | leave a text box |
 | `Ctrl+Enter` | submit (in the terminal: `S`, which asks first, or `Ctrl+S`) |
 
-The terminal interface adds `x` (clear a decision), `Enter` (write the note),
-`m` (general message), `]`/`[` (next/previous file) and `q` (quit). `?` lists them all.
+The terminal interface adds `Enter` (write the note), `m` (general message) and
+`q` (quit). `?` lists them all. To start in the split view, set `layout = "split"`
+in the `[ui]` section of `config.toml`.
 
 Pressing an active decision again clears it. **Approve file** folds the card and
 moves on to the next undecided file. Hunks you leave undecided stay as they are,

@@ -20,11 +20,12 @@ similar = "3.2.1"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "yaml-load", "plist-load", "dump-load", "dump-create", "regex-onig", "default-syntaxes", "default-themes"] }
 toml = "1.2.3"
 two-face = "0.5.2"
+winit = { version = "0.30", default-features = false, features = ["x11"], optional = true }
 
 [features]
 default = ["gui", "tui"]
 # The native egui window.
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "dep:winit"]
 # The terminal interface.
 tui = ["dep:ratatui", "dep:crossterm"]
 

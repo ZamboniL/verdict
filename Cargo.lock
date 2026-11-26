@@ -3563,6 +3563,7 @@ dependencies = [
  "syntect",
  "toml",
  "two-face",
+ "winit",
 ]
 
 [[package]]

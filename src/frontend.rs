@@ -99,6 +99,8 @@ pub struct UiConfig {
     /// Command that opens a terminal emulator running the program given after it,
     /// e.g. `["wezterm", "start", "--"]`. Used by the hook when not inside tmux.
     pub terminal: Vec<String>,
+    /// Start in the side-by-side view (`layout = "split"`).
+    pub split: bool,
 }
 
 pub fn ui_config() -> UiConfig {
@@ -120,6 +122,7 @@ pub fn ui_config() -> UiConfig {
     UiConfig {
         mode: ui.get("mode").and_then(|m| m.as_str()).and_then(Choice::parse),
         terminal,
+        split: ui.get("layout").and_then(|m| m.as_str()) == Some("split"),
     }
 }
 
@@ -166,15 +169,16 @@ pub fn run(
     choice: Choice,
     cfg: &UiConfig,
 ) -> Result<Option<Outcome>, String> {
+    let split = cfg.split;
     if !want_tui(choice) {
-        return run_gui(repo, files, mode);
+        return run_gui(repo, files, mode, split);
     }
     match mode {
-        Mode::Manual => run_tui(repo, files, mode),
+        Mode::Manual => run_tui(repo, files, mode, split),
         // The agent's own interface owns our terminal, so the review needs another one.
         Mode::Hook => match elsewhere(&repo, &files, cfg) {
             Some(r) => r,
-            None if has_display() => run_gui(repo, files, mode),
+            None if has_display() => run_gui(repo, files, mode, split),
             None => Err("the terminal interface needs tmux, or a `terminal` command in the \
                          [ui] section of config.toml, when run from a hook"
                 .into()),
@@ -183,22 +187,22 @@ pub fn run(
 }
 
 #[cfg(feature = "gui")]
-fn run_gui(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Outcome>, String> {
-    crate::gui::run(repo, files, mode)
+fn run_gui(repo: PathBuf, files: Vec<FileDiff>, mode: Mode, split: bool) -> Result<Option<Outcome>, String> {
+    crate::gui::run(repo, files, mode, split)
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui(_: PathBuf, _: Vec<FileDiff>, _: Mode) -> Result<Option<Outcome>, String> {
+fn run_gui(_: PathBuf, _: Vec<FileDiff>, _: Mode, _: bool) -> Result<Option<Outcome>, String> {
     Err("verdict was built without the `gui` feature".into())
 }
 
 #[cfg(feature = "tui")]
-fn run_tui(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Outcome>, String> {
-    crate::tui::run(repo, files, mode)
+fn run_tui(repo: PathBuf, files: Vec<FileDiff>, mode: Mode, split: bool) -> Result<Option<Outcome>, String> {
+    crate::tui::run(repo, files, mode, split)
 }
 
 #[cfg(not(feature = "tui"))]
-fn run_tui(_: PathBuf, _: Vec<FileDiff>, _: Mode) -> Result<Option<Outcome>, String> {
+fn run_tui(_: PathBuf, _: Vec<FileDiff>, _: Mode, _: bool) -> Result<Option<Outcome>, String> {
     Err("verdict was built without the `tui` feature".into())
 }
 
@@ -325,7 +329,7 @@ pub fn tui_child(repo: &Path, dir: &Path) -> std::process::ExitCode {
         if files.is_empty() {
             return Ok(None);
         }
-        run_tui(repo.to_path_buf(), files, Mode::Hook)
+        run_tui(repo.to_path_buf(), files, Mode::Hook, ui_config().split)
     })();
     let v = match result {
         Ok(Some(o)) => serde_json::json!({ "submitted": true, "message": o.message }),

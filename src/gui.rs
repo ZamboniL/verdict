@@ -4,13 +4,13 @@
 use crate::frontend::{Mode, Outcome, REG, hl_jobs, run_highlighter};
 use crate::highlight::Line;
 use crate::model::{self, Decision, FileDiff, FileHl, Hunk, Kind};
+use crate::review::{Effect, Review};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Event, FontId, Key, Modifiers, Rect, RichText, Sense,
     Stroke, TextEdit, TextFormat, TextStyle, Vec2, pos2, text::LayoutJob, vec2,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -25,6 +25,8 @@ mod pal {
     pub const DIM: Color32 = Color32::from_rgb(0x7a, 0x80, 0x8c);
     pub const ADD_BG: Color32 = Color32::from_rgb(0x1d, 0x33, 0x26);
     pub const DEL_BG: Color32 = Color32::from_rgb(0x3a, 0x20, 0x24);
+    /// The empty side of a split row.
+    pub const EMPTY: Color32 = Color32::from_rgb(0x19, 0x1b, 0x20);
     pub const GREEN: Color32 = Color32::from_rgb(0x5f, 0xc2, 0x7e);
     pub const RED: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x75);
     pub const BLUE: Color32 = Color32::from_rgb(0x61, 0xaf, 0xef);
@@ -42,7 +44,7 @@ fn decision_color(d: Decision) -> Color32 {
     }
 }
 
-pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Outcome>, String> {
+pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode, split: bool) -> Result<Option<Outcome>, String> {
     let result: Rc<RefCell<Option<Outcome>>> = Rc::default();
     let name = repo
         .file_name()
@@ -54,6 +56,12 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
             .with_app_id("verdict")
             .with_inner_size([1280.0, 860.0])
             .with_min_inner_size([640.0, 400.0]),
+        event_loop_builder: prefer_x11().then(|| -> eframe::EventLoopBuilderHook {
+            Box::new(|b| {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                b.with_x11();
+            })
+        }),
         ..Default::default()
     };
     let res = result.clone();
@@ -66,33 +74,91 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
             let jobs = hl_jobs(&files);
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || run_highlighter(jobs, tx, move || ctx.request_repaint()));
-            let flat = files
-                .iter()
-                .enumerate()
-                .flat_map(|(fi, f)| (0..f.hunks.len()).map(move |hi| (fi, hi)))
-                .collect();
             Ok(Box::new(App {
                 repo,
-                files,
+                r: Review::new(files, split),
                 mode,
-                flat,
-                sel: 0,
                 scroll_to_sel: false,
                 focus_note: false,
                 focus_edit: false,
-                general: String::new(),
                 error: None,
                 result: res,
                 done: false,
                 hl_rx: rx,
-                collapsed: HashSet::new(),
-                full: HashMap::new(),
                 focus_file_note: None,
             }))
         }),
     )
     .map_err(|e| e.to_string())?;
     Ok(result.take())
+}
+
+/// Whether to open the window through X11 instead of Wayland: if only one of the two
+/// display servers is reachable, use it; if both are, use Wayland only when
+/// `XDG_SESSION_TYPE=wayland`.
+///
+/// This matters on WSLg, which offers both and sets no session type: there it picks
+/// X11, which avoids a WSLg compositor crash when a Wayland window is resized.
+/// `VERDICT_GUI_BACKEND=wayland|x11` overrides.
+fn prefer_x11() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    match std::env::var("VERDICT_GUI_BACKEND").as_deref() {
+        Ok("x11") => return true,
+        Ok("wayland") => return false,
+        _ => {}
+    }
+    let var = |k: &str| std::env::var(k).ok();
+    let wayland = wayland_reachable(var("WAYLAND_SOCKET"), var("WAYLAND_DISPLAY"), var("XDG_RUNTIME_DIR"));
+    let x11 = var("DISPLAY").is_some_and(|d| !d.is_empty());
+    if !pick_x11(var("XDG_SESSION_TYPE").as_deref(), wayland, x11) {
+        return false;
+    }
+    // winit needs these for X11. Without them, stay on Wayland if we can.
+    if !wayland || (has_lib("libxkbcommon-x11.so.0") && has_lib("libxcb-xkb.so.1")) {
+        return true;
+    }
+    eprintln!(
+        "verdict: using Wayland because libxkbcommon-x11 isn't installed. On WSLg, \
+         resizing a Wayland window can crash the compositor: install libxkbcommon-x11-0."
+    );
+    false
+}
+
+/// The session type decides, unless exactly one display server is reachable.
+fn pick_x11(session_type: Option<&str>, wayland: bool, x11: bool) -> bool {
+    let use_wayland = if wayland != x11 { wayland } else { session_type == Some("wayland") };
+    !use_wayland
+}
+
+/// WAYLAND_SOCKET, then WAYLAND_DISPLAY, then a wayland-0 socket in XDG_RUNTIME_DIR.
+fn wayland_reachable(socket: Option<String>, display: Option<String>, runtime_dir: Option<String>) -> bool {
+    if let Some(s) = socket {
+        return !s.is_empty();
+    }
+    if let Some(d) = display {
+        return !d.is_empty();
+    }
+    runtime_dir.is_some_and(|d| std::path::Path::new(&d).join("wayland-0").exists())
+}
+
+/// A shared library is in LD_LIBRARY_PATH or a usual system directory.
+fn has_lib(name: &str) -> bool {
+    let extra = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    extra
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .chain([
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+            "/lib",
+        ])
+        .any(|d| std::path::Path::new(d).join(name).exists())
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -116,137 +182,51 @@ fn setup_style(ctx: &egui::Context) {
 
 struct App {
     repo: PathBuf,
-    files: Vec<FileDiff>,
+    r: Review,
     mode: Mode,
-    /// (file index, hunk index) for every hunk, in display order.
-    flat: Vec<(usize, usize)>,
-    sel: usize,
     scroll_to_sel: bool,
     focus_note: bool,
     focus_edit: bool,
-    general: String,
     error: Option<String>,
     result: Rc<RefCell<Option<Outcome>>>,
     done: bool,
     hl_rx: mpsc::Receiver<(usize, FileHl)>,
-    collapsed: HashSet<usize>,
-    /// Files shown in full: their unchanged blocks between hunks.
-    full: HashMap<usize, Vec<Vec<model::DLine>>>,
     focus_file_note: Option<usize>,
 }
 
 impl App {
-    fn sel_hunk(&mut self) -> Option<&mut Hunk> {
-        let (fi, hi) = *self.flat.get(self.sel)?;
-        self.files.get_mut(fi)?.hunks.get_mut(hi)
+    /// Focus the text box or editor the review asks for next.
+    fn effect(&mut self, e: Effect) {
+        match e {
+            Effect::HunkNote(..) => self.focus_note = true,
+            Effect::EditHunk(..) => self.focus_edit = true,
+            Effect::FileNote(fi) => self.focus_file_note = Some(fi),
+            Effect::None | Effect::Binary => {}
+        }
     }
 
     fn set_decision(&mut self, d: Decision) {
-        let binary = self
-            .flat
-            .get(self.sel)
-            .is_some_and(|&(fi, _)| self.files[fi].binary);
-        if binary && matches!(d, Decision::Edit) {
-            return;
-        }
-        let Some(h) = self.sel_hunk() else { return };
-        h.decision = if h.decision == d { Decision::Pending } else { d };
-        let now = h.decision;
-        match now {
-            Decision::Reject | Decision::Comment => self.focus_note = true,
-            Decision::Edit => self.focus_edit = true,
-            Decision::Approve => self.next_pending(),
-            Decision::Pending => {}
-        }
+        let e = self.r.set_decision(d);
+        self.effect(e);
     }
 
-    fn toggle_full(&mut self, fi: usize) {
-        if self.full.remove(&fi).is_none() {
-            if let Some(f) = self.files.get(fi).filter(|f| !f.binary) {
-                self.full.insert(fi, f.gaps());
-            }
-        }
-        self.collapsed.remove(&fi);
-        self.scroll_to_sel = true;
-    }
-
-    fn cur_file(&self) -> Option<usize> {
-        self.flat.get(self.sel).map(|p| p.0)
-    }
-
-    /// Select a hunk by flat index, expanding its file if collapsed.
-    fn select(&mut self, i: usize) {
-        self.sel = i;
-        self.scroll_to_sel = true;
-        if let Some(&(fi, _)) = self.flat.get(i) {
-            self.collapsed.remove(&fi);
-        }
-    }
-
-    /// Whole-file actions. Approve/Reject set every hunk (pressing again clears them);
-    /// Comment toggles a note about the file without touching hunk decisions.
     fn file_action(&mut self, fi: usize, d: Decision) {
-        let Some(f) = self.files.get_mut(fi) else { return };
-        match d {
-            Decision::Approve | Decision::Reject => {
-                let undo = f.all(d);
-                let new = if undo { Decision::Pending } else { d };
-                for h in &mut f.hunks {
-                    h.decision = new;
-                }
-                if d == Decision::Reject {
-                    f.file_mode = (!undo).then_some(Decision::Reject);
-                    if !undo {
-                        self.focus_file_note = Some(fi);
-                    }
-                } else if f.file_mode == Some(Decision::Reject) {
-                    f.file_mode = None;
-                }
-                if d == Decision::Approve && !undo {
-                    // Done with this file: collapse it and move on.
-                    self.collapsed.insert(fi);
-                    if let Some(last) = self.flat.iter().rposition(|p| p.0 == fi) {
-                        self.sel = last;
-                    }
-                    self.next_pending();
-                }
-            }
-            Decision::Comment => {
-                if f.file_mode == Some(Decision::Comment) {
-                    f.file_mode = None;
-                } else {
-                    f.file_mode = Some(Decision::Comment);
-                    self.focus_file_note = Some(fi);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn next_pending(&mut self) {
-        let n = self.flat.len();
-        for k in 1..=n {
-            let i = (self.sel + k) % n;
-            let (fi, hi) = self.flat[i];
-            if self.files[fi].hunks[hi].decision == Decision::Pending {
-                self.select(i);
-                return;
-            }
-        }
+        let e = self.r.file_action(fi, d);
+        self.effect(e);
     }
 
     fn submit(&mut self, ctx: &egui::Context) {
         if self.done {
             return;
         }
-        if let Err(e) = model::apply(&self.repo, &self.files) {
-            self.error = Some(e);
-            return;
+        match self.r.submit(&self.repo) {
+            Ok(message) => {
+                *self.result.borrow_mut() = Some(Outcome { message });
+                self.done = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => self.error = Some(e),
         }
-        let message = model::feedback(&self.files, &self.general);
-        *self.result.borrow_mut() = Some(Outcome { message });
-        self.done = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
@@ -254,12 +234,12 @@ impl App {
             self.submit(ctx);
             return;
         }
-        if ctx.text_edit_focused() || self.flat.is_empty() {
+        if ctx.text_edit_focused() || self.r.sel_pair().is_none() {
             return;
         }
         let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
         let shifted = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, k));
-        let cur = self.cur_file();
+        let cur = self.r.cur_file();
         let mut handled = true;
         // Shift variants first: plain-key matching ignores Shift.
         if let (Some(fi), true) = (cur, shifted(Key::A)) {
@@ -269,17 +249,27 @@ impl App {
         } else if let (Some(fi), true) = (cur, shifted(Key::C)) {
             self.file_action(fi, Decision::Comment);
         } else if pressed(Key::J) || pressed(Key::ArrowDown) {
-            self.select((self.sel + 1).min(self.flat.len() - 1));
+            self.r.next();
         } else if pressed(Key::K) || pressed(Key::ArrowUp) {
-            self.select(self.sel.saturating_sub(1));
+            self.r.prev();
         } else if let (Some(fi), true) = (cur, pressed(Key::F)) {
-            self.toggle_full(fi);
+            self.r.toggle_full(fi);
+        } else if pressed(Key::S) {
+            self.r.toggle_split();
         } else if let (Some(fi), true) = (cur, pressed(Key::Space)) {
-            if !self.collapsed.remove(&fi) {
-                self.collapsed.insert(fi);
-            }
+            self.r.toggle_fold(fi);
         } else if pressed(Key::N) {
-            self.next_pending();
+            self.r.next_pending();
+        } else if shifted(Key::G) || pressed(Key::End) {
+            self.r.last();
+        } else if pressed(Key::G) || pressed(Key::Home) {
+            self.r.first();
+        } else if pressed(Key::CloseBracket) {
+            self.r.next_file();
+        } else if pressed(Key::OpenBracket) {
+            self.r.prev_file();
+        } else if pressed(Key::X) {
+            self.r.clear();
         } else if pressed(Key::A) {
             self.set_decision(Decision::Approve);
         } else if pressed(Key::R) {
@@ -298,10 +288,8 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let c = model::counts(&self.files);
-        let will_send = c.reject + c.edit + c.comment > 0
-            || !self.general.trim().is_empty()
-            || self.files.iter().any(|f| f.file_note().is_some());
+        let c = self.r.counts();
+        let will_send = self.r.will_send();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let name = self.repo.file_name().unwrap_or_default().to_string_lossy();
@@ -343,11 +331,14 @@ impl App {
                     .add_enabled(c.pending > 0, egui::Button::new("Approve all pending"))
                     .clicked()
                 {
-                    for h in self.files.iter_mut().flat_map(|f| &mut f.hunks) {
-                        if h.decision == Decision::Pending {
-                            h.decision = Decision::Approve;
-                        }
-                    }
+                    self.r.approve_all_pending();
+                }
+                if ui
+                    .add(egui::Button::selectable(self.r.split, "Split view"))
+                    .on_hover_text("Old and new side by side (s)")
+                    .clicked()
+                {
+                    self.r.toggle_split();
                 }
                 if ui
                     .button("Skip")
@@ -367,14 +358,14 @@ impl App {
             ui.label(RichText::new(format!("Error: {e}")).color(pal::RED));
         }
         ui.add(
-            TextEdit::multiline(&mut self.general)
+            TextEdit::multiline(&mut self.r.general)
                 .hint_text("General feedback for the agent (optional)")
                 .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
         ui.label(
             RichText::new(
-                "j/k move · a r e c approve/reject/edit/comment hunk · Shift+A/R/C whole file · f full file · Space fold file · n next pending · Esc leave text box · Ctrl+Enter submit",
+                "j/k move · a r e c approve/reject/edit/comment hunk · Shift+A/R/C whole file · x clear · f full file · s split view · Space fold file · n next pending · ] [ next/prev file · Esc leave text box · Ctrl+Enter submit",
             )
             .small()
             .color(pal::DIM),
@@ -387,8 +378,8 @@ impl App {
         ui.label(RichText::new("FILES").small().color(pal::DIM));
         let mut jump = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let cur_file = self.flat.get(self.sel).map(|p| p.0);
-            for (fi, f) in self.files.iter().enumerate() {
+            let cur_file = self.r.cur_file();
+            for (fi, f) in self.r.files.iter().enumerate() {
                 let decided = f.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
                 let rejected = f.hunks.iter().any(|h| h.decision == Decision::Reject);
                 let status_col = match f.status {
@@ -413,17 +404,17 @@ impl App {
                 };
                 job.append(&format!("{decided}/{}", f.hunks.len()), 8.0, fmt(prog_col));
                 if ui.add(egui::Button::selectable(cur_file == Some(fi), job)).clicked() {
-                    jump = self.flat.iter().position(|p| p.0 == fi);
+                    jump = Some(fi);
                 }
             }
         });
-        if let Some(i) = jump {
-            self.select(i);
+        if let Some(fi) = jump {
+            self.r.select_file(fi);
         }
     }
 
     fn diff_view(&mut self, ui: &mut egui::Ui) {
-        if self.files.is_empty() {
+        if self.r.files.is_empty() {
             ui.centered_and_justified(|ui| ui.label("No changes to review."));
             return;
         }
@@ -434,7 +425,8 @@ impl App {
             .layout_no_wrap("0".into(), mono.clone(), pal::TEXT)
             .size()
             .x;
-        let sel_pair = self.flat.get(self.sel).copied();
+        let sel_pair = self.r.sel_pair();
+        let split = self.r.split;
         let mut new_sel = None;
         let mut action: Option<Decision> = None;
         let mut file_act: Option<(usize, Decision)> = None;
@@ -443,10 +435,10 @@ impl App {
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             ui.add_space(8.0);
-            for (fi, f) in self.files.iter_mut().enumerate() {
+            for (fi, f) in self.r.files.iter_mut().enumerate() {
                 let total = f.hunks.len();
                 let decided = f.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
-                let collapsed = self.collapsed.contains(&fi);
+                let collapsed = self.r.collapsed.contains(&fi);
                 let file_sel = sel_pair.map(|p| p.0) == Some(fi);
                 let state = if f.hunks.iter().any(|h| h.decision == Decision::Reject) {
                     pal::RED
@@ -512,7 +504,7 @@ impl App {
                             fbtn(ui, Decision::Reject, "Reject file", f.all(Decision::Reject), "Reject every hunk with one reason (Shift+R)");
                             fbtn(ui, Decision::Approve, "Approve file", f.all(Decision::Approve), "Approve every hunk (Shift+A)");
                             ui.add_space(8.0);
-                            let is_full = self.full.contains_key(&fi);
+                            let is_full = self.r.full.contains_key(&fi);
                             if ui
                                 .add_enabled(!f.binary, egui::Button::selectable(is_full, "Full file"))
                                 .on_hover_text("Show the whole file around the hunks (f)")
@@ -552,7 +544,7 @@ impl App {
                     let mut dots: Vec<(f32, Color32)> = Vec::new();
                     let file_rejected = f.file_mode == Some(Decision::Reject);
                     let digits = f.old.len().max(f.new.len()).to_string().len().max(3);
-                    let gaps = self.full.get(&fi);
+                    let gaps = self.r.full.get(&fi);
                     let FileDiff { hunks, hl, binary, .. } = f;
                     let binary = *binary;
                     let gap_ctx = HunkCtx {
@@ -567,6 +559,7 @@ impl App {
                         file_reason: false,
                         focus_note: false,
                         focus_edit: false,
+                        split,
                     };
                     let inner = egui::Frame::new()
                         .inner_margin(egui::Margin { left: 20, right: 0, top: 0, bottom: 0 })
@@ -588,6 +581,7 @@ impl App {
                                     file_reason: file_rejected,
                                     focus_note: selected && std::mem::take(&mut self.focus_note),
                                     focus_edit: selected && std::mem::take(&mut self.focus_edit),
+                                    split,
                                 };
                                 let out = hunk_ui(ui, h, ctx);
                                 let col = if h.decision == Decision::Pending { pal::DIM } else { decision_color(h.decision) };
@@ -631,25 +625,19 @@ impl App {
         });
 
         if let Some(fi) = full_toggle {
-            self.toggle_full(fi);
+            self.r.toggle_full(fi);
         }
         if let Some(fi) = toggle_fold {
-            if !self.collapsed.remove(&fi) {
-                self.collapsed.insert(fi);
-            }
+            self.r.toggle_fold(fi);
         }
         if let Some((fi, d)) = file_act {
-            if let Some(i) = self.flat.iter().position(|p| p.0 == fi) {
-                if self.cur_file() != Some(fi) {
-                    self.sel = i;
-                }
+            if self.r.cur_file() != Some(fi) {
+                self.r.select_quietly(fi, 0);
             }
             self.file_action(fi, d);
         }
-        if let Some(p) = new_sel {
-            if let Some(i) = self.flat.iter().position(|&q| q == p) {
-                self.sel = i;
-            }
+        if let Some((fi, hi)) = new_sel {
+            self.r.select_quietly(fi, hi);
         }
         if let Some(d) = action {
             self.set_decision(d);
@@ -661,11 +649,14 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while let Ok((i, hl)) = self.hl_rx.try_recv() {
-            if let Some(f) = self.files.get_mut(i) {
+            if let Some(f) = self.r.files.get_mut(i) {
                 f.hl = Some(hl);
             }
         }
         self.keyboard(&ctx);
+        if self.r.take_moved() {
+            self.scroll_to_sel = true;
+        }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_bar(ui));
         egui::Panel::left("files")
@@ -693,6 +684,8 @@ struct HunkCtx<'a> {
     file_reason: bool,
     focus_note: bool,
     focus_edit: bool,
+    /// Side-by-side: old on the left, new on the right.
+    split: bool,
 }
 
 struct HunkOut {
@@ -817,15 +810,12 @@ fn gap_ui(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) {
 }
 
 fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
-    let digits = c.digits as f32;
-    let num_w = digits * c.char_w + 10.0;
+    if c.split {
+        return split_lines(ui, lines, c);
+    }
+    let num_w = c.digits as f32 * c.char_w + 10.0;
     let text_x = num_w * 2.0 + c.char_w * 2.0 + 6.0;
-    let max_chars = lines
-        .iter()
-        .map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3)
-        .max()
-        .unwrap_or(0) as f32;
-    let width = (text_x + max_chars * c.char_w + 12.0).max(ui.available_width());
+    let width = (text_x + max_chars(lines.iter()) * c.char_w + 12.0).max(ui.available_width());
     let (rect, resp) = ui.allocate_exact_size(
         vec2(width, c.row_h * lines.len() as f32),
         Sense::click(),
@@ -835,63 +825,108 @@ fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::R
     }
     let painter = ui.painter();
     let clip = ui.clip_rect();
-    let spans_for = |l: &model::DLine| -> Option<&Line> {
-        let hl = c.hl?;
-        match l.kind {
-            Kind::Del => hl.old.get(l.old_no? - 1),
-            _ => hl.new.get(l.new_no? - 1),
-        }
-    };
     for (i, l) in lines.iter().enumerate() {
         let top = rect.top() + i as f32 * c.row_h;
         let row = Rect::from_min_size(pos2(rect.left(), top), vec2(width, c.row_h));
         if !clip.intersects(row) {
             continue;
         }
-        let (bg, sign, sign_col) = match l.kind {
-            Kind::Ctx => (Color32::TRANSPARENT, " ", pal::DIM),
-            Kind::Add => (pal::ADD_BG, "+", pal::GREEN),
-            Kind::Del => (pal::DEL_BG, "-", pal::RED),
-        };
-        if bg != Color32::TRANSPARENT {
+        if let Some(bg) = line_bg(l.kind) {
             painter.rect_filled(row, 0.0, bg);
         }
         let y = top + 1.0;
         let num = |n: Option<usize>| n.map(|n| n.to_string()).unwrap_or_default();
-        painter.text(
-            pos2(rect.left() + num_w - 6.0, y),
-            egui::Align2::RIGHT_TOP,
-            num(l.old_no),
-            c.mono.clone(),
-            pal::DIM,
-        );
-        painter.text(
-            pos2(rect.left() + num_w * 2.0 - 6.0, y),
-            egui::Align2::RIGHT_TOP,
-            num(l.new_no),
-            c.mono.clone(),
-            pal::DIM,
-        );
-        painter.text(
-            pos2(rect.left() + num_w * 2.0 + 4.0, y),
-            egui::Align2::LEFT_TOP,
-            sign,
-            c.mono.clone(),
-            sign_col,
-        );
-        let mut job = LayoutJob::default();
-        let fmt = |col: Color32| TextFormat {
-            font_id: c.mono.clone(),
-            color: col,
-            ..Default::default()
-        };
-        match spans_for(l) {
-            Some(spans) if !spans.is_empty() => append_spans(&mut job, spans, c.mono, true),
-            _ => job.append(&l.text.replace('\t', "    "), 0.0, fmt(pal::TEXT)),
-        }
-        let galley = painter.layout_job(job);
-        painter.galley(pos2(rect.left() + text_x, y), galley, pal::TEXT);
+        painter.text(pos2(rect.left() + num_w - 6.0, y), egui::Align2::RIGHT_TOP, num(l.old_no), c.mono.clone(), pal::DIM);
+        painter.text(pos2(rect.left() + num_w * 2.0 - 6.0, y), egui::Align2::RIGHT_TOP, num(l.new_no), c.mono.clone(), pal::DIM);
+        paint_code(painter, pos2(rect.left() + num_w * 2.0 + 4.0, y), text_x - num_w * 2.0 - 4.0, l, c);
     }
+    selection_bar(painter, rect, c);
+    resp
+}
+
+/// Side-by-side rows: each half has its own line number, sign and code, and grows
+/// to fit its longest line (the scroll area scrolls sideways past that).
+fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
+    let pairs = model::split_pairs(lines);
+    let num_w = c.digits as f32 * c.char_w + 10.0;
+    let text_x = num_w + c.char_w * 2.0 + 6.0;
+    let half = (text_x + max_chars(lines.iter()) * c.char_w + 12.0).max(ui.available_width() / 2.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(half * 2.0, c.row_h * pairs.len() as f32), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let clip = ui.clip_rect();
+    let painter = ui.painter();
+    for (i, &(left, right)) in pairs.iter().enumerate() {
+        let top = rect.top() + i as f32 * c.row_h;
+        for (side, idx) in [(0.0, left), (1.0, right)] {
+            let x0 = rect.left() + side * half;
+            let cell = Rect::from_min_size(pos2(x0, top), vec2(half, c.row_h));
+            if !clip.intersects(cell) {
+                continue;
+            }
+            let Some(l) = idx.map(|i| &lines[i]) else {
+                // Nothing on this side: the other side's line was added or removed.
+                painter.rect_filled(cell, 0.0, pal::EMPTY);
+                continue;
+            };
+            if let Some(bg) = line_bg(l.kind) {
+                painter.rect_filled(cell, 0.0, bg);
+            }
+            let no = if side == 0.0 { l.old_no } else { l.new_no };
+            let y = top + 1.0;
+            let p = painter.with_clip_rect(cell.intersect(clip));
+            p.text(pos2(x0 + num_w - 6.0, y), egui::Align2::RIGHT_TOP, no.map(|n| n.to_string()).unwrap_or_default(), c.mono.clone(), pal::DIM);
+            paint_code(&p, pos2(x0 + num_w + 4.0, y), text_x - num_w - 4.0, l, c);
+        }
+    }
+    let mid = rect.left() + half;
+    painter.line_segment([pos2(mid, rect.top()), pos2(mid, rect.bottom())], Stroke::new(1.0, pal::BORDER));
+    selection_bar(painter, rect, c);
+    resp
+}
+
+fn max_chars<'a>(lines: impl Iterator<Item = &'a model::DLine>) -> f32 {
+    lines
+        .map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3)
+        .max()
+        .unwrap_or(0) as f32
+}
+
+fn line_bg(k: Kind) -> Option<Color32> {
+    match k {
+        Kind::Ctx => None,
+        Kind::Add => Some(pal::ADD_BG),
+        Kind::Del => Some(pal::DEL_BG),
+    }
+}
+
+/// The +/- sign at `at`, then the highlighted code `code_dx` further right.
+fn paint_code(painter: &egui::Painter, at: egui::Pos2, code_dx: f32, l: &model::DLine, c: &HunkCtx) {
+    let (sign, sign_col) = match l.kind {
+        Kind::Ctx => (" ", pal::DIM),
+        Kind::Add => ("+", pal::GREEN),
+        Kind::Del => ("-", pal::RED),
+    };
+    painter.text(at, egui::Align2::LEFT_TOP, sign, c.mono.clone(), sign_col);
+    let spans = c.hl.and_then(|hl| match l.kind {
+        Kind::Del => hl.old.get(l.old_no? - 1),
+        _ => hl.new.get(l.new_no? - 1),
+    });
+    let mut job = LayoutJob::default();
+    match spans {
+        Some(spans) if !spans.is_empty() => append_spans(&mut job, spans, c.mono, true),
+        _ => job.append(
+            &l.text.replace('\t', "    "),
+            0.0,
+            TextFormat { font_id: c.mono.clone(), color: pal::TEXT, ..Default::default() },
+        ),
+    }
+    let galley = painter.layout_job(job);
+    painter.galley(at + vec2(code_dx, 0.0), galley, pal::TEXT);
+}
+
+fn selection_bar(painter: &egui::Painter, rect: Rect, c: &HunkCtx) {
     if c.selected {
         painter.rect_filled(
             Rect::from_min_size(rect.left_top() - Vec2::new(8.0, 0.0), vec2(3.0, rect.height())),
@@ -899,7 +934,6 @@ fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::R
             pal::ACCENT,
         );
     }
-    resp
 }
 
 fn append_spans(job: &mut LayoutJob, spans: &Line, font: &FontId, expand_tabs: bool) {
@@ -945,4 +979,31 @@ fn editor_job(text: &str, syntax: Option<&str>, font: &FontId) -> LayoutJob {
         job.append(&line[body.len()..], 0.0, plain.clone());
     }
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_rule() {
+        // WSLg: both reachable, no session type -> X11
+        assert!(pick_x11(None, true, true));
+        // Wayland desktop with XWayland -> Wayland
+        assert!(!pick_x11(Some("wayland"), true, true));
+        // X11 session -> X11
+        assert!(pick_x11(Some("x11"), true, true));
+        // Only one reachable wins, whatever the session says
+        assert!(!pick_x11(Some("x11"), true, false));
+        assert!(pick_x11(Some("wayland"), false, true));
+    }
+
+    #[test]
+    fn wayland_detection_order() {
+        let s = |v: &str| Some(v.to_owned());
+        assert!(!wayland_reachable(s(""), s("wayland-0"), None)); // WAYLAND_SOCKET decides first
+        assert!(wayland_reachable(None, s("wayland-0"), None));
+        assert!(!wayland_reachable(None, s(""), None));
+        assert!(!wayland_reachable(None, None, s("/nonexistent")));
+    }
 }

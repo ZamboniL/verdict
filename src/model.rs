@@ -305,6 +305,29 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
     hunks
 }
 
+/// Lines of a diff paired for the side-by-side view, as indices into it: context
+/// lines sit on both sides, and each run of removed lines is matched row by row with
+/// the added lines that follow it (the longer run continues with blanks opposite).
+pub fn split_pairs(lines: &[DLine]) -> Vec<(Option<usize>, Option<usize>)> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind == Kind::Ctx {
+            out.push((Some(i), Some(i)));
+            i += 1;
+            continue;
+        }
+        let dels: Vec<usize> = (i..lines.len()).take_while(|&j| lines[j].kind == Kind::Del).collect();
+        let after = i + dels.len();
+        let adds: Vec<usize> = (after..lines.len()).take_while(|&j| lines[j].kind == Kind::Add).collect();
+        for k in 0..dels.len().max(adds.len()) {
+            out.push((dels.get(k).copied(), adds.get(k).copied()));
+        }
+        i = after + adds.len();
+    }
+    out
+}
+
 enum Pick {
     Old,
     New,
@@ -660,6 +683,20 @@ mod tests {
         // Everything decided -> nothing left to review.
         assert!(load(&dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_pairs_match_removed_with_added() {
+        let f = file("a\nb\nc\nd\n", "a\nB\nC\nX\nd\n");
+        let lines = &f.hunks[0].lines;
+        let text = |i: Option<usize>| i.map(|i| lines[i].text.as_str()).unwrap_or("");
+        let rows: Vec<(&str, &str)> = split_pairs(lines).into_iter().map(|(l, r)| (text(l), text(r))).collect();
+        assert_eq!(rows, [("a", "a"), ("b", "B"), ("c", "C"), ("", "X"), ("d", "d")]);
+        // only removals
+        let g = file("a\nb\nc\n", "a\nc\n");
+        let pairs = split_pairs(&g.hunks[0].lines);
+        assert_eq!(pairs.iter().filter(|p| p.1.is_none()).count(), 1);
+        assert_eq!(pairs.len(), g.hunks[0].lines.len());
     }
 
     #[test]

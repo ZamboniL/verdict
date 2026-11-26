@@ -5,6 +5,7 @@ mod git;
 mod gui;
 mod highlight;
 mod model;
+mod review;
 mod session;
 mod tm;
 #[cfg(feature = "tui")]

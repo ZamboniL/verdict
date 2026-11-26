@@ -69,6 +69,9 @@ pub const EXAMPLE_CONFIG: &str = r#"# verdict configuration
 # "gui" (native window), "tui" (terminal) or "auto": the window when a display is
 # available, else the terminal. `--gui` / `--tui` and $VERDICT_UI override this.
 mode = "auto"
+# "unified" (one column, - and + lines interleaved) or "split" (old | new side by
+# side). Toggle it while reviewing with `s`.
+layout = "unified"
 # From the Claude Code hook, the terminal interface can't use the agent's terminal.
 # Inside tmux it opens in a popup. Elsewhere, give a command that opens a terminal
 # emulator and runs the program appended to it:
