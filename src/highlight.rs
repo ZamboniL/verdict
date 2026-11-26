@@ -46,7 +46,9 @@ fn cache_dir() -> PathBuf {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[derive(Deserialize, Default)]
@@ -69,12 +71,18 @@ pub const EXAMPLE_CONFIG: &str = r#"# verdict configuration
 # "gui" (native window), "tui" (terminal) or "auto": the window when a display is
 # available, else the terminal. `--gui` / `--tui` and $VERDICT_UI override this.
 mode = "auto"
+# "unified" (one column, - and + lines interleaved) or "split" (old | new side by
+# side). Toggle it while reviewing with `s`.
+layout = "unified"
 # From the Claude Code hook, the terminal interface can't use the agent's terminal.
 # Inside tmux it opens in a popup. Elsewhere, give a command that opens a terminal
 # emulator and runs the program appended to it:
 # terminal = ["wezterm", "start", "--"]
 # terminal = ["kitty"]
 # terminal = ["gnome-terminal", "--wait", "--"]
+# Inside tmux: "popup" (over the agent), "split" (a pane next to the agent, so you
+# can read what it said while reviewing) or "window" (a new tmux window).
+# tmux = "popup"
 
 [highlight]
 # Any builtin theme (`verdict themes` lists them) or the name of a theme you drop
@@ -131,12 +139,16 @@ pub struct Registry {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     entries.sort();
     for p in entries {
         if p.is_dir() {
-            if p.file_name().is_some_and(|n| n == "node_modules" || n == ".git") {
+            if p.file_name()
+                .is_some_and(|n| n == "node_modules" || n == ".git")
+            {
                 continue;
             }
             walk(&p, out);
@@ -147,10 +159,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn name_of(p: &Path) -> String {
-    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
-fn discover(dir: &Path, warnings: &mut Vec<String>) -> (Vec<Source>, Vec<ThemeSource>, Vec<PathBuf>) {
+fn discover(
+    dir: &Path,
+    warnings: &mut Vec<String>,
+) -> (Vec<Source>, Vec<ThemeSource>, Vec<PathBuf>) {
     let mut sources = Vec::new();
     let mut themes = Vec::new();
     let mut fingerprint_files = Vec::new();
@@ -161,7 +178,10 @@ fn discover(dir: &Path, warnings: &mut Vec<String>) -> (Vec<Source>, Vec<ThemeSo
         let n = name_of(&p);
         if n.ends_with(".sublime-syntax") {
             sources.push(Source::Sublime(p.clone()));
-        } else if n.ends_with(".tmLanguage") || n.ends_with(".tmLanguage.json") || n.ends_with(".json") {
+        } else if n.ends_with(".tmLanguage")
+            || n.ends_with(".tmLanguage.json")
+            || n.ends_with(".json")
+        {
             sources.push(Source::Tm {
                 path: p.clone(),
                 name: None,
@@ -185,7 +205,10 @@ fn discover(dir: &Path, warnings: &mut Vec<String>) -> (Vec<Source>, Vec<ThemeSo
             .trim_end_matches("-color-theme")
             .to_owned();
         if n.ends_with(".tmTheme") || n.ends_with(".json") {
-            themes.push(ThemeSource { path: p, name: stem });
+            themes.push(ThemeSource {
+                path: p,
+                name: stem,
+            });
         }
     }
 
@@ -206,8 +229,7 @@ fn discover(dir: &Path, warnings: &mut Vec<String>) -> (Vec<Source>, Vec<ThemeSo
             continue;
         }
         fingerprint_files.push(manifest.clone());
-        let mut langs: HashMap<String, (Vec<String>, Vec<String>, Option<String>, Option<String>)> =
-            HashMap::new();
+        let mut langs: HashMap<String, ExtLanguage> = HashMap::new();
         for l in contrib["languages"].as_array().into_iter().flatten() {
             let Some(id) = l["id"].as_str() else { continue };
             let strs = |k: &str| -> Vec<String> {
@@ -218,13 +240,17 @@ fn discover(dir: &Path, warnings: &mut Vec<String>) -> (Vec<Source>, Vec<ThemeSo
                     .collect()
             };
             let e = langs.entry(id.to_owned()).or_default();
-            e.0.extend(strs("extensions").into_iter().map(|x| x.trim_start_matches('.').to_owned()));
-            e.1.extend(strs("filenames"));
-            if e.2.is_none() {
-                e.2 = l["firstLine"].as_str().map(str::to_owned);
+            e.extensions.extend(
+                strs("extensions")
+                    .into_iter()
+                    .map(|x| x.trim_start_matches('.').to_owned()),
+            );
+            e.filenames.extend(strs("filenames"));
+            if e.first_line.is_none() {
+                e.first_line = l["firstLine"].as_str().map(str::to_owned);
             }
-            if e.3.is_none() {
-                e.3 = l["aliases"][0].as_str().map(str::to_owned);
+            if e.alias.is_none() {
+                e.alias = l["aliases"][0].as_str().map(str::to_owned);
             }
         }
         for g in contrib["grammars"].as_array().into_iter().flatten() {
@@ -232,26 +258,39 @@ fn discover(dir: &Path, warnings: &mut Vec<String>) -> (Vec<Source>, Vec<ThemeSo
             let (Some(lang), Some(path)) = (g["language"].as_str(), g["path"].as_str()) else {
                 continue;
             };
-            let (exts, fnames, first, alias) = langs.get(lang).cloned().unwrap_or_default();
+            let info = langs.get(lang).cloned().unwrap_or_default();
             let p = base.join(path);
             fingerprint_files.push(p.clone());
             sources.push(Source::Tm {
                 path: p,
-                name: Some(alias.unwrap_or_else(|| lang.to_owned())),
-                extensions: exts,
-                filenames: fnames,
-                first_line: first,
+                name: Some(info.alias.unwrap_or_else(|| lang.to_owned())),
+                extensions: info.extensions,
+                filenames: info.filenames,
+                first_line: info.first_line,
             });
         }
         for t in contrib["themes"].as_array().into_iter().flatten() {
-            let (Some(label), Some(path)) = (t["label"].as_str().or(t["id"].as_str()), t["path"].as_str())
+            let (Some(label), Some(path)) =
+                (t["label"].as_str().or(t["id"].as_str()), t["path"].as_str())
             else {
                 continue;
             };
-            themes.push(ThemeSource { path: base.join(path), name: label.to_owned() });
+            themes.push(ThemeSource {
+                path: base.join(path),
+                name: label.to_owned(),
+            });
         }
     }
     (sources, themes, fingerprint_files)
+}
+
+/// A language an extension declares in `contributes.languages`.
+#[derive(Clone, Default)]
+struct ExtLanguage {
+    extensions: Vec<String>,
+    filenames: Vec<String>,
+    first_line: Option<String>,
+    alias: Option<String>,
 }
 
 fn fingerprint(files: &[PathBuf]) -> u64 {
@@ -272,8 +311,11 @@ fn fingerprint(files: &[PathBuf]) -> u64 {
 fn build_user_syntaxes(sources: Vec<Source>, warnings: &mut Vec<String>) -> Cached {
     let base = two_face::syntax::extra_newlines();
     // Scopes we can resolve `include: source.x` against. true = converted from TextMate.
-    let mut known: HashMap<String, bool> =
-        base.syntaxes().iter().map(|s| (s.scope.build_string(), false)).collect();
+    let mut known: HashMap<String, bool> = base
+        .syntaxes()
+        .iter()
+        .map(|s| (s.scope.build_string(), false))
+        .collect();
 
     // Parse everything first so cross-grammar includes between user grammars resolve.
     let mut defs: Vec<(String, Result<SyntaxDefinition, String>)> = Vec::new();
@@ -286,15 +328,23 @@ fn build_user_syntaxes(sources: Vec<Source>, warnings: &mut Vec<String>) -> Cach
                     .map_err(|e| e.to_string())
                     .and_then(|t| {
                         let stem = name_of(&p).trim_end_matches(".sublime-syntax").to_owned();
-                        SyntaxDefinition::load_from_str(&t, true, Some(&stem)).map_err(|e| e.to_string())
+                        SyntaxDefinition::load_from_str(&t, true, Some(&stem))
+                            .map_err(|e| e.to_string())
                     });
                 if let Ok(d) = &r {
                     known.insert(d.scope.build_string(), false);
                 }
                 defs.push((p.display().to_string(), r));
             }
-            Source::Tm { path, name, extensions, filenames: fnames, first_line } => {
-                let g = tm::read_doc(&path).and_then(|v| tm::TmGrammar::from_value(v, name.as_deref()));
+            Source::Tm {
+                path,
+                name,
+                extensions,
+                filenames: fnames,
+                first_line,
+            } => {
+                let g =
+                    tm::read_doc(&path).and_then(|v| tm::TmGrammar::from_value(v, name.as_deref()));
                 match g {
                     Ok(mut g) => {
                         for e in extensions {
@@ -329,7 +379,8 @@ fn build_user_syntaxes(sources: Vec<Source>, warnings: &mut Vec<String>) -> Cach
                 path.display()
             ));
         }
-        let r = SyntaxDefinition::load_from_str(&text, true, Some(&g.name)).map_err(|e| e.to_string());
+        let r =
+            SyntaxDefinition::load_from_str(&text, true, Some(&g.name)).map_err(|e| e.to_string());
         defs.push((path.display().to_string(), r));
     }
 
@@ -344,7 +395,12 @@ fn build_user_syntaxes(sources: Vec<Source>, warnings: &mut Vec<String>) -> Cach
             Err(e) => warnings.push(format!("{path}: {e}")),
         }
     }
-    Cached { ss: builder.build(), user_names, filenames, warnings: warnings.clone() }
+    Cached {
+        ss: builder.build(),
+        user_names,
+        filenames,
+        warnings: warnings.clone(),
+    }
 }
 
 fn load_theme_set(themes: &[ThemeSource], warnings: &mut Vec<String>) -> (ThemeSet, Vec<String>) {
@@ -414,11 +470,17 @@ impl Registry {
         warnings.extend(cached.warnings.iter().cloned());
 
         let (mut set, user_themes) = load_theme_set(&theme_sources, &mut warnings);
-        let wanted = cfg.highlight.theme.clone().unwrap_or_else(|| DEFAULT_THEME.to_owned());
+        let wanted = cfg
+            .highlight
+            .theme
+            .clone()
+            .unwrap_or_else(|| DEFAULT_THEME.to_owned());
         let theme_name = if set.themes.contains_key(&wanted) {
             wanted
         } else {
-            warnings.push(format!("theme \"{wanted}\" not found, using {DEFAULT_THEME}"));
+            warnings.push(format!(
+                "theme \"{wanted}\" not found, using {DEFAULT_THEME}"
+            ));
             DEFAULT_THEME.to_owned()
         };
         let mut themes: Vec<(String, bool)> = set
@@ -444,8 +506,18 @@ impl Registry {
     fn resolve(&self, target: &str) -> Option<&SyntaxReference> {
         let ss = &self.ss;
         ss.find_syntax_by_name(target)
-            .or_else(|| ss.syntaxes().iter().rev().find(|s| s.scope.build_string() == target))
-            .or_else(|| ss.syntaxes().iter().rev().find(|s| s.name.eq_ignore_ascii_case(target)))
+            .or_else(|| {
+                ss.syntaxes()
+                    .iter()
+                    .rev()
+                    .find(|s| s.scope.build_string() == target)
+            })
+            .or_else(|| {
+                ss.syntaxes()
+                    .iter()
+                    .rev()
+                    .find(|s| s.name.eq_ignore_ascii_case(target))
+            })
             .or_else(|| ss.find_syntax_by_extension(target.trim_start_matches('.')))
     }
 
@@ -461,7 +533,11 @@ impl Registry {
                 }
             }
         }
-        if let Some(s) = self.filenames.get(fname).and_then(|n| self.ss.find_syntax_by_name(n)) {
+        if let Some(s) = self
+            .filenames
+            .get(fname)
+            .and_then(|n| self.ss.find_syntax_by_name(n))
+        {
             return Some(s);
         }
         if let Some(s) = self.ss.find_syntax_by_extension(fname) {
@@ -512,7 +588,11 @@ pub fn glob_match(p: &[u8], s: &[u8]) -> bool {
     match (p.first(), s.first()) {
         (None, None) => true,
         (Some(b'*'), _) if p.get(1) == Some(&b'*') => {
-            let rest = if p.get(2) == Some(&b'/') { &p[3..] } else { &p[2..] };
+            let rest = if p.get(2) == Some(&b'/') {
+                &p[3..]
+            } else {
+                &p[2..]
+            };
             (0..=s.len()).any(|i| glob_match(rest, &s[i..]))
         }
         (Some(b'*'), _) => {

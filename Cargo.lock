@@ -3556,6 +3556,7 @@ dependencies = [
  "crossterm",
  "eframe",
  "plist",
+ "png",
  "ratatui",
  "serde",
  "serde_json",
@@ -3563,6 +3564,7 @@ dependencies = [
  "syntect",
  "toml",
  "two-face",
+ "winit",
 ]
 
 [[package]]

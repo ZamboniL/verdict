@@ -8,7 +8,7 @@ finishes a turn. It runs as a native window (egui) or right in your terminal
 comment on each hunk or each whole file. Your verdict goes back to the agent as its
 next instruction.
 
-![verdict reviewing a change: one file approved, a debug println rejected with a reason](docs/screenshot.jpg)
+![verdict reviewing a change: one file approved, a debug println rejected with a reason](docs/screenshot.png)
 
 ## Why
 
@@ -36,6 +36,7 @@ verdict does one job:
 - Edit hunks inline. The agent sees exactly what you changed.
 - **Full file** view: show the whole file, with unchanged code between the hunk
   cards, when 3 lines of context aren't enough.
+- **Split view**: old and new side by side, in the window and in the terminal.
 - Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
   gutter. Cards fold away when you're done with them.
 - Syntax highlighting for about 200 languages out of the box. You can add more
@@ -66,6 +67,13 @@ This installs the `verdict` binary into `~/.cargo/bin`.
 - **Linux:** tested, including **WSL2**. On WSL2 it runs as a Linux GUI app
   through WSLg, so it reads your repo at native speed without going through the
   slow Windows-to-WSL file bridge.
+  The window uses whichever of X11 and Wayland is available. When both are, it
+  uses Wayland only if `XDG_SESSION_TYPE=wayland`. WSLg offers both and sets no
+  session type, so verdict uses X11 there, which also avoids a WSLg compositor
+  crash when a Wayland window is resized. X11 needs
+  `libxkbcommon-x11-0` (`sudo apt install libxkbcommon-x11-0`); without it,
+  verdict warns and uses Wayland. `VERDICT_GUI_BACKEND=wayland` or `x11`
+  overrides the choice.
 - **macOS:** expected to work, but not tested yet.
 - **Native Windows:** not supported yet. Use WSL2.
 
@@ -80,6 +88,21 @@ verdict
 Review, then press **Ctrl+Enter** to submit (**S** or **Ctrl+S** in the terminal). The feedback message prints to stdout
 and is also saved to `.git/verdict-feedback.md`, so you can paste it into any
 agent: Claude Code, Codex, Aider, Cursor, or anything else.
+
+### Staged changes and commits
+
+verdict also reviews changes that are already staged or committed:
+
+```sh
+verdict --staged          # what's staged (HEAD -> index)
+verdict HEAD~3..          # the last three commits
+verdict main...feature    # a branch, from where it left main
+```
+
+These reviews are **feedback only**: approving, rejecting and commenting build
+the feedback message, but nothing in git changes and hunks can't be edited.
+Ranges work like `git diff`: `A..B`, `A..` (up to `HEAD`) and `A...B` (from the
+point where `B` branched off `A`).
 
 ## Window or terminal
 
@@ -101,7 +124,13 @@ instead, and **e** edits a hunk in `$EDITOR`. Press **?** for every key.
 **From the hook**, Claude Code owns the terminal, so the terminal interface opens
 somewhere else:
 
-- **Inside tmux**, it opens in a popup over the agent (tmux 3.2+).
+- **Inside tmux**, it opens in a popup over the agent (tmux 3.2+). To keep the
+  agent's pane visible while you review, open it next to the agent instead:
+
+  ```toml
+  [ui]
+  tmux = "split"    # or "window" for a new tmux window; default "popup"
+  ```
 - **Otherwise**, set a command that opens a terminal emulator. verdict appends its
   own command to it:
 
@@ -142,6 +171,8 @@ Add both hooks to `~/.claude/settings.json`, or to a project's
    - If nothing changed, for example because the session was only answering a
      question, verdict stays closed.
    - Otherwise the review window opens, showing only those files.
+   - Press **t** to read what the agent said at the end of its turn (the
+     **Agent's message** button in the window).
 3. **When you submit:**
    - If you approved everything, the agent finishes normally.
    - Otherwise your review becomes the agent's next instruction, and it keeps
@@ -163,14 +194,20 @@ in the environment to turn verdict off for a session.
 | Key | Does |
 |---|---|
 | `j` / `k` | next / previous hunk |
+| `]` / `[` | next / previous file |
+| `g` / `G` | first / last hunk |
 | `n` | jump to the next undecided hunk |
+| `x` | clear the hunk's decision |
 | `f` | show the whole file around its hunks |
+| `s` | split view: old and new side by side |
+| `t` | what the agent said (reviews opened by the hook) |
 | `Space` | fold / unfold the current file |
 | `Esc` | leave a text box |
 | `Ctrl+Enter` | submit (in the terminal: `S`, which asks first, or `Ctrl+S`) |
 
-The terminal interface adds `x` (clear a decision), `Enter` (write the note),
-`m` (general message), `]`/`[` (next/previous file) and `q` (quit). `?` lists them all.
+The terminal interface adds `Enter` (write the note), `m` (general message) and
+`q` (quit). `?` lists them all. To start in the split view, set `layout = "split"`
+in the `[ui]` section of `config.toml`.
 
 Pressing an active decision again clears it. **Approve file** folds the card and
 moves on to the next undecided file. Hunks you leave undecided stay as they are,
@@ -296,6 +333,8 @@ when a file changes.
 
 ```
 verdict [PATH]     review uncommitted changes in the repo containing PATH
+verdict --staged   review staged changes (feedback only)
+verdict RANGE      review a commit range such as HEAD~3.. (feedback only)
 verdict hook       Claude Code hook entry point (UserPromptSubmit and Stop)
 verdict langs      list languages and grammar warnings
 verdict themes     list syntax themes (* = active)
@@ -326,25 +365,11 @@ verdict init       create the config directory with an example config.toml
 
 ## Contributing
 
-Issues and pull requests are welcome. The code is small and split by concern:
-
-| File | What it does |
-|---|---|
-| `src/main.rs` | CLI, Claude Code hook protocol |
-| `src/git.rs` | thin wrapper over the `git` CLI (no libgit2) |
-| `src/model.rs` | diffs, hunks, applying decisions, the feedback message |
-| `src/session.rs` | per-session turn snapshots, transcript analysis |
-| `src/ui.rs` | the egui review window |
-| `src/highlight.rs` | language and theme registry, user extensions, caching |
-| `src/tm.rs` | TextMate grammar and VS Code theme conversion |
-
-```sh
-cargo test             # unit tests, including real git repos in a temp dir
-cargo run -- .         # review this repo's own uncommitted changes
-```
-
-Before sending a change, make sure `cargo test` passes and `cargo build` produces
-no warnings. If you're changing the UI, include a screenshot.
+Issues and pull requests are welcome. The code is small and split by concern,
+and `cargo test` runs the tests against real git repos in a temp dir.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to report bugs, how the code is
+laid out, what a pull request needs, and how to script the window to take
+screenshots.
 
 ## License
 

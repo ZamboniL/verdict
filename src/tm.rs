@@ -181,7 +181,13 @@ impl TmGrammar {
             })
             .unwrap_or_default();
         let first_line = json["firstLineMatch"].as_str().map(str::to_owned);
-        Ok(TmGrammar { json, name, scope, extensions, first_line })
+        Ok(TmGrammar {
+            json,
+            name,
+            scope,
+            extensions,
+            first_line,
+        })
     }
 }
 
@@ -205,7 +211,13 @@ fn clean_scope(name: &str) -> Option<String> {
 fn ctx_name(repo_key: &str) -> String {
     let clean: String = repo_key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("r_{clean}")
 }
@@ -271,7 +283,9 @@ impl Conv<'_> {
         let mut items = Vec::new();
         for (k, c) in obj {
             let Ok(n) = k.parse::<i64>() else { continue };
-            let Some(name) = c["name"].as_str().and_then(clean_scope) else { continue };
+            let Some(name) = c["name"].as_str().and_then(clean_scope) else {
+                continue;
+            };
             if n == 0 {
                 whole = Some(name);
             } else {
@@ -349,7 +363,9 @@ impl Conv<'_> {
                 return None;
             }
             let shared = self.captures(&r["captures"]);
-            let bcaps = self.captures(&r["beginCaptures"]).or_else(|| self.captures(&r["captures"]));
+            let bcaps = self
+                .captures(&r["beginCaptures"])
+                .or_else(|| self.captures(&r["captures"]));
             let ecaps = self.captures(&r["endCaptures"]).or(shared);
 
             let mut end_rule = vec![(s("match"), s(end))];
@@ -423,7 +439,12 @@ impl Conv<'_> {
 /// Convert a TextMate grammar to `.sublime-syntax` text. Returns the text and the
 /// number of rules dropped (unsupported regex or unresolvable include).
 pub fn convert(g: &TmGrammar, known: &HashMap<String, bool>) -> (String, usize) {
-    let mut c = Conv { self_scope: &g.scope, known, repo: HashMap::new(), dropped: 0 };
+    let mut c = Conv {
+        self_scope: &g.scope,
+        known,
+        repo: HashMap::new(),
+        dropped: 0,
+    };
     c.collect_repo(&g.json);
     let mut contexts = vec![(s("main"), Y::L(c.patterns(&g.json["patterns"])))];
     let mut keys: Vec<String> = c.repo.keys().cloned().collect();
@@ -441,7 +462,10 @@ pub fn convert(g: &TmGrammar, known: &HashMap<String, bool>) -> (String, usize) 
     let mut top = vec![
         (s("name"), s(g.name.clone())),
         (s("scope"), s(g.scope.clone())),
-        (s("file_extensions"), Y::L(g.extensions.iter().map(|e| s(e.clone())).collect())),
+        (
+            s("file_extensions"),
+            Y::L(g.extensions.iter().map(|e| s(e.clone())).collect()),
+        ),
     ];
     if let Some(fl) = &g.first_line {
         top.push((s("first_line_match"), s(fl.clone())));
@@ -459,10 +483,30 @@ fn parse_color(s: &str) -> Option<Color> {
     let hex = |i: usize, n: usize| u8::from_str_radix(&h[i..i + n], 16).ok();
     let dup = |v: u8| v * 17;
     Some(match h.len() {
-        3 => Color { r: dup(hex(0, 1)?), g: dup(hex(1, 1)?), b: dup(hex(2, 1)?), a: 255 },
-        4 => Color { r: dup(hex(0, 1)?), g: dup(hex(1, 1)?), b: dup(hex(2, 1)?), a: dup(hex(3, 1)?) },
-        6 => Color { r: hex(0, 2)?, g: hex(2, 2)?, b: hex(4, 2)?, a: 255 },
-        8 => Color { r: hex(0, 2)?, g: hex(2, 2)?, b: hex(4, 2)?, a: hex(6, 2)? },
+        3 => Color {
+            r: dup(hex(0, 1)?),
+            g: dup(hex(1, 1)?),
+            b: dup(hex(2, 1)?),
+            a: 255,
+        },
+        4 => Color {
+            r: dup(hex(0, 1)?),
+            g: dup(hex(1, 1)?),
+            b: dup(hex(2, 1)?),
+            a: dup(hex(3, 1)?),
+        },
+        6 => Color {
+            r: hex(0, 2)?,
+            g: hex(2, 2)?,
+            b: hex(4, 2)?,
+            a: 255,
+        },
+        8 => Color {
+            r: hex(0, 2)?,
+            g: hex(2, 2)?,
+            b: hex(4, 2)?,
+            a: hex(6, 2)?,
+        },
         _ => return None,
     })
 }
@@ -602,10 +646,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(scopes.iter().any(|s| s == "keyword.control.demo"), "{scopes:?}");
-        assert!(scopes.iter().any(|s| s == "string.quoted.demo"), "{scopes:?}");
-        assert!(scopes.iter().any(|s| s == "constant.character.escape.demo"), "{scopes:?}");
-        assert!(scopes.iter().any(|s| s == "comment.block.demo"), "{scopes:?}");
+        assert!(
+            scopes.iter().any(|s| s == "keyword.control.demo"),
+            "{scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|s| s == "string.quoted.demo"),
+            "{scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|s| s == "constant.character.escape.demo"),
+            "{scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|s| s == "comment.block.demo"),
+            "{scopes:?}"
+        );
     }
 
     #[test]

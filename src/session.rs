@@ -72,7 +72,9 @@ pub fn load(repo: &Path, session: &str) -> Option<Snapshot> {
 }
 
 pub fn save(repo: &Path, session: &str, snap: &Snapshot) {
-    let (Some(d), Some(f)) = (dir(repo), file(repo, session)) else { return };
+    let (Some(d), Some(f)) = (dir(repo), file(repo, session)) else {
+        return;
+    };
     if std::fs::create_dir_all(&d).is_err() {
         return;
     }
@@ -82,7 +84,10 @@ pub fn save(repo: &Path, session: &str, snap: &Snapshot) {
     // Forget sessions idle for a week.
     let cutoff = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
     for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff);
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < cutoff);
         if old {
             let _ = std::fs::remove_file(e.path());
         }
@@ -114,17 +119,13 @@ pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
     let mut opaque = false;
     let mut paths = HashSet::new();
     for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         let content = &v["message"]["content"];
         match v["type"].as_str() {
             Some("user") => {
-                // A new prompt (not a tool result or an injected meta message) starts a turn.
-                let is_prompt = v["isMeta"].as_bool() != Some(true)
-                    && (content.is_string()
-                        || content.as_array().is_some_and(|a| {
-                            a.iter().any(|b| matches!(b["type"].as_str(), Some("text" | "image")))
-                        }));
-                if is_prompt {
+                if is_prompt(&v) {
                     saw_prompt = true;
                     opaque = false;
                     paths.clear();
@@ -140,10 +141,13 @@ pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
                         opaque = true;
                     } else if PATH_TOOLS.contains(&name) {
                         let input = &b["input"];
-                        let p = input["file_path"].as_str().or(input["notebook_path"].as_str());
+                        let p = input["file_path"]
+                            .as_str()
+                            .or(input["notebook_path"].as_str());
                         match p.map(Path::new) {
                             Some(p) => {
-                                let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                                let abs =
+                                    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                                 if let Ok(rel) = abs.strip_prefix(&repo) {
                                     paths.insert(rel.to_string_lossy().into_owned());
                                 }
@@ -167,10 +171,92 @@ pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
     }
 }
 
+/// The agent's final reply this turn: its text after the last tool call. `None` if
+/// the transcript can't be read or the turn has no text.
+pub fn last_reply(transcript: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(transcript).ok()?;
+    let mut reply: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let content = &v["message"]["content"];
+        match v["type"].as_str() {
+            Some("user") if is_prompt(&v) => reply.clear(),
+            Some("assistant") => {
+                for b in content.as_array().into_iter().flatten() {
+                    match b["type"].as_str() {
+                        Some("tool_use") => reply.clear(),
+                        Some("text") => {
+                            if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                                reply.push(t.trim().to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!reply.is_empty()).then(|| reply.join("\n\n"))
+}
+
+/// A user entry that starts a turn: a typed prompt, not a tool result or an
+/// injected meta message.
+fn is_prompt(v: &serde_json::Value) -> bool {
+    let content = &v["message"]["content"];
+    v["isMeta"].as_bool() != Some(true)
+        && (content.is_string()
+            || content.as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|b| matches!(b["type"].as_str(), Some("text" | "image")))
+            }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn last_reply_is_the_text_after_the_last_tool_call() {
+        let f = std::env::temp_dir().join(format!("verdict-reply-{}.jsonl", std::process::id()));
+        let user = |c: &str| format!(r#"{{"type":"user","message":{{"content":{c}}}}}"#);
+        let text = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{t}"}}]}}}}"#
+            )
+        };
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#;
+        std::fs::write(
+            &f,
+            [
+                user(r#""first""#),
+                text("old turn"),
+                user(r#""fix the limiter""#),
+                text("Looking at it."),
+                tool.to_owned(),
+                user(r#"[{"type":"tool_result","content":"ok"}]"#),
+                text("Fixed the refill."),
+                text("Left a println for now."),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            last_reply(&f).as_deref(),
+            Some("Fixed the refill.\n\nLeft a println for now.")
+        );
+        // A turn that ends on a tool call has no reply yet.
+        std::fs::write(
+            &f,
+            [user(r#""go""#), text("On it."), tool.to_owned()].join("\n"),
+        )
+        .unwrap();
+        assert_eq!(last_reply(&f), None);
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn reads_turn_activity_from_transcript() {
@@ -181,7 +267,9 @@ mod tests {
         let f = repo.join("t.jsonl");
         let user = |c: &str| format!(r#"{{"type":"user","message":{{"content":{c}}}}}"#);
         let tool = |name: &str, input: &str| {
-            format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{name}","input":{input}}}]}}}}"#)
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{name}","input":{input}}}]}}}}"#
+            )
         };
         let a = repo.join("src/a.rs").display().to_string();
         let write = |lines: &[String]| std::fs::write(&f, lines.join("\n")).unwrap();
@@ -203,14 +291,20 @@ mod tests {
             user(r#"[{"type":"tool_result","content":"ok"}]"#),
             tool("Write", r#"{"file_path":"/elsewhere/x"}"#),
         ]);
-        assert_eq!(turn_activity(&f, &repo), Activity::Paths(["src/a.rs".to_string()].into()));
+        assert_eq!(
+            turn_activity(&f, &repo),
+            Activity::Paths(["src/a.rs".to_string()].into())
+        );
 
         // A shell command makes it opaque.
         write(&[user(r#""go""#), tool("Bash", r#"{"command":"sed -i ..."}"#)]);
         assert_eq!(turn_activity(&f, &repo), Activity::Any);
 
         // Meta messages don't start turns; no prompt at all means unknown.
-        write(&[r#"{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"x"}]}}"#.into()]);
+        write(&[
+            r#"{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"x"}]}}"#
+                .into(),
+        ]);
         assert_eq!(turn_activity(&f, &repo), Activity::Unknown);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -221,14 +315,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sh = |args: &[&str]| {
-            let o = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         };
         sh(&["init", "-q"]);
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         sh(&["add", "."]);
-        sh(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        sh(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
 
         // Someone else's leftover change, present before the turn starts.
         std::fs::write(dir.join("a.txt"), "a changed by another session\n").unwrap();
