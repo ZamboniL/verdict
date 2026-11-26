@@ -83,6 +83,8 @@ agent: Claude Code, Codex, Aider, Cursor, or anything else.
 
 ## Window or terminal
 
+![verdict reviewing in the terminal: approve a file, reject a debug println with a reason, comment on a test, submit](docs/tui-demo.svg)
+
 ```sh
 verdict --gui     # native window
 verdict --tui     # terminal interface
