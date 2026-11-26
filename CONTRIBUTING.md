@@ -107,6 +107,17 @@ set separately because code behind `#[cfg(feature = ...)]` is only linted when
 that feature is on. If you think a clippy lint is wrong for a specific piece of
 code, silence it there with `#[allow(clippy::...)]` and add a comment saying why.
 
+CI runs the same checks on every pull request
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+The commit that first ran `rustfmt` over everything is listed in
+`.git-blame-ignore-revs`. GitHub's blame view skips it automatically. For local
+`git blame`, run once:
+
+```sh
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
+
 Also:
 
 - **UI changes need a picture.** For the window, use the
@@ -125,6 +136,21 @@ Also:
 
 Code written with an AI agent is fine, as long as you've reviewed it yourself.
 verdict is a good tool for that.
+
+## Releasing
+
+For maintainers: bump `version` in `Cargo.toml`, commit, then tag and push:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+`verdict` for Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel). It
+publishes a GitHub release with a `.tar.gz` and a SHA-256 checksum for each,
+plus generated release notes. The build fails if the tag doesn't match the
+version in `Cargo.toml`.
 
 ## License
 
