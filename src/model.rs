@@ -3,7 +3,9 @@
 //! and rendering the feedback message for the agent.
 
 use crate::git::{self, Status};
-use similar::{Algorithm, DiffOp, DiffTag, capture_diff_slices, group_diff_ops};
+use similar::{
+    Algorithm, DiffOp, DiffTag, capture_diff_slices, capture_diff_slices_deadline, group_diff_ops,
+};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::Path;
@@ -22,6 +24,17 @@ pub struct DLine {
     pub old_no: Option<usize>,
     pub new_no: Option<usize>,
     pub text: String,
+}
+
+impl DLine {
+    pub fn new(kind: Kind, old_no: Option<usize>, new_no: Option<usize>, text: String) -> DLine {
+        DLine {
+            kind,
+            old_no,
+            new_no,
+            text,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,6 +62,8 @@ pub struct Hunk {
 
 pub struct FileDiff {
     pub path: String,
+    /// Where the file was before it was renamed (`status` is `Renamed`).
+    pub old_path: Option<String>,
     pub status: Status,
     pub mode: String,
     pub binary: bool,
@@ -94,11 +109,13 @@ impl FileDiff {
         let block = |o0: usize, n0: usize, n1: usize| -> Vec<DLine> {
             (n0..n1)
                 .enumerate()
-                .map(|(i, j)| DLine {
-                    kind: Kind::Ctx,
-                    old_no: Some(o0 + i + 1),
-                    new_no: Some(j + 1),
-                    text: strip_eol(&self.new[j]),
+                .map(|(i, j)| {
+                    DLine::new(
+                        Kind::Ctx,
+                        Some(o0 + i + 1),
+                        Some(j + 1),
+                        strip_eol(&self.new[j]),
+                    )
                 })
                 .collect()
         };
@@ -153,6 +170,7 @@ pub fn load_only(
             files.push(f);
         }
     }
+    let mut files = pair_renames(files);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
@@ -190,7 +208,7 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
     };
 
     Ok(build(
-        e.path, e.status, mode, old_bytes, new_bytes, new_exists,
+        e.path, None, e.status, mode, old_bytes, new_bytes, new_exists,
     ))
 }
 
@@ -229,16 +247,89 @@ pub fn load_source(
             Vec::new()
         };
         files.extend(build(
-            e.path, e.status, mode, old_bytes, new_bytes, new_exists,
+            e.path, None, e.status, mode, old_bytes, new_bytes, new_exists,
         ));
     }
+    let mut files = pair_renames(files);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
-/// A file's diff from its two versions. `None` when they don't differ.
+/// Deleted files paired with added files of mostly the same content (half their
+/// lines or more, like git's rename detection), each pair turned into one renamed
+/// file whose hunks are the edits made along with the move.
+fn pair_renames(files: Vec<FileDiff>) -> Vec<FileDiff> {
+    let gone: Vec<usize> = (0..files.len())
+        .filter(|&i| files[i].status == Status::Deleted && !files[i].old_bytes.is_empty())
+        .collect();
+    let added: Vec<usize> = (0..files.len())
+        .filter(|&i| files[i].status == Status::Untracked && !files[i].new_bytes.is_empty())
+        .collect();
+    // Every pair is compared, so give up on huge deletions plus additions.
+    if gone.is_empty() || added.is_empty() || gone.len() * added.len() > 2_500 {
+        return files;
+    }
+    let mut cands = Vec::new();
+    for &d in &gone {
+        for &a in &added {
+            let s = similarity(&files[d], &files[a]);
+            if s >= 0.5 {
+                cands.push((s, d, a));
+            }
+        }
+    }
+    // Best matches first; ties go to the order git listed them in.
+    cands.sort_by(|x, y| y.0.total_cmp(&x.0).then((x.1, x.2).cmp(&(y.1, y.2))));
+    let mut slots: Vec<Option<FileDiff>> = files.into_iter().map(Some).collect();
+    let mut out = Vec::new();
+    for (_, d, a) in cands {
+        if slots[d].is_none() || slots[a].is_none() {
+            continue;
+        }
+        let (del, add) = (slots[d].take().unwrap(), slots[a].take().unwrap());
+        out.extend(build(
+            add.path,
+            Some(del.path),
+            Status::Renamed,
+            add.mode,
+            del.old_bytes,
+            add.new_bytes,
+            true,
+        ));
+    }
+    out.extend(slots.into_iter().flatten());
+    out
+}
+
+/// How much of a deleted file lives on in an added one: the share of their lines
+/// that match, from 0 to 1.
+fn similarity(del: &FileDiff, add: &FileDiff) -> f32 {
+    if del.old_bytes == add.new_bytes {
+        return 1.0;
+    }
+    if del.binary || add.binary {
+        return 0.0;
+    }
+    let (a, b) = (&del.old, &add.new);
+    let total = (a.len() + b.len()) as f32;
+    // Even if every line of the shorter file matched, it couldn't reach half.
+    if 2.0 * a.len().min(b.len()) as f32 / total < 0.5 {
+        return 0.0;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    let same: usize = capture_diff_slices_deadline(Algorithm::Myers, a, b, Some(deadline))
+        .iter()
+        .filter(|o| o.tag() == DiffTag::Equal)
+        .map(|o| o.old_range().len())
+        .sum();
+    2.0 * same as f32 / total
+}
+
+/// A file's diff from its two versions. `None` when they don't differ (unless it was
+/// renamed: the move alone is something to review).
 fn build(
     path: String,
+    old_path: Option<String>,
     status: Status,
     mode: String,
     old_bytes: Vec<u8>,
@@ -248,6 +339,7 @@ fn build(
     let binary = is_binary(&old_bytes) || is_binary(&new_bytes);
     let mut f = FileDiff {
         path,
+        old_path,
         status,
         mode,
         binary,
@@ -268,16 +360,16 @@ fn build(
             ctx_old: 0..0,
             ctx_new: 0..0,
             header: "binary file".into(),
-            lines: vec![DLine {
-                kind: Kind::Ctx,
-                old_no: None,
-                new_no: None,
-                text: format!(
+            lines: vec![DLine::new(
+                Kind::Ctx,
+                None,
+                None,
+                format!(
                     "binary content: {} bytes -> {} bytes",
                     f.old_bytes.len(),
                     f.new_bytes.len()
                 ),
-            }],
+            )],
             decision: Decision::Pending,
             note: String::new(),
             edit_buf: String::new(),
@@ -287,7 +379,27 @@ fn build(
     f.old = split_lines(std::str::from_utf8(&f.old_bytes).unwrap());
     f.new = split_lines(std::str::from_utf8(&f.new_bytes).unwrap());
     f.hunks = compute_hunks(&f.old, &f.new);
-    (!f.hunks.is_empty()).then_some(f)
+    if f.hunks.is_empty() {
+        let from = f.old_path.as_ref()?;
+        // Moved without a change: one hunk stands for the move, to approve or reject.
+        f.hunks.push(Hunk {
+            old: 0..0,
+            new: 0..0,
+            ctx_old: 0..0,
+            ctx_new: 0..0,
+            header: "renamed, content unchanged".into(),
+            lines: vec![DLine::new(
+                Kind::Ctx,
+                None,
+                None,
+                format!("{from} -> {}", f.path),
+            )],
+            decision: Decision::Pending,
+            note: String::new(),
+            edit_buf: String::new(),
+        });
+    }
+    Some(f)
 }
 
 pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
@@ -307,30 +419,20 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
             match tag {
                 DiffTag::Equal => {
                     for (i, j) in o.zip(n) {
-                        lines.push(DLine {
-                            kind: Kind::Ctx,
-                            old_no: Some(i + 1),
-                            new_no: Some(j + 1),
-                            text: strip_eol(&old[i]),
-                        });
+                        lines.push(DLine::new(
+                            Kind::Ctx,
+                            Some(i + 1),
+                            Some(j + 1),
+                            strip_eol(&old[i]),
+                        ));
                     }
                 }
                 _ => {
                     for i in o {
-                        lines.push(DLine {
-                            kind: Kind::Del,
-                            old_no: Some(i + 1),
-                            new_no: None,
-                            text: strip_eol(&old[i]),
-                        });
+                        lines.push(DLine::new(Kind::Del, Some(i + 1), None, strip_eol(&old[i])));
                     }
                     for j in n {
-                        lines.push(DLine {
-                            kind: Kind::Add,
-                            old_no: None,
-                            new_no: Some(j + 1),
-                            text: strip_eol(&new[j]),
-                        });
+                        lines.push(DLine::new(Kind::Add, None, Some(j + 1), strip_eol(&new[j])));
                     }
                 }
             }
@@ -361,10 +463,13 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
     hunks
 }
 
+/// A row of the side-by-side view: indices of its old-side and new-side lines.
+pub type Pair = (Option<usize>, Option<usize>);
+
 /// Lines of a diff paired for the side-by-side view, as indices into it: context
 /// lines sit on both sides, and each run of removed lines is matched row by row with
 /// the added lines that follow it (the longer run continues with blanks opposite).
-pub fn split_pairs(lines: &[DLine]) -> Vec<(Option<usize>, Option<usize>)> {
+pub fn split_pairs(lines: &[DLine]) -> Vec<Pair> {
     let mut out = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
@@ -444,23 +549,43 @@ pub fn apply(repo: &Path, files: &[FileDiff]) -> git::Result<()> {
             Ok(())
         };
         let remove = || std::fs::remove_file(&full).map_err(|e| format!("{}: {e}", f.path));
+        // Staging a renamed file stages the move: the old path leaves the index.
+        let stage = |content: &[u8]| -> git::Result<()> {
+            git::stage(repo, &f.path, content, &f.mode)?;
+            match &f.old_path {
+                Some(from) => git::unstage_remove(repo, from),
+                None => Ok(()),
+            }
+        };
+        // A rename rejected as a whole is moved back.
+        let unrename = |from: &str| -> git::Result<()> {
+            let dst = repo.join(from);
+            let err = |e: std::io::Error| format!("{from}: {e}");
+            if let Some(dir) = dst.parent() {
+                std::fs::create_dir_all(dir).map_err(err)?;
+            }
+            std::fs::write(&dst, &f.old_bytes).map_err(err)?;
+            if git::index_mode(repo, from).as_deref() == Some("100755") {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+            }
+            remove()
+        };
 
         if f.binary {
             match f.hunks[0].decision {
                 Decision::Approve => {
                     if f.new_exists {
-                        git::stage(repo, &f.path, &f.new_bytes, &f.mode)?
+                        stage(&f.new_bytes)?
                     } else {
                         git::unstage_remove(repo, &f.path)?
                     }
                 }
-                Decision::Reject => {
-                    if f.status == Status::Untracked {
-                        remove()?
-                    } else {
-                        write(&f.old_bytes)?
-                    }
-                }
+                Decision::Reject => match &f.old_path {
+                    Some(from) => unrename(from)?,
+                    None if f.status == Status::Untracked => remove()?,
+                    None => write(&f.old_bytes)?,
+                },
                 _ => {}
             }
             continue;
@@ -479,22 +604,24 @@ pub fn apply(repo: &Path, files: &[FileDiff]) -> git::Result<()> {
                     Decision::Edit => Pick::Custom(edited_lines(f, h)),
                     _ => Pick::Old,
                 });
-                git::stage(repo, &f.path, idx.concat().as_bytes(), &f.mode)?;
+                stage(idx.concat().as_bytes())?;
             }
         }
         if f.hunks
             .iter()
             .any(|h| matches!(d(h), Decision::Reject | Decision::Edit))
         {
+            let all_rejected = f.hunks.iter().all(|h| d(h) == Decision::Reject);
+            if let (Some(from), true) = (&f.old_path, all_rejected) {
+                unrename(from)?;
+                continue;
+            }
             let wt = mix(f, |h| match h.decision {
                 Decision::Reject => Pick::Old,
                 Decision::Edit => Pick::Custom(edited_lines(f, h)),
                 _ => Pick::New,
             });
-            if f.status == Status::Untracked
-                && wt.is_empty()
-                && f.hunks.iter().all(|h| d(h) == Decision::Reject)
-            {
+            if f.status == Status::Untracked && wt.is_empty() && all_rejected {
                 remove()?;
             } else {
                 write(wt.concat().as_bytes())?;
@@ -626,7 +753,20 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
             } else {
                 String::new()
             };
-            let _ = writeln!(s, "### `{}`{scope}\n", f.path);
+            match &f.old_path {
+                Some(from) => {
+                    let _ = writeln!(s, "### `{}` (renamed from `{from}`){scope}\n", f.path);
+                }
+                None => {
+                    let _ = writeln!(s, "### `{}`{scope}\n", f.path);
+                }
+            }
+            if want == Decision::Reject && !read_only && f.old_path.is_some() && whole {
+                let _ = writeln!(
+                    s,
+                    "The rename was reverted too: the file is back at its old path.\n"
+                );
+            }
             if let Some(n) = note_here {
                 let label = if want == Decision::Reject {
                     "Why the file was rejected"
@@ -713,6 +853,7 @@ mod tests {
         let n = split_lines(new);
         FileDiff {
             path: "t.txt".into(),
+            old_path: None,
             status: Status::Modified,
             mode: "100644".into(),
             binary: false,
@@ -993,5 +1134,130 @@ mod tests {
         f.hunks[1].note = "keep lowercase".into();
         let m = feedback(std::slice::from_ref(&f), "", &git::Source::Worktree).unwrap();
         assert!(m.contains("keep lowercase") && m.contains("-l") && m.contains("+L"));
+    }
+
+    fn git_repo(name: &str) -> (std::path::PathBuf, impl Fn(&[&str])) {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("verdict-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        let sh = move |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&d)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        sh(&["init", "-q"]);
+        (dir, sh)
+    }
+
+    const BODY: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n";
+
+    #[test]
+    fn renames_are_paired_and_applied() {
+        let (dir, sh) = git_repo("rename");
+        std::fs::write(dir.join("old.txt"), BODY).unwrap();
+        std::fs::write(dir.join("other.txt"), "unrelated\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "init"]);
+        // Moved with one line changed, and an unrelated new file.
+        std::fs::remove_file(dir.join("old.txt")).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/new.txt"), BODY.replace("four", "FOUR")).unwrap();
+        std::fs::write(dir.join("fresh.txt"), "hello\n").unwrap();
+
+        let files = load(&dir).unwrap();
+        let got: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status, f.old_path.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("fresh.txt", Status::Untracked, None),
+                ("sub/new.txt", Status::Renamed, Some("old.txt"))
+            ]
+        );
+        assert_eq!(files[1].hunks.len(), 1);
+        let m = {
+            let mut f = load(&dir).unwrap();
+            f[1].hunks[0].decision = Decision::Comment;
+            f[1].hunks[0].note = "ok".into();
+            feedback(&f, "", &git::Source::Worktree).unwrap()
+        };
+        assert!(
+            m.contains("### `sub/new.txt` (renamed from `old.txt`)"),
+            "{m}"
+        );
+
+        // Approving stages the move.
+        let mut files = load(&dir).unwrap();
+        files[1].hunks[0].decision = Decision::Approve;
+        apply(&dir, &files).unwrap();
+        assert!(git::index_blob(&dir, "old.txt").is_err());
+        assert_eq!(
+            git::index_blob(&dir, "sub/new.txt").unwrap(),
+            BODY.replace("four", "FOUR").as_bytes()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejecting_a_rename_moves_it_back() {
+        let (dir, sh) = git_repo("unrename");
+        std::fs::write(dir.join("old.txt"), BODY).unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "init"]);
+        std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
+
+        let mut files = load(&dir).unwrap();
+        assert_eq!(files.len(), 1);
+        // Nothing changed but the path: one hunk stands for the move.
+        assert_eq!(files[0].hunks[0].header, "renamed, content unchanged");
+        files[0].hunks[0].decision = Decision::Reject;
+        files[0].hunks[0].note = "keep the name".into();
+        let m = feedback(&files, "", &git::Source::Worktree).unwrap();
+        assert!(m.contains("rename was reverted"), "{m}");
+        apply(&dir, &files).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("old.txt")).unwrap(), BODY);
+        assert!(!dir.join("new.txt").exists());
+        assert!(load(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renames_in_commit_ranges() {
+        let (dir, sh) = git_repo("rename-range");
+        std::fs::write(dir.join("a.txt"), BODY).unwrap();
+        std::fs::write(dir.join("b.txt"), "something else entirely\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "c1"]);
+        sh(&["mv", "a.txt", "c.txt"]);
+        sh(&["rm", "-q", "b.txt"]);
+        std::fs::write(dir.join("d.txt"), "a brand new file\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "c2"]);
+        let range = git::parse_range(&dir, "HEAD~1..").unwrap();
+        let files = load_source(&dir, &range, None).unwrap();
+        let got: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        // Dissimilar files aren't paired.
+        assert_eq!(
+            got,
+            [
+                ("b.txt", Status::Deleted),
+                ("c.txt", Status::Renamed),
+                ("d.txt", Status::Untracked)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

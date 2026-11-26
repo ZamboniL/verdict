@@ -65,6 +65,9 @@ pub enum Status {
     Modified,
     Deleted,
     Untracked,
+    /// Deleted at one path and added at another with similar content. verdict pairs
+    /// these itself (see `model::pair_renames`); git never reports it to us.
+    Renamed,
 }
 
 impl Status {
@@ -73,6 +76,7 @@ impl Status {
             Status::Modified => "M",
             Status::Deleted => "D",
             Status::Untracked => "A",
+            Status::Renamed => "R",
         }
     }
 }
@@ -190,6 +194,7 @@ pub fn changed_in(repo: &Path, source: &Source) -> Result<Vec<Entry>> {
         "diff",
         "--name-status",
         "-z",
+        // Renames are paired by verdict, the same way for every source.
         "--no-renames",
         "--no-ext-diff",
     ];

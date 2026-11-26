@@ -274,7 +274,12 @@ fn child_review(
     let list = dir.join("files");
     let out = dir.join("result.json");
     let pid = dir.join("pid");
-    let paths: Vec<&str> = review.files.iter().map(|f| f.path.as_str()).collect();
+    // Both sides of a rename, so the child pairs them again.
+    let paths: Vec<&str> = review
+        .files
+        .iter()
+        .flat_map(|f| std::iter::once(f.path.as_str()).chain(f.old_path.as_deref()))
+        .collect();
     std::fs::write(&list, paths.join("\n")).map_err(|e| e.to_string())?;
     if let Some(m) = &review.agent_message {
         std::fs::write(dir.join("agent.md"), m).map_err(|e| e.to_string())?;

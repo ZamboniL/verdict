@@ -339,6 +339,7 @@ mod tests {
         let n = split_lines(new);
         FileDiff {
             path: path.into(),
+            old_path: None,
             status: Status::Modified,
             mode: "100644".into(),
             binary: false,

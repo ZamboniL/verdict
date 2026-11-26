@@ -1109,6 +1109,7 @@ impl App {
                     Status::Modified => "modified",
                     Status::Deleted => "deleted",
                     Status::Untracked => "new file",
+                    Status::Renamed => "renamed",
                 };
                 let arrow = if self.r.collapsed.contains(&r.fi) {
                     "▸"
@@ -1125,7 +1126,13 @@ impl App {
                         f.path.clone(),
                         Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("  {kind}"), fg(pal::DIM)),
+                    Span::styled(
+                        match &f.old_path {
+                            Some(from) => format!("  renamed from {from}"),
+                            None => format!("  {kind}"),
+                        },
+                        fg(pal::DIM),
+                    ),
                 ];
                 if let Some(hl) = &f.hl {
                     spans.push(Span::styled(format!(" · {}", hl.lang), fg(pal::DIM)));
@@ -1485,6 +1492,7 @@ fn status_color(s: Status) -> Color {
         Status::Modified => pal::AMBER,
         Status::Deleted => pal::RED,
         Status::Untracked => pal::GREEN,
+        Status::Renamed => pal::BLUE,
     }
 }
 

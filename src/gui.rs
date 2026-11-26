@@ -226,6 +226,7 @@ fn status_color(s: crate::git::Status) -> Color32 {
         crate::git::Status::Modified => pal::AMBER,
         crate::git::Status::Deleted => pal::RED,
         crate::git::Status::Untracked => pal::GREEN,
+        crate::git::Status::Renamed => pal::BLUE,
     }
 }
 
@@ -776,8 +777,12 @@ impl App {
                     if resp.clicked() {
                         jump = Some(fi);
                     }
+                    let hover = match &f.old_path {
+                        Some(from) => format!("{}\nrenamed from {from}", f.path),
+                        None => f.path.clone(),
+                    };
                     let resp = resp
-                        .on_hover_text(&f.path)
+                        .on_hover_text(hover)
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if !ui.is_rect_visible(rect) {
                         continue;
@@ -1008,6 +1013,13 @@ impl App {
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if arrow.clicked() || path.clicked() {
                                     toggle_fold = Some(fi);
+                                }
+                                if let Some(from) = &f.old_path {
+                                    ui.label(
+                                        RichText::new(format!("renamed from {from}"))
+                                            .size(12.0)
+                                            .color(pal::DIM),
+                                    );
                                 }
                                 let arrow_tip = if collapsed {
                                     "Unfold (Space)"
