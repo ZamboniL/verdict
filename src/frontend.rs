@@ -7,8 +7,10 @@
 #[cfg(not(any(feature = "gui", feature = "tui")))]
 compile_error!("enable at least one of the `gui` and `tui` features");
 
+use crate::git::Source;
 use crate::highlight::Registry;
 use crate::model::{FileDiff, FileHl};
+use crate::review::Review;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -103,6 +105,20 @@ pub struct UiConfig {
     pub terminal: Vec<String>,
     /// Start in the side-by-side view (`layout = "split"`).
     pub split: bool,
+    /// Where the hook opens the terminal interface inside tmux.
+    pub tmux: TmuxPlace,
+}
+
+/// `[ui] tmux = "popup" | "split" | "window"`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum TmuxPlace {
+    /// Over the agent's pane; closes when the review ends.
+    #[default]
+    Popup,
+    /// A pane next to the agent's, so both stay visible.
+    Split,
+    /// A new tmux window.
+    Window,
 }
 
 pub fn ui_config() -> UiConfig {
@@ -131,6 +147,11 @@ pub fn ui_config() -> UiConfig {
             .and_then(Choice::parse),
         terminal,
         split: ui.get("layout").and_then(|m| m.as_str()) == Some("split"),
+        tmux: match ui.get("tmux").and_then(|m| m.as_str()) {
+            Some("split") => TmuxPlace::Split,
+            Some("window") => TmuxPlace::Window,
+            _ => TmuxPlace::Popup,
+        },
     }
 }
 
@@ -176,21 +197,20 @@ fn want_tui(c: Choice) -> bool {
 /// Run the review in the chosen interface.
 pub fn run(
     repo: PathBuf,
-    files: Vec<FileDiff>,
+    review: Review,
     mode: Mode,
     choice: Choice,
     cfg: &UiConfig,
 ) -> Result<Option<Outcome>, String> {
-    let split = cfg.split;
     if !want_tui(choice) {
-        return run_gui(repo, files, mode, split);
+        return run_gui(repo, review, mode);
     }
     match mode {
-        Mode::Manual => run_tui(repo, files, mode, split),
+        Mode::Manual => run_tui(repo, review, mode),
         // The agent's own interface owns our terminal, so the review needs another one.
-        Mode::Hook => match elsewhere(&repo, &files, cfg) {
+        Mode::Hook => match elsewhere(&repo, &review, cfg) {
             Some(r) => r,
-            None if has_display() => run_gui(repo, files, mode, split),
+            None if has_display() => run_gui(repo, review, mode),
             None => Err(
                 "the terminal interface needs tmux, or a `terminal` command in the \
                          [ui] section of config.toml, when run from a hook"
@@ -201,32 +221,22 @@ pub fn run(
 }
 
 #[cfg(feature = "gui")]
-fn run_gui(
-    repo: PathBuf,
-    files: Vec<FileDiff>,
-    mode: Mode,
-    split: bool,
-) -> Result<Option<Outcome>, String> {
-    crate::gui::run(repo, files, mode, split)
+fn run_gui(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
+    crate::gui::run(repo, review, mode)
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui(_: PathBuf, _: Vec<FileDiff>, _: Mode, _: bool) -> Result<Option<Outcome>, String> {
+fn run_gui(_: PathBuf, _: Review, _: Mode) -> Result<Option<Outcome>, String> {
     Err("verdict was built without the `gui` feature".into())
 }
 
 #[cfg(feature = "tui")]
-fn run_tui(
-    repo: PathBuf,
-    files: Vec<FileDiff>,
-    mode: Mode,
-    split: bool,
-) -> Result<Option<Outcome>, String> {
-    crate::tui::run(repo, files, mode, split)
+fn run_tui(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
+    crate::tui::run(repo, review, mode)
 }
 
 #[cfg(not(feature = "tui"))]
-fn run_tui(_: PathBuf, _: Vec<FileDiff>, _: Mode, _: bool) -> Result<Option<Outcome>, String> {
+fn run_tui(_: PathBuf, _: Review, _: Mode) -> Result<Option<Outcome>, String> {
     Err("verdict was built without the `tui` feature".into())
 }
 
@@ -234,7 +244,7 @@ fn run_tui(_: PathBuf, _: Vec<FileDiff>, _: Mode, _: bool) -> Result<Option<Outc
 /// `verdict __tui` process, and wait for its result. `None` if there's nowhere to run it.
 fn elsewhere(
     repo: &Path,
-    files: &[FileDiff],
+    review: &Review,
     cfg: &UiConfig,
 ) -> Option<Result<Option<Outcome>, String>> {
     let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
@@ -247,14 +257,14 @@ fn elsewhere(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("verdict-{}-{nanos}", std::process::id()));
-    let r = child_review(repo, files, cfg, in_tmux, &exe, &dir);
+    let r = child_review(repo, review, cfg, in_tmux, &exe, &dir);
     let _ = std::fs::remove_dir_all(&dir);
     Some(r)
 }
 
 fn child_review(
     repo: &Path,
-    files: &[FileDiff],
+    review: &Review,
     cfg: &UiConfig,
     in_tmux: bool,
     exe: &Path,
@@ -264,8 +274,11 @@ fn child_review(
     let list = dir.join("files");
     let out = dir.join("result.json");
     let pid = dir.join("pid");
-    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let paths: Vec<&str> = review.files.iter().map(|f| f.path.as_str()).collect();
     std::fs::write(&list, paths.join("\n")).map_err(|e| e.to_string())?;
+    if let Some(m) = &review.agent_message {
+        std::fs::write(dir.join("agent.md"), m).map_err(|e| e.to_string())?;
+    }
     let child_args = [
         exe.as_os_str(),
         "__tui".as_ref(),
@@ -275,10 +288,17 @@ fn child_review(
 
     let mut cmd = if in_tmux {
         let mut c = std::process::Command::new("tmux");
-        c.args(["display-popup", "-E", "-w", "95%", "-h", "95%", "-d"])
-            .arg(repo)
-            .arg("--")
-            .args(child_args);
+        match cfg.tmux {
+            TmuxPlace::Popup => c.args(["display-popup", "-E", "-w", "95%", "-h", "95%", "-d"]),
+            TmuxPlace::Split => c.args(["split-window", "-h", "-l", "60%", "-c"]),
+            TmuxPlace::Window => c.args(["new-window", "-n", "verdict", "-c"]),
+        };
+        c.arg(repo);
+        // Next to the agent's own pane, not whichever pane is active.
+        if let (TmuxPlace::Split, Ok(pane)) = (cfg.tmux, std::env::var("TMUX_PANE")) {
+            c.args(["-t", &pane]);
+        }
+        c.arg("--").args(child_args);
         c
     } else {
         let mut c = std::process::Command::new(&cfg.terminal[0]);
@@ -364,7 +384,9 @@ pub fn tui_child(repo: &Path, dir: &Path) -> std::process::ExitCode {
         if files.is_empty() {
             return Ok(None);
         }
-        run_tui(repo.to_path_buf(), files, Mode::Hook, ui_config().split)
+        let mut review = Review::new(files, ui_config().split, Source::Worktree);
+        review.agent_message = std::fs::read_to_string(dir.join("agent.md")).ok();
+        run_tui(repo.to_path_buf(), review, Mode::Hook)
     })();
     let v = match result {
         Ok(Some(o)) => serde_json::json!({ "submitted": true, "message": o.message }),

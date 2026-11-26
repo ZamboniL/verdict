@@ -7,7 +7,7 @@ use crate::model::{self, Decision, FileDiff, FileHl, Hunk, Kind};
 use crate::review::{Effect, Review};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Event, FontId, Key, Modifiers, Rect, RichText, Sense,
-    Stroke, TextEdit, TextFormat, TextStyle, Vec2, pos2, text::LayoutJob, vec2,
+    Stroke, TextEdit, TextFormat, TextStyle, pos2, text::LayoutJob, vec2,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -16,27 +16,49 @@ use std::sync::mpsc;
 
 mod pal {
     use super::Color32;
-    pub const BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1b);
-    pub const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1d, 0x23);
-    pub const CARD: Color32 = Color32::from_rgb(0x1e, 0x21, 0x28);
-    pub const FILE: Color32 = Color32::from_rgb(0x18, 0x1b, 0x21);
-    pub const BORDER: Color32 = Color32::from_rgb(0x2c, 0x30, 0x3a);
-    pub const TEXT: Color32 = Color32::from_rgb(0xd4, 0xd7, 0xdd);
-    pub const DIM: Color32 = Color32::from_rgb(0x7a, 0x80, 0x8c);
-    pub const ADD_BG: Color32 = Color32::from_rgb(0x1d, 0x33, 0x26);
-    pub const DEL_BG: Color32 = Color32::from_rgb(0x3a, 0x20, 0x24);
+    const fn c(hex: u32) -> Color32 {
+        Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+    }
+    /// Behind the file cards.
+    pub const BG: Color32 = c(0x0e1014);
+    /// Top bar, sidebar, bottom bar.
+    pub const PANEL: Color32 = c(0x14161b);
+    pub const CARD: Color32 = c(0x181b21);
+    /// A file card's header strip.
+    pub const HEADER: Color32 = c(0x1d2027);
+    /// A hunk's header row.
+    pub const HUNK_HEAD: Color32 = c(0x1b1e25);
+    /// Hovered and selected rows, active toggles.
+    pub const RAISED: Color32 = c(0x252a35);
+    /// Line numbers.
+    pub const GUTTER: Color32 = c(0x15171c);
+    /// Unchanged code between hunks in the full-file view.
+    pub const GAP: Color32 = c(0x131519);
     /// The empty side of a split row.
-    pub const EMPTY: Color32 = Color32::from_rgb(0x19, 0x1b, 0x20);
-    pub const GREEN: Color32 = Color32::from_rgb(0x5f, 0xc2, 0x7e);
-    pub const RED: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x75);
-    pub const BLUE: Color32 = Color32::from_rgb(0x61, 0xaf, 0xef);
-    pub const AMBER: Color32 = Color32::from_rgb(0xe5, 0xc0, 0x7b);
-    pub const ACCENT: Color32 = Color32::from_rgb(0x8f, 0xa8, 0xff);
+    pub const EMPTY: Color32 = c(0x121418);
+    pub const BORDER: Color32 = c(0x2a2f39);
+    pub const BORDER_HI: Color32 = c(0x3b4252);
+    /// Dividers inside a card.
+    pub const SOFT: Color32 = c(0x23272f);
+    pub const TEXT: Color32 = c(0xe2e5ea);
+    pub const DIM: Color32 = c(0x8d939e);
+    pub const FAINT: Color32 = c(0x5d636e);
+    pub const ADD_BG: Color32 = c(0x15271c);
+    pub const ADD_GUTTER: Color32 = c(0x1b3424);
+    pub const DEL_BG: Color32 = c(0x2b171b);
+    pub const DEL_GUTTER: Color32 = c(0x3b1e24);
+    pub const GREEN: Color32 = c(0x5cc98a);
+    pub const RED: Color32 = c(0xec6f7a);
+    pub const BLUE: Color32 = c(0x6cb4f5);
+    pub const AMBER: Color32 = c(0xe9c46a);
+    pub const ACCENT: Color32 = c(0x8b9cff);
+    /// Text on a filled button.
+    pub const ON_FILL: Color32 = c(0x0e1014);
 }
 
 fn decision_color(d: Decision) -> Color32 {
     match d {
-        Decision::Pending => pal::BORDER,
+        Decision::Pending => pal::FAINT,
         Decision::Approve => pal::GREEN,
         Decision::Reject => pal::RED,
         Decision::Edit => pal::BLUE,
@@ -44,12 +66,262 @@ fn decision_color(d: Decision) -> Color32 {
     }
 }
 
-pub fn run(
-    repo: PathBuf,
-    files: Vec<FileDiff>,
-    mode: Mode,
-    split: bool,
-) -> Result<Option<Outcome>, String> {
+fn decision_label(d: Decision) -> &'static str {
+    match d {
+        Decision::Pending => "Pending",
+        Decision::Approve => "Approved",
+        Decision::Reject => "Rejected",
+        Decision::Edit => "Edited",
+        Decision::Comment => "Commented",
+    }
+}
+
+/// `c` mixed into `base`, opaque.
+fn tint(base: Color32, c: Color32, t: f32) -> Color32 {
+    base.lerp_to_gamma(c, t)
+}
+
+// ---- small widgets ---------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Look {
+    /// Outlined in its color when off, filled when on.
+    Tinted(Color32),
+    /// Like `Tinted`, but neutral until hovered: for rows that aren't selected.
+    Quiet(Color32),
+    /// Neutral on/off switch.
+    Toggle,
+    /// The one main action.
+    Primary,
+    /// Neutral secondary action.
+    Plain,
+}
+
+/// A compact button with an optional key hint after the label.
+fn button(
+    ui: &mut egui::Ui,
+    label: &str,
+    key: Option<&str>,
+    look: Look,
+    on: bool,
+    enabled: bool,
+) -> egui::Response {
+    // Laid out uncolored: the colors depend on hover, known only after allocating.
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(13.0),
+        Color32::PLACEHOLDER,
+    );
+    let key_g = key.map(|k| {
+        ui.painter()
+            .layout_no_wrap(k.to_owned(), FontId::monospace(11.0), Color32::PLACEHOLDER)
+    });
+    let pad = 10.0;
+    let w = galley.size().x + pad * 2.0 + key_g.as_ref().map_or(0.0, |g| g.size().x + 7.0);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 24.0), sense);
+    let hovered = enabled && resp.hovered();
+    let look = match look {
+        Look::Quiet(c) if on || hovered => Look::Tinted(c),
+        l => l,
+    };
+    let (fill, hover_fill, stroke, text) = match (look, on) {
+        (Look::Primary, _) => (
+            pal::ACCENT,
+            tint(pal::ACCENT, Color32::WHITE, 0.15),
+            Color32::TRANSPARENT,
+            pal::ON_FILL,
+        ),
+        (Look::Tinted(c), true) => (
+            c,
+            tint(c, Color32::WHITE, 0.12),
+            Color32::TRANSPARENT,
+            pal::ON_FILL,
+        ),
+        (Look::Tinted(c), false) => (
+            Color32::TRANSPARENT,
+            c.gamma_multiply(0.14),
+            tint(pal::CARD, c, 0.35),
+            c,
+        ),
+        (Look::Quiet(_), _) => (Color32::TRANSPARENT, pal::RAISED, pal::BORDER, pal::DIM),
+        (Look::Toggle, true) => (
+            pal::RAISED,
+            tint(pal::RAISED, Color32::WHITE, 0.05),
+            tint(pal::RAISED, pal::ACCENT, 0.55),
+            pal::TEXT,
+        ),
+        (Look::Toggle, false) => (Color32::TRANSPARENT, pal::RAISED, pal::BORDER, pal::DIM),
+        (Look::Plain, _) => (Color32::TRANSPARENT, pal::RAISED, pal::BORDER, pal::TEXT),
+    };
+    let key_col = if on || matches!(look, Look::Primary) {
+        text.gamma_multiply(0.55)
+    } else {
+        pal::FAINT
+    };
+    let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.35) };
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let bg = if hovered { hover_fill } else { fill };
+        p.rect(
+            rect,
+            6,
+            fade(bg),
+            Stroke::new(1.0, fade(stroke)),
+            egui::StrokeKind::Inside,
+        );
+        let gw = galley.size().x;
+        let y = rect.center().y - galley.size().y / 2.0;
+        p.galley(pos2(rect.left() + pad, y), galley, fade(text));
+        if let Some(g) = key_g {
+            let ky = rect.center().y - g.size().y / 2.0;
+            p.galley(pos2(rect.left() + pad + gw + 7.0, ky), g, fade(key_col));
+        }
+    }
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// A small rounded label in a tint of `color`.
+fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let g = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
+    let size = g.size() + vec2(14.0, 4.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(size.x, size.y.max(18.0)), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 9, color.gamma_multiply(0.16));
+    p.galley(rect.center() - g.size() / 2.0, g, color);
+    resp
+}
+
+/// The file's status letter in a small tinted square.
+fn status_badge(ui: &mut egui::Ui, status: crate::git::Status) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+    paint_badge(ui.painter(), rect, status);
+    resp
+}
+
+fn paint_badge(p: &egui::Painter, rect: Rect, status: crate::git::Status) {
+    let col = status_color(status);
+    p.rect_filled(rect, 4, col.gamma_multiply(0.16));
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        status.letter(),
+        FontId::monospace(11.0),
+        col,
+    );
+}
+
+fn status_color(s: crate::git::Status) -> Color32 {
+    match s {
+        crate::git::Status::Modified => pal::AMBER,
+        crate::git::Status::Deleted => pal::RED,
+        crate::git::Status::Untracked => pal::GREEN,
+    }
+}
+
+/// A key drawn as a keycap, then what it does.
+fn key_hint(ui: &mut egui::Ui, keys: &str, what: &str) {
+    ui.spacing_mut().item_spacing.x = 5.0;
+    let g = ui
+        .painter()
+        .layout_no_wrap(keys.to_owned(), FontId::monospace(11.0), pal::DIM);
+    let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 10.0, 17.0), Sense::hover());
+    ui.painter().rect(
+        rect,
+        4,
+        pal::HEADER,
+        Stroke::new(1.0, pal::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - g.size() / 2.0, g, pal::DIM);
+    ui.label(RichText::new(what).size(11.5).color(pal::FAINT));
+    ui.add_space(8.0);
+}
+
+/// Small uppercase heading.
+fn caption(ui: &mut egui::Ui, text: &str, color: Color32) {
+    ui.label(
+        RichText::new(text)
+            .size(10.5)
+            .strong()
+            .color(color)
+            .extra_letter_spacing(0.6),
+    );
+}
+
+/// A text box outlined in a tint of `color`.
+fn note_box(
+    ui: &mut egui::Ui,
+    buf: &mut String,
+    hint: &str,
+    color: Color32,
+    rows: usize,
+) -> egui::Response {
+    let frame = egui::Frame::new()
+        .fill(pal::BG)
+        .stroke(Stroke::new(1.0, tint(pal::BG, color, 0.4)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 7));
+    let edit = if rows <= 1 {
+        TextEdit::singleline(buf)
+    } else {
+        TextEdit::multiline(buf).desired_rows(rows)
+    };
+    ui.add(
+        edit.hint_text(RichText::new(hint).color(pal::FAINT))
+            .desired_width(f32::INFINITY)
+            .frame(frame),
+    )
+}
+
+/// The path split into its directory (with the trailing slash) and file name.
+fn split_path(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..=i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// Decision colors along a thin bar, in proportion.
+fn progress_bar(ui: &mut egui::Ui, c: &model::Counts, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 3, pal::RAISED);
+    if c.total == 0 {
+        return;
+    }
+    let mut x = rect.left();
+    for (n, col) in [
+        (c.approve, pal::GREEN),
+        (c.edit, pal::BLUE),
+        (c.comment, pal::AMBER),
+        (c.reject, pal::RED),
+    ] {
+        if n == 0 {
+            continue;
+        }
+        let w = rect.width() * n as f32 / c.total as f32;
+        p.rect_filled(
+            Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height())),
+            3,
+            col,
+        );
+        x += w;
+    }
+}
+
+pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
     let result: Rc<RefCell<Option<Outcome>>> = Rc::default();
     let name = repo
         .file_name()
@@ -76,12 +348,13 @@ pub fn run(
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
-            let jobs = hl_jobs(&files);
+            let jobs = hl_jobs(&review.files);
+            let hl_left = jobs.len();
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || run_highlighter(jobs, tx, move || ctx.request_repaint()));
             Ok(Box::new(App {
                 repo,
-                r: Review::new(files, split),
+                r: review,
                 mode,
                 scroll_to_sel: false,
                 focus_note: false,
@@ -91,6 +364,9 @@ pub fn run(
                 done: false,
                 hl_rx: rx,
                 focus_file_note: None,
+                show_agent: false,
+                hl_left,
+                capture: Capture::from_env(),
             }))
         }),
     )
@@ -184,19 +460,41 @@ fn setup_style(ctx: &egui::Context) {
     v.panel_fill = pal::PANEL;
     v.window_fill = pal::PANEL;
     v.extreme_bg_color = pal::BG;
+    v.faint_bg_color = pal::HEADER;
     v.override_text_color = Some(pal::TEXT);
     v.selection.bg_fill = Color32::from_rgb(0x2e, 0x3a, 0x5c);
+    v.selection.stroke = Stroke::new(1.0, pal::ACCENT);
+    v.hyperlink_color = pal::ACCENT;
+    v.window_corner_radius = CornerRadius::same(8);
+    v.menu_corner_radius = CornerRadius::same(6);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal::BORDER);
+    v.widgets.noninteractive.bg_fill = pal::PANEL;
+    for (w, fill) in [
+        (&mut v.widgets.inactive, pal::HEADER),
+        (&mut v.widgets.hovered, pal::RAISED),
+        (&mut v.widgets.active, pal::RAISED),
+    ] {
+        w.corner_radius = CornerRadius::same(6);
+        w.bg_fill = fill;
+        w.weak_bg_fill = fill;
+        w.bg_stroke = Stroke::new(1.0, pal::BORDER);
+    }
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, pal::BORDER_HI);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, pal::ACCENT);
     ctx.set_visuals(v);
     ctx.global_style_mut(|s| {
         s.text_styles
             .insert(TextStyle::Body, FontId::proportional(14.0));
         s.text_styles
-            .insert(TextStyle::Button, FontId::proportional(13.5));
+            .insert(TextStyle::Button, FontId::proportional(13.0));
+        s.text_styles
+            .insert(TextStyle::Small, FontId::proportional(11.5));
         s.text_styles
             .insert(TextStyle::Monospace, FontId::monospace(13.0));
         s.spacing.item_spacing = vec2(8.0, 6.0);
-        s.spacing.button_padding = vec2(8.0, 3.0);
+        s.spacing.button_padding = vec2(10.0, 4.0);
+        s.spacing.scroll.floating = true;
+        s.spacing.scroll.bar_width = 8.0;
     });
 }
 
@@ -212,6 +510,12 @@ struct App {
     done: bool,
     hl_rx: mpsc::Receiver<(usize, FileHl)>,
     focus_file_note: Option<usize>,
+    /// The agent's last message is shown in a side panel.
+    show_agent: bool,
+    /// Files still waiting for the background highlighter.
+    hl_left: usize,
+    /// Scripted screenshot run (`VERDICT_SCREENSHOT`), for development and docs.
+    capture: Option<Capture>,
 }
 
 impl App {
@@ -221,7 +525,7 @@ impl App {
             Effect::HunkNote(..) => self.focus_note = true,
             Effect::EditHunk(..) => self.focus_edit = true,
             Effect::FileNote(fi) => self.focus_file_note = Some(fi),
-            Effect::None | Effect::Binary => {}
+            Effect::None | Effect::Binary | Effect::ReadOnly => {}
         }
     }
 
@@ -276,6 +580,8 @@ impl App {
             self.r.toggle_full(fi);
         } else if pressed(Key::S) {
             self.r.toggle_split();
+        } else if pressed(Key::T) {
+            self.show_agent = !self.show_agent && self.r.agent_message.is_some();
         } else if let (Some(fi), true) = (cur, pressed(Key::Space)) {
             self.r.toggle_fold(fi);
         } else if pressed(Key::N) {
@@ -310,27 +616,47 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let c = self.r.counts();
         let will_send = self.r.will_send();
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new("verdict")
+                    .size(14.0)
+                    .strong()
+                    .color(pal::ACCENT),
+            );
+            ui.label(RichText::new("/").size(14.0).color(pal::FAINT));
             let name = self.repo.file_name().unwrap_or_default().to_string_lossy();
-            ui.label(RichText::new(name).strong().size(15.0));
-            ui.label(RichText::new(format!("{} hunks", c.total)).color(pal::DIM));
-            let chip = |ui: &mut egui::Ui, n: usize, label: &str, col: Color32| {
-                if n > 0 {
-                    ui.label(RichText::new(format!("{n} {label}")).color(col));
-                }
-            };
-            chip(ui, c.approve, "approved", pal::GREEN);
-            chip(ui, c.reject, "rejected", pal::RED);
-            chip(ui, c.edit, "edited", pal::BLUE);
-            chip(ui, c.comment, "commented", pal::AMBER);
-            chip(ui, c.pending, "pending", pal::DIM);
+            ui.label(RichText::new(name).size(14.0).strong().color(pal::TEXT));
+            if self.r.source.read_only() {
+                ui.add_space(4.0);
+                pill(
+                    ui,
+                    &format!("{} · feedback only", self.r.source.describe()),
+                    pal::ACCENT,
+                )
+                .on_hover_text("Nothing in git changes when you submit; hunks can't be edited");
+            }
+            ui.add_space(18.0);
+            progress_bar(ui, &c, 120.0);
+            ui.add_space(2.0);
+            let decided = c.total - c.pending;
+            ui.label(
+                RichText::new(format!("{decided} of {} decided", c.total))
+                    .size(12.5)
+                    .color(pal::DIM),
+            )
+            .on_hover_text(format!(
+                "{} approved · {} rejected · {} edited · {} commented · {} pending",
+                c.approve, c.reject, c.edit, c.comment, c.pending
+            ));
             if let Some(reg) = REG.get() {
                 if !reg.warnings.is_empty() {
-                    ui.label(
-                        RichText::new(format!("{} highlight warning(s)", reg.warnings.len()))
-                            .small()
-                            .color(pal::AMBER),
+                    ui.add_space(6.0);
+                    pill(
+                        ui,
+                        &format!("{} highlight warning(s)", reg.warnings.len()),
+                        pal::AMBER,
                     )
                     .on_hover_text(reg.warnings.join("\n"));
                 }
@@ -338,30 +664,48 @@ impl App {
 
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let label = match (self.mode, will_send) {
-                    (Mode::Hook, true) => "Submit: send feedback  (Ctrl+Enter)",
-                    (Mode::Hook, false) => "Submit: let agent finish  (Ctrl+Enter)",
-                    (Mode::Manual, _) => "Submit  (Ctrl+Enter)",
+                    (Mode::Hook, true) => "Send feedback",
+                    (Mode::Hook, false) => "Let agent finish",
+                    (Mode::Manual, _) => "Submit",
                 };
-                let btn = egui::Button::new(RichText::new(label).color(Color32::BLACK).strong())
-                    .fill(pal::ACCENT);
-                if ui.add(btn).clicked() {
+                if button(ui, label, Some("Ctrl+Enter"), Look::Primary, true, true).clicked() {
                     self.submit(ui.ctx());
                 }
-                if ui
-                    .add_enabled(c.pending > 0, egui::Button::new("Approve all pending"))
-                    .clicked()
+                if button(
+                    ui,
+                    "Approve all pending",
+                    None,
+                    Look::Plain,
+                    false,
+                    c.pending > 0,
+                )
+                .clicked()
                 {
                     self.r.approve_all_pending();
                 }
-                if ui
-                    .add(egui::Button::selectable(self.r.split, "Split view"))
-                    .on_hover_text("Old and new side by side (s)")
+                ui.add_space(10.0);
+                if self.r.agent_message.is_some()
+                    && button(
+                        ui,
+                        "Agent's message",
+                        Some("t"),
+                        Look::Toggle,
+                        self.show_agent,
+                        true,
+                    )
+                    .on_hover_text("What the agent said at the end of its turn")
+                    .clicked()
+                {
+                    self.show_agent = !self.show_agent;
+                }
+                if button(ui, "Split", Some("s"), Look::Toggle, self.r.split, true)
+                    .on_hover_text("Old and new side by side")
                     .clicked()
                 {
                     self.r.toggle_split();
                 }
-                if ui
-                    .button("Skip")
+                ui.add_space(10.0);
+                if button(ui, "Skip", None, Look::Plain, false, true)
                     .on_hover_text("Close without changing anything")
                     .clicked()
                 {
@@ -369,72 +713,147 @@ impl App {
                 }
             });
         });
-        ui.add_space(4.0);
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
         if let Some(e) = &self.error {
             ui.label(RichText::new(format!("Error: {e}")).color(pal::RED));
         }
-        ui.add(
-            TextEdit::multiline(&mut self.r.general)
-                .hint_text("General feedback for the agent (optional)")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
+        note_box(
+            ui,
+            &mut self.r.general,
+            "General feedback for the agent (optional)",
+            pal::BORDER_HI,
+            2,
         );
-        ui.label(
-            RichText::new(
-                "j/k move · a r e c approve/reject/edit/comment hunk · Shift+A/R/C whole file · x clear · f full file · s split view · Space fold file · n next pending · ] [ next/prev file · Esc leave text box · Ctrl+Enter submit",
-            )
-            .small()
-            .color(pal::DIM),
-        );
-        ui.add_space(4.0);
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            key_hint(ui, "j k", "move");
+            key_hint(ui, "a r e c", "approve · reject · edit · comment");
+            key_hint(ui, "A R C", "whole file");
+            key_hint(ui, "x", "clear");
+            key_hint(ui, "n", "next pending");
+            key_hint(ui, "[ ]", "files");
+            key_hint(ui, "f", "full file");
+            key_hint(ui, "s", "split");
+            key_hint(ui, "Space", "fold");
+            if self.r.agent_message.is_some() {
+                key_hint(ui, "t", "agent");
+            }
+            key_hint(ui, "Esc", "leave text box");
+            key_hint(ui, "Ctrl+Enter", "submit");
+        });
     }
 
     fn file_list(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.label(RichText::new("FILES").small().color(pal::DIM));
-        let mut jump = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let cur_file = self.r.cur_file();
-            for (fi, f) in self.r.files.iter().enumerate() {
-                let decided = f
-                    .hunks
-                    .iter()
-                    .filter(|h| h.decision != Decision::Pending)
-                    .count();
-                let rejected = f.hunks.iter().any(|h| h.decision == Decision::Reject);
-                let status_col = match f.status {
-                    crate::git::Status::Modified => pal::AMBER,
-                    crate::git::Status::Deleted => pal::RED,
-                    crate::git::Status::Untracked => pal::GREEN,
-                };
-                let mut job = LayoutJob::default();
-                let fmt = |c: Color32| TextFormat {
-                    font_id: FontId::monospace(12.5),
-                    color: c,
-                    ..Default::default()
-                };
-                job.append(f.status.letter(), 0.0, fmt(status_col));
-                job.append(&f.path, 8.0, fmt(pal::TEXT));
-                let prog_col = if rejected {
-                    pal::RED
-                } else if decided == f.hunks.len() {
-                    pal::GREEN
-                } else {
-                    pal::DIM
-                };
-                job.append(&format!("{decided}/{}", f.hunks.len()), 8.0, fmt(prog_col));
-                if ui
-                    .add(egui::Button::selectable(cur_file == Some(fi), job))
-                    .clicked()
-                {
-                    jump = Some(fi);
-                }
-            }
+        ui.horizontal(|ui| {
+            caption(ui, "FILES", pal::FAINT);
+            ui.label(
+                RichText::new(self.r.files.len().to_string())
+                    .size(11.0)
+                    .color(pal::FAINT),
+            );
         });
+        ui.add_space(2.0);
+        let mut jump = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let cur_file = self.r.cur_file();
+                for (fi, f) in self.r.files.iter().enumerate() {
+                    let (rect, resp) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+                    if resp.clicked() {
+                        jump = Some(fi);
+                    }
+                    let resp = resp
+                        .on_hover_text(&f.path)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let p = ui.painter();
+                    let selected = cur_file == Some(fi);
+                    if selected {
+                        p.rect_filled(rect, 6, pal::RAISED);
+                        p.rect_filled(
+                            Rect::from_min_size(rect.left_top() + vec2(0.0, 7.0), vec2(2.5, 16.0)),
+                            1,
+                            pal::ACCENT,
+                        );
+                    } else if resp.hovered() {
+                        p.rect_filled(rect, 6, pal::HEADER);
+                    }
+                    let badge = Rect::from_center_size(
+                        pos2(rect.left() + 17.0, rect.center().y),
+                        vec2(18.0, 18.0),
+                    );
+                    paint_badge(p, badge, f.status);
+
+                    // Hunk pips on the right, one per hunk, or a count when there are many.
+                    let n = f.hunks.len();
+                    let pips_w = if n <= 8 { n as f32 * 9.0 } else { 40.0 };
+                    let right = rect.right() - 10.0;
+                    if n <= 8 {
+                        for (i, h) in f.hunks.iter().enumerate() {
+                            let c = pos2(right - pips_w + 4.0 + i as f32 * 9.0, rect.center().y);
+                            if h.decision == Decision::Pending {
+                                p.circle_stroke(c, 3.0, Stroke::new(1.2, pal::FAINT));
+                            } else {
+                                p.circle_filled(c, 3.5, decision_color(h.decision));
+                            }
+                        }
+                    } else {
+                        let decided = f
+                            .hunks
+                            .iter()
+                            .filter(|h| h.decision != Decision::Pending)
+                            .count();
+                        p.text(
+                            pos2(right, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{decided}/{n}"),
+                            FontId::monospace(11.0),
+                            pal::DIM,
+                        );
+                    }
+
+                    let (dir, name) = split_path(&f.path);
+                    let mut job = LayoutJob::default();
+                    let fmt = |c: Color32, size: f32| TextFormat {
+                        font_id: FontId::proportional(size),
+                        color: c,
+                        ..Default::default()
+                    };
+                    job.append(
+                        name,
+                        0.0,
+                        fmt(
+                            if selected {
+                                pal::TEXT
+                            } else {
+                                tint(pal::PANEL, pal::TEXT, 0.85)
+                            },
+                            13.0,
+                        ),
+                    );
+                    if !dir.is_empty() {
+                        job.append(dir.trim_end_matches('/'), 6.0, fmt(pal::FAINT, 11.5));
+                    }
+                    let text_x = badge.right() + 8.0;
+                    let clip = Rect::from_min_max(
+                        pos2(text_x, rect.top()),
+                        pos2(right - pips_w - 8.0, rect.bottom()),
+                    );
+                    let g = p.layout_job(job);
+                    p.with_clip_rect(clip.intersect(p.clip_rect())).galley(
+                        pos2(text_x, rect.center().y - g.size().y / 2.0),
+                        g,
+                        pal::TEXT,
+                    );
+                }
+            });
         if let Some(fi) = jump {
             self.r.select_file(fi);
         }
@@ -442,11 +861,17 @@ impl App {
 
     fn diff_view(&mut self, ui: &mut egui::Ui) {
         if self.r.files.is_empty() {
-            ui.centered_and_justified(|ui| ui.label("No changes to review."));
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("No changes to review.")
+                        .size(16.0)
+                        .color(pal::DIM),
+                )
+            });
             return;
         }
         let mono = TextStyle::Monospace.resolve(ui.style());
-        let row_h = ui.text_style_height(&TextStyle::Monospace) + 2.0;
+        let row_h = ui.text_style_height(&TextStyle::Monospace) + 5.0;
         let char_w = ui
             .painter()
             .layout_no_wrap("0".into(), mono.clone(), pal::TEXT)
@@ -454,6 +879,7 @@ impl App {
             .x;
         let sel_pair = self.r.sel_pair();
         let split = self.r.split;
+        let read_only = self.r.source.read_only();
         let mut new_sel = None;
         let mut action: Option<Decision> = None;
         let mut file_act: Option<(usize, Decision)> = None;
@@ -461,190 +887,321 @@ impl App {
         let mut full_toggle: Option<usize> = None;
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            ui.add_space(8.0);
+            // Headers and notes stay within the window even when code scrolls sideways.
+            let view_w = ui.available_width();
+            ui.add_space(4.0);
             for (fi, f) in self.r.files.iter_mut().enumerate() {
                 let total = f.hunks.len();
-                let decided = f.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
+                let decided = f
+                    .hunks
+                    .iter()
+                    .filter(|h| h.decision != Decision::Pending)
+                    .count();
+                let rejected = f
+                    .hunks
+                    .iter()
+                    .filter(|h| h.decision == Decision::Reject)
+                    .count();
                 let collapsed = self.r.collapsed.contains(&fi);
                 let file_sel = sel_pair.map(|p| p.0) == Some(fi);
-                let state = if f.hunks.iter().any(|h| h.decision == Decision::Reject) {
-                    pal::RED
+                let (state_text, state_col) = if total == 0 {
+                    (String::new(), pal::DIM)
                 } else if f.all(Decision::Approve) {
-                    pal::GREEN
+                    ("Approved".to_owned(), pal::GREEN)
+                } else if f.all(Decision::Reject) {
+                    ("Rejected".to_owned(), pal::RED)
                 } else if decided == total {
-                    pal::BLUE
+                    if rejected > 0 {
+                        (format!("Reviewed · {rejected} rejected"), pal::RED)
+                    } else {
+                        ("Reviewed".to_owned(), pal::BLUE)
+                    }
+                } else if rejected > 0 {
+                    (
+                        format!("{decided}/{total} decided · {rejected} rejected"),
+                        pal::RED,
+                    )
                 } else {
-                    pal::BORDER
+                    (format!("{decided}/{total} decided"), pal::DIM)
                 };
-                let file_frame = egui::Frame::new()
-                    .fill(pal::FILE)
-                    .stroke(Stroke::new(if file_sel { 1.5 } else { 1.0 }, state))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 });
-                let file_resp = file_frame.show(ui, |ui| {
-                    // Header: fold arrow, path, meta, whole-file actions.
-                    ui.horizontal(|ui| {
-                        let (r, arrow) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
-                        let c = r.center();
-                        let pts = if collapsed {
-                            vec![c + vec2(-3.0, -5.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 5.0)]
+                let is_full = self.r.full.contains_key(&fi);
+                let gaps = self.r.full.get(&fi);
+                // One width for every row in the card, so backgrounds line up.
+                let widest = f
+                    .hunks
+                    .iter()
+                    .map(|h| max_chars(h.lines.iter()))
+                    .chain(gaps.into_iter().flatten().map(|g| max_chars(g.iter())))
+                    .fold(0.0, f32::max);
+                let card = egui::Frame::new()
+                    .fill(pal::CARD)
+                    .stroke(Stroke::new(
+                        1.0,
+                        if file_sel {
+                            pal::BORDER_HI
                         } else {
-                            vec![c + vec2(-5.0, -3.0), c + vec2(5.0, -3.0), c + vec2(0.0, 4.0)]
-                        };
-                        let col = if arrow.hovered() { pal::TEXT } else { pal::DIM };
-                        ui.painter().add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
-                        let path = ui.add(
-                            egui::Label::new(RichText::new(&f.path).monospace().strong().size(14.0))
-                                .sense(Sense::click()),
-                        );
-                        if arrow.clicked() || path.clicked() {
-                            toggle_fold = Some(fi);
-                        }
-                        let kind = match f.status {
-                            crate::git::Status::Modified => "modified",
-                            crate::git::Status::Deleted => "deleted",
-                            crate::git::Status::Untracked => "new file",
-                        };
-                        ui.label(RichText::new(kind).small().color(pal::DIM));
-                        if let Some(hl) = &f.hl {
-                            ui.label(RichText::new(&hl.lang).small().color(pal::DIM));
-                        }
-                        let noun = if total == 1 { "hunk" } else { "hunks" };
-                        ui.label(RichText::new(format!("{decided}/{total} {noun} decided")).small().color(if state == pal::BORDER { pal::DIM } else { state }));
-
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                            let mut fbtn = |ui: &mut egui::Ui, d: Decision, label: &str, on: bool, tip: &str| {
-                                let text = if on {
-                                    RichText::new(label).color(Color32::BLACK).strong()
+                            pal::BORDER
+                        },
+                    ))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(1));
+                let mut header_rect = Rect::NOTHING;
+                let mut header_bg = None;
+                let card_resp = card.show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    header_bg = Some(ui.painter().add(egui::Shape::Noop));
+                    // Header: fold arrow, path, state, whole-file actions.
+                    let head = egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: 10,
+                            right: 10,
+                            top: 8,
+                            bottom: 8,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_max_width(view_w - 22.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let (r, arrow) =
+                                    ui.allocate_exact_size(vec2(16.0, 18.0), Sense::click());
+                                let c = r.center();
+                                let pts = if collapsed {
+                                    vec![
+                                        c + vec2(-2.5, -4.5),
+                                        c + vec2(3.5, 0.0),
+                                        c + vec2(-2.5, 4.5),
+                                    ]
                                 } else {
-                                    RichText::new(label).color(decision_color(d))
+                                    vec![
+                                        c + vec2(-4.5, -2.5),
+                                        c + vec2(4.5, -2.5),
+                                        c + vec2(0.0, 3.5),
+                                    ]
                                 };
-                                let mut b = egui::Button::new(text);
-                                if on {
-                                    b = b.fill(decision_color(d));
+                                let col = if arrow.hovered() { pal::TEXT } else { pal::DIM };
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    pts,
+                                    col,
+                                    Stroke::NONE,
+                                ));
+                                status_badge(ui, f.status);
+                                let (dir, name) = split_path(&f.path);
+                                let mut job = LayoutJob::default();
+                                let fmt = |c: Color32| TextFormat {
+                                    font_id: FontId::monospace(13.5),
+                                    color: c,
+                                    ..Default::default()
+                                };
+                                job.append(dir, 0.0, fmt(pal::DIM));
+                                job.append(name, 0.0, fmt(pal::TEXT));
+                                let path = ui
+                                    .add(egui::Label::new(job).sense(Sense::click()))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if arrow.clicked() || path.clicked() {
+                                    toggle_fold = Some(fi);
                                 }
-                                if ui.add(b).on_hover_text(tip).clicked() {
-                                    file_act = Some((fi, d));
+                                let arrow_tip = if collapsed {
+                                    "Unfold (Space)"
+                                } else {
+                                    "Fold (Space)"
+                                };
+                                arrow.on_hover_text(arrow_tip);
+                                if let Some(hl) = &f.hl {
+                                    ui.label(RichText::new(&hl.lang).size(11.5).color(pal::FAINT));
                                 }
-                            };
-                            fbtn(ui, Decision::Comment, "Comment on file", f.file_mode == Some(Decision::Comment), "A note about the whole file (Shift+C)");
-                            fbtn(ui, Decision::Reject, "Reject file", f.all(Decision::Reject), "Reject every hunk with one reason (Shift+R)");
-                            fbtn(ui, Decision::Approve, "Approve file", f.all(Decision::Approve), "Approve every hunk (Shift+A)");
-                            ui.add_space(8.0);
-                            let is_full = self.r.full.contains_key(&fi);
-                            if ui
-                                .add_enabled(!f.binary, egui::Button::selectable(is_full, "Full file"))
-                                .on_hover_text("Show the whole file around the hunks (f)")
-                                .clicked()
-                            {
-                                full_toggle = Some(fi);
-                            }
+                                if !state_text.is_empty() {
+                                    pill(ui, &state_text, state_col);
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let mut fbtn =
+                                        |ui: &mut egui::Ui,
+                                         d: Decision,
+                                         label: &str,
+                                         on: bool,
+                                         tip: &str| {
+                                            let look = if file_sel {
+                                                Look::Tinted(decision_color(d))
+                                            } else {
+                                                Look::Quiet(decision_color(d))
+                                            };
+                                            if button(ui, label, None, look, on, true)
+                                                .on_hover_text(tip)
+                                                .clicked()
+                                            {
+                                                file_act = Some((fi, d));
+                                            }
+                                        };
+                                    fbtn(
+                                        ui,
+                                        Decision::Comment,
+                                        "Comment",
+                                        f.file_mode == Some(Decision::Comment),
+                                        "A note about the whole file (Shift+C)",
+                                    );
+                                    fbtn(
+                                        ui,
+                                        Decision::Reject,
+                                        "Reject file",
+                                        f.all(Decision::Reject),
+                                        "Reject every hunk with one reason (Shift+R)",
+                                    );
+                                    fbtn(
+                                        ui,
+                                        Decision::Approve,
+                                        "Approve file",
+                                        f.all(Decision::Approve),
+                                        "Approve every hunk (Shift+A)",
+                                    );
+                                    ui.add_space(8.0);
+                                    if button(
+                                        ui,
+                                        "Full file",
+                                        Some("f"),
+                                        Look::Toggle,
+                                        is_full,
+                                        !f.binary,
+                                    )
+                                    .on_hover_text("Show the whole file around the hunks")
+                                    .clicked()
+                                    {
+                                        full_toggle = Some(fi);
+                                    }
+                                });
+                            });
                         });
-                    });
+                    header_rect = head.response.rect;
 
                     if let Some(mode) = f.file_mode {
-                        let hint = if mode == Decision::Reject {
-                            "Why is this whole file rejected? (sent to the agent once, for all its hunks)"
+                        let (title, hint, col) = if mode == Decision::Reject {
+                            (
+                                "WHY THE WHOLE FILE IS REJECTED",
+                                "Sent to the agent once, for all its hunks",
+                                pal::RED,
+                            )
                         } else {
-                            "Comment about the whole file (sent to the agent)"
+                            ("COMMENT ON THE FILE", "Sent to the agent", pal::AMBER)
                         };
-                        let r = ui.add(
-                            TextEdit::multiline(&mut f.note)
-                                .hint_text(hint)
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY),
-                        );
-                        if self.focus_file_note == Some(fi) {
-                            r.request_focus();
-                            self.focus_file_note = None;
-                        }
+                        let note = egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                left: 12,
+                                right: 12,
+                                top: 0,
+                                bottom: 10,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_max_width(view_w - 26.0);
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                caption(ui, title, col);
+                                let r = note_box(ui, &mut f.note, hint, col, 2);
+                                if self.focus_file_note == Some(fi) {
+                                    r.request_focus();
+                                    self.focus_file_note = None;
+                                }
+                            });
+                        header_rect = header_rect.union(note.response.rect);
                     }
 
                     if collapsed {
-                        let noun = if total == 1 { "hunk" } else { "hunks" };
-                        ui.label(RichText::new(format!("{total} {noun} folded (Space or click the arrow to expand)")).small().color(pal::DIM));
                         return;
                     }
-                    ui.add_space(4.0);
 
-                    // Hunks, indented, joined by a rail in the gutter.
-                    let mut dots: Vec<(f32, Color32)> = Vec::new();
                     let file_rejected = f.file_mode == Some(Decision::Reject);
                     let digits = f.old.len().max(f.new.len()).to_string().len().max(3);
-                    let gaps = self.r.full.get(&fi);
-                    let FileDiff { hunks, hl, binary, .. } = f;
+                    let FileDiff {
+                        hunks, hl, binary, ..
+                    } = f;
                     let binary = *binary;
                     let gap_ctx = HunkCtx {
                         hl: hl.as_ref(),
-                        binary,
+                        editable: !binary && !read_only,
                         selected: false,
                         row_h,
                         char_w,
                         digits,
+                        widest,
+                        view_w,
                         mono: &mono,
                         label: None,
                         file_reason: false,
                         focus_note: false,
                         focus_edit: false,
                         split,
+                        gap: true,
                     };
-                    let inner = egui::Frame::new()
-                        .inner_margin(egui::Margin { left: 20, right: 0, top: 0, bottom: 0 })
-                        .show(ui, |ui| {
-                            for (hi, h) in hunks.iter_mut().enumerate() {
-                                if let Some(g) = gaps.and_then(|g| g.get(hi)) {
-                                    gap_ui(ui, g, &gap_ctx);
-                                }
-                                let selected = sel_pair == Some((fi, hi));
-                                let ctx = HunkCtx {
-                                    hl: hl.as_ref(),
-                                    binary,
-                                    selected,
-                                    row_h,
-                                    char_w,
-                                    digits,
-                                    mono: &mono,
-                                    label: (total > 1).then(|| format!("{}/{total}", hi + 1)),
-                                    file_reason: file_rejected,
-                                    focus_note: selected && std::mem::take(&mut self.focus_note),
-                                    focus_edit: selected && std::mem::take(&mut self.focus_edit),
-                                    split,
-                                };
-                                let out = hunk_ui(ui, h, ctx);
-                                let col = if h.decision == Decision::Pending { pal::DIM } else { decision_color(h.decision) };
-                                dots.push((out.rect.top() + 14.0, col));
-                                if out.clicked {
-                                    new_sel = Some((fi, hi));
-                                }
-                                if let Some(d) = out.action {
-                                    new_sel = Some((fi, hi));
-                                    action = Some(d);
-                                }
-                                if selected && self.scroll_to_sel {
-                                    ui.scroll_to_rect(out.rect, Some(Align::Min));
-                                    self.scroll_to_sel = false;
-                                }
-                                if hi + 1 < total && gaps.is_none() {
-                                    ui.add_space(6.0);
-                                }
-                            }
-                            if let Some(g) = gaps.and_then(|g| g.get(total)) {
-                                gap_ui(ui, g, &gap_ctx);
-                            }
-                        });
-                    let x = inner.response.rect.left() + 8.0;
-                    let painter = ui.painter();
-                    if let (Some(first), Some(last)) = (dots.first(), dots.last()) {
-                        if dots.len() > 1 {
-                            painter.line_segment([pos2(x, first.0), pos2(x, last.0)], Stroke::new(2.0, pal::BORDER));
+                    for (hi, h) in hunks.iter_mut().enumerate() {
+                        if let Some(g) = gaps.and_then(|g| g.get(hi)) {
+                            gap_ui(ui, g, &gap_ctx);
+                        }
+                        let selected = sel_pair == Some((fi, hi));
+                        let ctx = HunkCtx {
+                            hl: hl.as_ref(),
+                            editable: !binary && !read_only,
+                            selected,
+                            row_h,
+                            char_w,
+                            digits,
+                            widest,
+                            view_w,
+                            mono: &mono,
+                            label: Some(if total > 1 {
+                                format!("Hunk {}/{total}", hi + 1)
+                            } else {
+                                "Hunk".to_owned()
+                            }),
+                            file_reason: file_rejected,
+                            focus_note: selected && std::mem::take(&mut self.focus_note),
+                            focus_edit: selected && std::mem::take(&mut self.focus_edit),
+                            split,
+                            gap: false,
+                        };
+                        let out = hunk_ui(ui, h, ctx);
+                        if out.clicked {
+                            new_sel = Some((fi, hi));
+                        }
+                        if let Some(d) = out.action {
+                            new_sel = Some((fi, hi));
+                            action = Some(d);
+                        }
+                        if selected && self.scroll_to_sel {
+                            ui.scroll_to_rect(out.rect, Some(Align::Min));
+                            self.scroll_to_sel = false;
                         }
                     }
-                    for (y, col) in dots {
-                        painter.circle_filled(pos2(x, y), 4.0, col);
+                    if let Some(g) = gaps.and_then(|g| g.get(total)) {
+                        gap_ui(ui, g, &gap_ctx);
                     }
+                    ui.add_space(6.0);
                 });
+                // The header strip spans the card, however wide its code made it.
+                let inner = card_resp.response.rect.shrink(1.0);
+                let strip = Rect::from_x_y_ranges(inner.x_range(), header_rect.y_range());
+                let radius = if collapsed {
+                    CornerRadius::same(7)
+                } else {
+                    CornerRadius {
+                        nw: 7,
+                        ne: 7,
+                        sw: 0,
+                        se: 0,
+                    }
+                };
+                if let Some(idx) = header_bg {
+                    ui.painter().set(
+                        idx,
+                        egui::epaint::RectShape::filled(strip, radius, pal::HEADER),
+                    );
+                }
+                if !collapsed {
+                    ui.painter().hline(
+                        inner.x_range(),
+                        strip.bottom(),
+                        Stroke::new(1.0, pal::BORDER),
+                    );
+                }
                 if file_sel && collapsed && self.scroll_to_sel {
-                    ui.scroll_to_rect(file_resp.response.rect, Some(Align::Min));
+                    ui.scroll_to_rect(card_resp.response.rect, Some(Align::Min));
                     self.scroll_to_sel = false;
                 }
                 ui.add_space(12.0);
@@ -679,37 +1236,221 @@ impl eframe::App for App {
             if let Some(f) = self.r.files.get_mut(i) {
                 f.hl = Some(hl);
             }
+            self.hl_left = self.hl_left.saturating_sub(1);
         }
         self.keyboard(&ctx);
         if self.r.take_moved() {
             self.scroll_to_sel = true;
         }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_bar(ui));
+        let bar = |x: i8, y: i8| {
+            egui::Frame::new()
+                .fill(pal::PANEL)
+                .inner_margin(egui::Margin::symmetric(x, y))
+        };
+        egui::Panel::top("top")
+            .frame(bar(14, 8))
+            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("bottom")
+            .frame(bar(14, 8))
+            .show(ui, |ui| self.bottom_bar(ui));
+        if let (true, Some(msg)) = (self.show_agent, &self.r.agent_message) {
+            egui::Panel::right("agent")
+                .resizable(true)
+                .default_size(380.0)
+                .frame(bar(14, 10))
+                .show(ui, |ui| {
+                    caption(ui, "WHAT THE AGENT SAID", pal::FAINT);
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(msg).color(pal::TEXT).size(13.5))
+                                .selectable(true),
+                        );
+                    });
+                });
+        }
         egui::Panel::left("files")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(260.0)
+            .frame(bar(8, 10))
             .show(ui, |ui| self.file_list(ui));
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(pal::BG)
-                    .inner_margin(egui::Margin::same(8)),
-            )
+            .frame(egui::Frame::new().fill(pal::BG).inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 10,
+                bottom: 0,
+            }))
             .show(ui, |ui| self.diff_view(ui));
+        if let Some(c) = &mut self.capture {
+            c.after_frame(&ctx, self.hl_left == 0);
+        }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(c) = &mut self.capture {
+            c.feed(ctx, raw, self.hl_left == 0);
+        }
     }
 }
 
+// ---- scripted screenshots ----------------------------------------------------
+
+/// `VERDICT_SCREENSHOT=out.png` opens the review, presses the keys in `VERDICT_KEYS`
+/// once highlighting is done, saves the window as a PNG and closes without
+/// submitting, so nothing in git changes. It lets an agent (or a docs script) see
+/// the window it's working on.
+///
+/// `VERDICT_KEYS` is a space-separated list: a key as the window takes it (`a`, `j`,
+/// `A` for Shift+A, `Space`, `Escape`, `Down`, `[`), or `"quoted text"` to type into
+/// the focused text box. One step runs per frame. Ctrl isn't available, so a script
+/// can't submit.
+struct Capture {
+    path: PathBuf,
+    steps: std::collections::VecDeque<Step>,
+    frames: usize,
+    /// Frames drawn after the last step, to let focus and scrolling settle.
+    settled: usize,
+    requested: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum Step {
+    Key(Key, Modifiers),
+    Text(String),
+}
+
+impl Capture {
+    fn from_env() -> Option<Capture> {
+        let path = std::env::var_os("VERDICT_SCREENSHOT").filter(|p| !p.is_empty())?;
+        let keys = std::env::var("VERDICT_KEYS").unwrap_or_default();
+        let steps = match parse_steps(&keys) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("verdict: VERDICT_KEYS: {e}");
+                std::process::exit(2);
+            }
+        };
+        Some(Capture {
+            path: path.into(),
+            steps: steps.into(),
+            frames: 0,
+            settled: 0,
+            requested: false,
+        })
+    }
+
+    /// Ready once every file is highlighted, or after a while regardless.
+    fn ready(&self, highlighted: bool) -> bool {
+        highlighted || self.frames > 600
+    }
+
+    fn feed(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, highlighted: bool) {
+        self.frames += 1;
+        ctx.request_repaint();
+        if !self.ready(highlighted) {
+            return;
+        }
+        match self.steps.pop_front() {
+            Some(Step::Key(key, modifiers)) => {
+                for pressed in [true, false] {
+                    raw.events.push(Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    });
+                }
+            }
+            Some(Step::Text(t)) => raw.events.push(Event::Text(t)),
+            None => {}
+        }
+    }
+
+    fn after_frame(&mut self, ctx: &egui::Context, highlighted: bool) {
+        if self.requested || !self.ready(highlighted) || !self.steps.is_empty() {
+            return;
+        }
+        self.settled += 1;
+        if self.settled < 3 {
+            return;
+        }
+        self.requested = true;
+        let path = self.path.clone();
+        let ctx2 = ctx.clone();
+        ctx.request_screenshot(move |img| {
+            match write_png(&path, &img) {
+                Ok(()) => eprintln!("verdict: screenshot saved to {}", path.display()),
+                Err(e) => eprintln!(
+                    "verdict: can't save the screenshot to {}: {e}",
+                    path.display()
+                ),
+            }
+            ctx2.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx2.request_repaint();
+        });
+        ctx.request_repaint();
+    }
+}
+
+fn parse_steps(s: &str) -> Result<Vec<Step>, String> {
+    let mut steps = Vec::new();
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        if let Some(q) = rest.strip_prefix('"') {
+            let end = q.find('"').ok_or("unclosed quote")?;
+            steps.push(Step::Text(q[..end].to_owned()));
+            rest = q[end + 1..].trim_start();
+            continue;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..end];
+        rest = rest[end..].trim_start();
+        let upper = tok.len() == 1 && tok.chars().all(|c| c.is_ascii_uppercase());
+        let (name, mods) = if upper {
+            (tok.to_ascii_lowercase(), Modifiers::SHIFT)
+        } else {
+            (tok.to_owned(), Modifiers::NONE)
+        };
+        let key = Key::from_name(&name).ok_or_else(|| format!("unknown key `{tok}`"))?;
+        steps.push(Step::Key(key, mods));
+    }
+    Ok(steps)
+}
+
+fn write_png(path: &std::path::Path, img: &egui::ColorImage) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        img.size[0] as u32,
+        img.size[1] as u32,
+    );
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let data: Vec<u8> = img
+        .pixels
+        .iter()
+        .flat_map(|p| p.to_srgba_unmultiplied())
+        .collect();
+    let mut w = enc.write_header().map_err(|e| e.to_string())?;
+    w.write_image_data(&data).map_err(|e| e.to_string())
+}
 struct HunkCtx<'a> {
     hl: Option<&'a FileHl>,
-    binary: bool,
+    /// The Edit button works: not a binary file, not a read-only review.
+    editable: bool,
     selected: bool,
     row_h: f32,
     char_w: f32,
     /// Line-number width, fixed per file so gutters line up.
     digits: usize,
+    /// The longest line in the file's card, in characters, so every row is as wide.
+    widest: f32,
+    /// The visible width of the diff area.
+    view_w: f32,
     mono: &'a FontId,
-    /// "2/3" position within the file, when it has several hunks.
+    /// "Hunk 2/3".
     label: Option<String>,
     /// The file is rejected as a whole, so its reason covers this hunk.
     file_reason: bool,
@@ -717,6 +1458,8 @@ struct HunkCtx<'a> {
     focus_edit: bool,
     /// Side-by-side: old on the left, new on the right.
     split: bool,
+    /// Unchanged code between hunks (full-file view): drawn quieter.
+    gap: bool,
 }
 
 struct HunkOut {
@@ -728,118 +1471,164 @@ struct HunkOut {
 fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
     let mut clicked = false;
     let mut action = None;
-    let border = if c.selected {
-        Stroke::new(
-            2.0,
-            if h.decision == Decision::Pending {
-                pal::ACCENT
-            } else {
-                decision_color(h.decision)
-            },
-        )
-    } else {
-        Stroke::new(1.0, decision_color(h.decision))
-    };
-    let resp = egui::Frame::new()
-        .fill(pal::CARD)
-        .stroke(border)
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(l) = &c.label {
-                    ui.label(RichText::new(l).monospace().strong().color(pal::TEXT));
-                }
-                ui.label(RichText::new(&h.header).monospace().color(pal::DIM));
-                ui.add_space(12.0);
-                let mut btn = |ui: &mut egui::Ui, d: Decision, label: &str, enabled: bool| {
-                    let on = h.decision == d;
-                    let text = if on {
-                        RichText::new(label).color(Color32::BLACK).strong()
-                    } else {
-                        RichText::new(label).color(decision_color(d))
-                    };
-                    let mut b = egui::Button::new(text);
-                    if on {
-                        b = b.fill(decision_color(d));
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let inner = ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let head = egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 10,
+                top: 6,
+                bottom: 6,
+            })
+            .show(ui, |ui| {
+                ui.set_max_width(c.view_w - 26.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if let Some(l) = &c.label {
+                        let col = if c.selected { pal::TEXT } else { pal::DIM };
+                        ui.label(RichText::new(l).size(12.5).strong().color(col));
                     }
-                    if ui.add_enabled(enabled, b).clicked() {
-                        action = Some(d);
-                    }
-                };
-                btn(ui, Decision::Approve, "Approve", true);
-                btn(ui, Decision::Reject, "Reject", true);
-                btn(ui, Decision::Edit, "Edit", !c.binary);
-                btn(ui, Decision::Comment, "Comment", true);
-            });
-            ui.add_space(2.0);
-
-            if diff_lines(ui, &h.lines, &c).clicked() {
-                clicked = true;
-            }
-
-            match h.decision {
-                Decision::Reject if c.file_reason => {
-                    ui.add(
-                        TextEdit::singleline(&mut h.note)
-                            .hint_text(
-                                "Covered by the file reason. Optional: extra detail for this hunk",
-                            )
-                            .desired_width(f32::INFINITY),
-                    );
-                }
-                Decision::Reject | Decision::Comment => {
-                    let hint = if h.decision == Decision::Reject {
-                        "Why is this rejected? What should it do instead? (sent to the agent)"
-                    } else {
-                        "Comment for the agent"
-                    };
-                    let r = ui.add(
-                        TextEdit::multiline(&mut h.note)
-                            .hint_text(hint)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if c.focus_note {
-                        r.request_focus();
-                    }
-                }
-                Decision::Edit => {
                     ui.label(
-                        RichText::new("Your replacement for the + lines:")
-                            .small()
-                            .color(pal::BLUE),
+                        RichText::new(&h.header)
+                            .monospace()
+                            .size(12.0)
+                            .color(pal::FAINT),
                     );
-                    let syn_name = c.hl.map(|hl| hl.lang.clone());
-                    let mono = c.mono.clone();
-                    let mut layouter =
-                        move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                            let mut job = editor_job(buf.as_str(), syn_name.as_deref(), &mono);
-                            job.wrap.max_width = wrap;
-                            ui.painter().layout_job(job)
-                        };
-                    let r = ui.add(
-                        TextEdit::multiline(&mut h.edit_buf)
-                            .code_editor()
-                            .layouter(&mut layouter)
-                            .desired_rows(h.new.len().clamp(3, 30))
-                            .desired_width(f32::INFINITY)
-                            .lock_focus(true),
-                    );
-                    if c.focus_edit {
-                        r.request_focus();
+                    if h.decision != Decision::Pending {
+                        pill(ui, decision_label(h.decision), decision_color(h.decision));
                     }
-                    ui.add(
-                        TextEdit::singleline(&mut h.note)
-                            .hint_text("Optional note: why you changed it")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let mut btn = |ui: &mut egui::Ui,
+                                       d: Decision,
+                                       label: &str,
+                                       key: &str,
+                                       enabled: bool| {
+                            let col = decision_color(d);
+                            let look = if c.selected {
+                                Look::Tinted(col)
+                            } else {
+                                Look::Quiet(col)
+                            };
+                            if button(ui, label, Some(key), look, h.decision == d, enabled)
+                                .clicked()
+                            {
+                                action = Some(d);
+                            }
+                        };
+                        btn(ui, Decision::Comment, "Comment", "c", true);
+                        btn(ui, Decision::Edit, "Edit", "e", c.editable);
+                        btn(ui, Decision::Reject, "Reject", "r", true);
+                        btn(ui, Decision::Approve, "Approve", "a", true);
+                    });
+                });
+            });
+
+        if diff_lines(ui, &h.lines, &c).clicked() {
+            clicked = true;
+        }
+
+        if h.decision == Decision::Pending || h.decision == Decision::Approve {
+            return head.response.rect;
+        }
+        let col = decision_color(h.decision);
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 12,
+                top: 8,
+                bottom: 10,
+            })
+            .show(ui, |ui| {
+                ui.set_max_width(c.view_w - 28.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                match h.decision {
+                    Decision::Reject if c.file_reason => {
+                        caption(ui, "COVERED BY THE FILE'S REASON", col);
+                        note_box(
+                            ui,
+                            &mut h.note,
+                            "Optional: extra detail for this hunk",
+                            col,
+                            1,
+                        );
+                    }
+                    Decision::Reject | Decision::Comment => {
+                        let (title, hint) = if h.decision == Decision::Reject {
+                            (
+                                "WHY IT'S REJECTED",
+                                "What should it do instead? Sent to the agent",
+                            )
+                        } else {
+                            ("COMMENT", "Sent to the agent")
+                        };
+                        caption(ui, title, col);
+                        let r = note_box(ui, &mut h.note, hint, col, 2);
+                        if c.focus_note {
+                            r.request_focus();
+                        }
+                    }
+                    Decision::Edit => {
+                        caption(ui, "YOUR REPLACEMENT FOR THE + LINES", col);
+                        let syn_name = c.hl.map(|hl| hl.lang.clone());
+                        let mono = c.mono.clone();
+                        let mut layouter =
+                            move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                                let mut job = editor_job(buf.as_str(), syn_name.as_deref(), &mono);
+                                job.wrap.max_width = wrap;
+                                ui.painter().layout_job(job)
+                            };
+                        let frame = egui::Frame::new()
+                            .fill(pal::BG)
+                            .stroke(Stroke::new(1.0, tint(pal::BG, col, 0.4)))
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::symmetric(10, 7));
+                        let r = ui.add(
+                            TextEdit::multiline(&mut h.edit_buf)
+                                .code_editor()
+                                .layouter(&mut layouter)
+                                .desired_rows(h.new.len().clamp(3, 30))
+                                .desired_width(f32::INFINITY)
+                                .lock_focus(true)
+                                .frame(frame),
+                        );
+                        if c.focus_edit {
+                            r.request_focus();
+                        }
+                        ui.add_space(2.0);
+                        note_box(ui, &mut h.note, "Optional: why you changed it", col, 1);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        });
+            });
+        head.response.rect
+    });
+    let rect = inner.response.rect;
+    let head = Rect::from_x_y_ranges(rect.x_range(), inner.inner.y_range());
+    let p = ui.painter();
+    let head_fill = if c.selected {
+        tint(pal::CARD, pal::ACCENT, 0.08)
+    } else {
+        pal::HUNK_HEAD
+    };
+    p.set(bg_idx, egui::epaint::RectShape::filled(head, 0, head_fill));
+    p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, pal::SOFT));
+    p.hline(rect.x_range(), head.bottom(), Stroke::new(1.0, pal::SOFT));
+    if h.decision != Decision::Pending {
+        let stripe = Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height()));
+        p.rect_filled(stripe, 0, decision_color(h.decision));
+    }
+    if c.selected {
+        p.rect_stroke(
+            rect.shrink(1.0),
+            4,
+            Stroke::new(1.5, pal::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
     HunkOut {
-        rect: resp.response.rect,
+        rect,
         clicked,
         action,
     }
@@ -847,35 +1636,25 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
 
 /// Unchanged lines shown between hunks in the full-file view.
 fn gap_ui(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) {
-    if lines.is_empty() {
-        return;
+    if !lines.is_empty() {
+        diff_lines(ui, lines, c);
     }
-    // Match the hunk cards' content inset (1px stroke + 8px margin).
-    egui::Frame::new()
-        .inner_margin(egui::Margin {
-            left: 9,
-            right: 9,
-            top: 2,
-            bottom: 2,
-        })
-        .show(ui, |ui| {
-            diff_lines(ui, lines, c);
-        });
 }
 
 fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
     if c.split {
         return split_lines(ui, lines, c);
     }
-    let num_w = c.digits as f32 * c.char_w + 10.0;
-    let text_x = num_w * 2.0 + c.char_w * 2.0 + 6.0;
-    let width = (text_x + max_chars(lines.iter()) * c.char_w + 12.0).max(ui.available_width());
+    let num_w = c.digits as f32 * c.char_w + 14.0;
+    let gutter = num_w * 2.0;
+    let width =
+        (gutter + 8.0 + c.char_w * 2.0 + c.widest * c.char_w + 16.0).max(ui.available_width());
     let (rect, resp) =
         ui.allocate_exact_size(vec2(width, c.row_h * lines.len() as f32), Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;
     }
-    let painter = ui.painter();
+    let mut painter = ui.painter().clone();
     let clip = ui.clip_rect();
     for (i, l) in lines.iter().enumerate() {
         let top = rect.top() + i as f32 * c.row_h;
@@ -883,44 +1662,78 @@ fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::R
         if !clip.intersects(row) {
             continue;
         }
-        if let Some(bg) = line_bg(l.kind) {
-            painter.rect_filled(row, 0.0, bg);
+        let (gutter_bg, code_bg, num_col) = row_colors(l.kind, c.gap);
+        painter.rect_filled(
+            Rect::from_min_size(row.min, vec2(gutter, c.row_h)),
+            0,
+            gutter_bg,
+        );
+        if let Some(bg) = code_bg {
+            painter.rect_filled(
+                Rect::from_min_max(pos2(rect.left() + gutter, top), row.max),
+                0,
+                bg,
+            );
         }
-        let y = top + 1.0;
+        let cy = row.center().y;
         let num = |n: Option<usize>| n.map(|n| n.to_string()).unwrap_or_default();
+        let small = FontId::monospace(c.mono.size - 1.0);
         painter.text(
-            pos2(rect.left() + num_w - 6.0, y),
-            egui::Align2::RIGHT_TOP,
+            pos2(rect.left() + num_w - 8.0, cy),
+            egui::Align2::RIGHT_CENTER,
             num(l.old_no),
-            c.mono.clone(),
-            pal::DIM,
+            small.clone(),
+            num_col,
         );
         painter.text(
-            pos2(rect.left() + num_w * 2.0 - 6.0, y),
-            egui::Align2::RIGHT_TOP,
+            pos2(rect.left() + gutter - 8.0, cy),
+            egui::Align2::RIGHT_CENTER,
             num(l.new_no),
-            c.mono.clone(),
-            pal::DIM,
+            small,
+            num_col,
         );
+        if c.gap {
+            painter.set_opacity(0.55);
+        }
         paint_code(
-            painter,
-            pos2(rect.left() + num_w * 2.0 + 4.0, y),
-            text_x - num_w * 2.0 - 4.0,
+            &painter,
+            pos2(rect.left() + gutter + 8.0, top + 2.5),
+            c.char_w * 2.0,
             l,
             c,
         );
+        painter.set_opacity(1.0);
     }
-    selection_bar(painter, rect, c);
-    resp
+    resp.on_hover_cursor(egui::CursorIcon::Default)
+}
+
+/// Gutter background, code background and line-number color for a row.
+fn row_colors(k: Kind, gap: bool) -> (Color32, Option<Color32>, Color32) {
+    if gap {
+        return (pal::GAP, Some(pal::GAP), pal::FAINT);
+    }
+    match k {
+        Kind::Ctx => (pal::GUTTER, None, pal::FAINT),
+        Kind::Add => (
+            pal::ADD_GUTTER,
+            Some(pal::ADD_BG),
+            tint(pal::ADD_GUTTER, pal::GREEN, 0.55),
+        ),
+        Kind::Del => (
+            pal::DEL_GUTTER,
+            Some(pal::DEL_BG),
+            tint(pal::DEL_GUTTER, pal::RED, 0.55),
+        ),
+    }
 }
 
 /// Side-by-side rows: each half has its own line number, sign and code, and grows
-/// to fit its longest line (the scroll area scrolls sideways past that).
+/// to fit the card's longest line (the scroll area scrolls sideways past that).
 fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
     let pairs = model::split_pairs(lines);
-    let num_w = c.digits as f32 * c.char_w + 10.0;
-    let text_x = num_w + c.char_w * 2.0 + 6.0;
-    let half = (text_x + max_chars(lines.iter()) * c.char_w + 12.0).max(ui.available_width() / 2.0);
+    let num_w = c.digits as f32 * c.char_w + 14.0;
+    let half =
+        (num_w + 8.0 + c.char_w * 2.0 + c.widest * c.char_w + 16.0).max(ui.available_width() / 2.0);
     let (rect, resp) = ui.allocate_exact_size(
         vec2(half * 2.0, c.row_h * pairs.len() as f32),
         Sense::click(),
@@ -940,31 +1753,35 @@ fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::
             }
             let Some(l) = idx.map(|i| &lines[i]) else {
                 // Nothing on this side: the other side's line was added or removed.
-                painter.rect_filled(cell, 0.0, pal::EMPTY);
+                painter.rect_filled(cell, 0, pal::EMPTY);
                 continue;
             };
-            if let Some(bg) = line_bg(l.kind) {
-                painter.rect_filled(cell, 0.0, bg);
+            let (gutter_bg, code_bg, num_col) = row_colors(l.kind, c.gap);
+            painter.rect_filled(
+                Rect::from_min_size(cell.min, vec2(num_w, c.row_h)),
+                0,
+                gutter_bg,
+            );
+            if let Some(bg) = code_bg {
+                painter.rect_filled(Rect::from_min_max(pos2(x0 + num_w, top), cell.max), 0, bg);
             }
             let no = if side == 0.0 { l.old_no } else { l.new_no };
-            let y = top + 1.0;
-            let p = painter.with_clip_rect(cell.intersect(clip));
+            let mut p = painter.with_clip_rect(cell.intersect(clip));
             p.text(
-                pos2(x0 + num_w - 6.0, y),
-                egui::Align2::RIGHT_TOP,
+                pos2(x0 + num_w - 8.0, cell.center().y),
+                egui::Align2::RIGHT_CENTER,
                 no.map(|n| n.to_string()).unwrap_or_default(),
-                c.mono.clone(),
-                pal::DIM,
+                FontId::monospace(c.mono.size - 1.0),
+                num_col,
             );
-            paint_code(&p, pos2(x0 + num_w + 4.0, y), text_x - num_w - 4.0, l, c);
+            if c.gap {
+                p.set_opacity(0.55);
+            }
+            paint_code(&p, pos2(x0 + num_w + 8.0, top + 2.5), c.char_w * 2.0, l, c);
         }
     }
     let mid = rect.left() + half;
-    painter.line_segment(
-        [pos2(mid, rect.top()), pos2(mid, rect.bottom())],
-        Stroke::new(1.0, pal::BORDER),
-    );
-    selection_bar(painter, rect, c);
+    painter.vline(mid, rect.y_range(), Stroke::new(1.0, pal::BORDER));
     resp
 }
 
@@ -973,14 +1790,6 @@ fn max_chars<'a>(lines: impl Iterator<Item = &'a model::DLine>) -> f32 {
         .map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3)
         .max()
         .unwrap_or(0) as f32
-}
-
-fn line_bg(k: Kind) -> Option<Color32> {
-    match k {
-        Kind::Ctx => None,
-        Kind::Add => Some(pal::ADD_BG),
-        Kind::Del => Some(pal::DEL_BG),
-    }
 }
 
 /// The +/- sign at `at`, then the highlighted code `code_dx` further right.
@@ -1017,20 +1826,6 @@ fn paint_code(
     let galley = painter.layout_job(job);
     painter.galley(at + vec2(code_dx, 0.0), galley, pal::TEXT);
 }
-
-fn selection_bar(painter: &egui::Painter, rect: Rect, c: &HunkCtx) {
-    if c.selected {
-        painter.rect_filled(
-            Rect::from_min_size(
-                rect.left_top() - Vec2::new(8.0, 0.0),
-                vec2(3.0, rect.height()),
-            ),
-            0.0,
-            pal::ACCENT,
-        );
-    }
-}
-
 fn append_spans(job: &mut LayoutJob, spans: &Line, font: &FontId, expand_tabs: bool) {
     for sp in spans {
         let color = Color32::from_rgb(sp.rgb[0], sp.rgb[1], sp.rgb[2]);
@@ -1091,6 +1886,25 @@ fn editor_job(text: &str, syntax: Option<&str>, font: &FontId) -> LayoutJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_steps() {
+        let s = parse_steps(r#" A r "no debug output" Escape j Space ] "#).unwrap();
+        assert_eq!(
+            s,
+            vec![
+                Step::Key(Key::A, Modifiers::SHIFT),
+                Step::Key(Key::R, Modifiers::NONE),
+                Step::Text("no debug output".into()),
+                Step::Key(Key::Escape, Modifiers::NONE),
+                Step::Key(Key::J, Modifiers::NONE),
+                Step::Key(Key::Space, Modifiers::NONE),
+                Step::Key(Key::CloseBracket, Modifiers::NONE),
+            ]
+        );
+        assert!(parse_steps("Ctrl+Enter").is_err());
+        assert!(parse_steps(r#""open"#).is_err());
+    }
 
     #[test]
     fn backend_rule() {

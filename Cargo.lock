@@ -3556,6 +3556,7 @@ dependencies = [
  "crossterm",
  "eframe",
  "plist",
+ "png",
  "ratatui",
  "serde",
  "serde_json",

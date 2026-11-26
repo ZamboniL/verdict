@@ -80,6 +80,9 @@ layout = "unified"
 # terminal = ["wezterm", "start", "--"]
 # terminal = ["kitty"]
 # terminal = ["gnome-terminal", "--wait", "--"]
+# Inside tmux: "popup" (over the agent), "split" (a pane next to the agent, so you
+# can read what it said while reviewing) or "window" (a new tmux window).
+# tmux = "popup"
 
 [highlight]
 # Any builtin theme (`verdict themes` lists them) or the name of a theme you drop
@@ -226,8 +229,7 @@ fn discover(
             continue;
         }
         fingerprint_files.push(manifest.clone());
-        let mut langs: HashMap<String, (Vec<String>, Vec<String>, Option<String>, Option<String>)> =
-            HashMap::new();
+        let mut langs: HashMap<String, ExtLanguage> = HashMap::new();
         for l in contrib["languages"].as_array().into_iter().flatten() {
             let Some(id) = l["id"].as_str() else { continue };
             let strs = |k: &str| -> Vec<String> {
@@ -238,17 +240,17 @@ fn discover(
                     .collect()
             };
             let e = langs.entry(id.to_owned()).or_default();
-            e.0.extend(
+            e.extensions.extend(
                 strs("extensions")
                     .into_iter()
                     .map(|x| x.trim_start_matches('.').to_owned()),
             );
-            e.1.extend(strs("filenames"));
-            if e.2.is_none() {
-                e.2 = l["firstLine"].as_str().map(str::to_owned);
+            e.filenames.extend(strs("filenames"));
+            if e.first_line.is_none() {
+                e.first_line = l["firstLine"].as_str().map(str::to_owned);
             }
-            if e.3.is_none() {
-                e.3 = l["aliases"][0].as_str().map(str::to_owned);
+            if e.alias.is_none() {
+                e.alias = l["aliases"][0].as_str().map(str::to_owned);
             }
         }
         for g in contrib["grammars"].as_array().into_iter().flatten() {
@@ -256,15 +258,15 @@ fn discover(
             let (Some(lang), Some(path)) = (g["language"].as_str(), g["path"].as_str()) else {
                 continue;
             };
-            let (exts, fnames, first, alias) = langs.get(lang).cloned().unwrap_or_default();
+            let info = langs.get(lang).cloned().unwrap_or_default();
             let p = base.join(path);
             fingerprint_files.push(p.clone());
             sources.push(Source::Tm {
                 path: p,
-                name: Some(alias.unwrap_or_else(|| lang.to_owned())),
-                extensions: exts,
-                filenames: fnames,
-                first_line: first,
+                name: Some(info.alias.unwrap_or_else(|| lang.to_owned())),
+                extensions: info.extensions,
+                filenames: info.filenames,
+                first_line: info.first_line,
             });
         }
         for t in contrib["themes"].as_array().into_iter().flatten() {
@@ -280,6 +282,15 @@ fn discover(
         }
     }
     (sources, themes, fingerprint_files)
+}
+
+/// A language an extension declares in `contributes.languages`.
+#[derive(Clone, Default)]
+struct ExtLanguage {
+    extensions: Vec<String>,
+    filenames: Vec<String>,
+    first_line: Option<String>,
+    alias: Option<String>,
 }
 
 fn fingerprint(files: &[PathBuf]) -> u64 {

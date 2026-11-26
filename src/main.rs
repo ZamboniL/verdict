@@ -23,6 +23,12 @@ verdict: hunk-by-hunk review of AI-written changes
 USAGE:
   verdict [PATH]     Review unstaged changes in the repo containing PATH (default: .)
                      Feedback is printed to stdout and saved to .git/verdict-feedback.md
+  verdict --staged [PATH]
+                     Review staged changes (HEAD -> index). Feedback only: nothing in
+                     git changes, and hunks can't be edited
+  verdict RANGE [PATH]
+                     Review a commit range, feedback only: A..B, A.. (to HEAD), or
+                     A...B (from where B branched off A), e.g. HEAD~3.. or main...feature
   verdict hook       Claude Code hook entry point (reads hook JSON on stdin)
   verdict langs      List languages (builtin + yours) and grammar load warnings
   verdict themes     List syntax themes; the active one is marked with *
@@ -34,8 +40,8 @@ INTERFACE:
   --tui              Review in the terminal
   Without a flag: $VERDICT_UI (gui, tui or auto), then `mode` in the [ui] section of
   config.toml, then auto: the window when a display is available, else the terminal.
-  From a hook, the terminal interface opens in a tmux popup, or in the terminal
-  emulator set by `terminal` in [ui].
+  From a hook, the terminal interface opens in tmux (a popup, or a split or window:
+  `tmux` in [ui]), or in the terminal emulator set by `terminal` in [ui].
 
 Syntax highlighting is extensible: drop grammars into ~/.config/verdict/grammars
 (.sublime-syntax, .tmLanguage, .tmLanguage.json), themes into .../themes
@@ -48,14 +54,21 @@ in the working tree. Nothing is written until you submit.
 fn main() -> ExitCode {
     wslg_env();
     let mut flag = None;
+    let mut staged = false;
     let args: Vec<String> = std::env::args()
         .skip(1)
-        .filter(|a| match frontend::parse_flag(a) {
-            Some(c) => {
-                flag = Some(c);
-                false
+        .filter(|a| {
+            if a == "--staged" || a == "--cached" {
+                staged = true;
+                return false;
             }
-            None => true,
+            match frontend::parse_flag(a) {
+                Some(c) => {
+                    flag = Some(c);
+                    false
+                }
+                None => true,
+            }
         })
         .collect();
     match args.first().map(String::as_str) {
@@ -78,7 +91,7 @@ fn main() -> ExitCode {
             }
         },
         Some("init") => init(),
-        other => manual(Path::new(other.unwrap_or(".")), flag),
+        _ => manual(&args, staged, flag),
     }
 }
 
@@ -97,12 +110,33 @@ fn wslg_env() {
     }
 }
 
-fn manual(path: &Path, flag: Option<Choice>) -> ExitCode {
+/// `verdict [--staged] [RANGE] [PATH]`: an argument that isn't an existing path and
+/// contains ".." is a range.
+fn manual(args: &[String], staged: bool, flag: Option<Choice>) -> ExitCode {
+    let (ranges, paths): (Vec<&String>, Vec<&String>) = args
+        .iter()
+        .partition(|a| a.contains("..") && !Path::new(a.as_str()).exists());
+    if ranges.len() > 1 || paths.len() > 1 || (staged && !ranges.is_empty()) {
+        eprintln!("usage: verdict [--staged | RANGE] [PATH]   (see verdict --help)");
+        return ExitCode::FAILURE;
+    }
+    let path = Path::new(paths.first().map_or(".", |p| p.as_str()));
     let Some(repo) = git::toplevel(path) else {
         eprintln!("verdict: {} is not inside a git repository", path.display());
         return ExitCode::FAILURE;
     };
-    let files = match model::load(&repo) {
+    let source = match ranges.first() {
+        Some(r) => match git::parse_range(&repo, r) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("verdict: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None if staged => git::Source::Staged,
+        None => git::Source::Worktree,
+    };
+    let files = match model::load_source(&repo, &source, None) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("verdict: {e}");
@@ -110,12 +144,19 @@ fn manual(path: &Path, flag: Option<Choice>) -> ExitCode {
         }
     };
     if files.is_empty() {
-        eprintln!("verdict: no unstaged changes to review");
+        eprintln!(
+            "verdict: no {} to review",
+            match &source {
+                git::Source::Range { label, .. } => format!("changes in {label}"),
+                s => s.describe(),
+            }
+        );
         return ExitCode::SUCCESS;
     }
     let cfg = frontend::ui_config();
     let choice = frontend::choice(flag, &cfg);
-    match frontend::run(repo.clone(), files, frontend::Mode::Manual, choice, &cfg) {
+    let review = review::Review::new(files, cfg.split, source);
+    match frontend::run(repo.clone(), review, frontend::Mode::Manual, choice, &cfg) {
         Ok(Some(frontend::Outcome { message: Some(m) })) => {
             print!("{m}");
             if let Some(p) = git_dir(&repo) {
@@ -298,7 +339,18 @@ fn hook(flag: Option<Choice>) -> ExitCode {
     };
     let cfg = frontend::ui_config();
     let choice = frontend::choice(flag, &cfg);
-    let outcome = frontend::run(repo.clone(), files, frontend::Mode::Hook, choice, &cfg);
+    let mut review = review::Review::new(files, cfg.split, git::Source::Worktree);
+    // What the agent said, so the reviewer can read it first.
+    review.agent_message = v["last_assistant_message"]
+        .as_str()
+        .filter(|m| !m.trim().is_empty())
+        .map(String::from)
+        .or_else(|| {
+            v["transcript_path"]
+                .as_str()
+                .and_then(|t| session::last_reply(Path::new(t)))
+        });
+    let outcome = frontend::run(repo.clone(), review, frontend::Mode::Hook, choice, &cfg);
     // Whatever happened, the reviewed state is the new baseline: if the agent
     // continues, the next Stop shows only what it changes in response.
     if let Ok(snap) = session::snapshot(&repo) {

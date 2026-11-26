@@ -134,6 +134,7 @@ fn is_binary(b: &[u8]) -> bool {
     b[..b.len().min(8000)].contains(&0) || std::str::from_utf8(b).is_err()
 }
 
+#[cfg(test)]
 pub fn load(repo: &Path) -> git::Result<Vec<FileDiff>> {
     load_only(repo, None)
 }
@@ -188,10 +189,66 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
         Vec::new()
     };
 
+    Ok(build(
+        e.path, e.status, mode, old_bytes, new_bytes, new_exists,
+    ))
+}
+
+/// Load the files changed in `source`, restricted to `only` when given.
+pub fn load_source(
+    repo: &Path,
+    source: &git::Source,
+    only: Option<&std::collections::HashSet<String>>,
+) -> git::Result<Vec<FileDiff>> {
+    if *source == git::Source::Worktree {
+        return load_only(repo, only);
+    }
+    let (old_rev, new_rev) = source.revs();
+    let mut files = Vec::new();
+    for e in git::changed_in(repo, source)? {
+        if only.is_some_and(|o| !o.contains(&e.path)) {
+            continue;
+        }
+        let side = if e.status == Status::Deleted {
+            old_rev
+        } else {
+            new_rev
+        };
+        let mode = git::mode_at(repo, side, &e.path).unwrap_or_else(|| "100644".into());
+        if mode == "120000" || mode == "160000" {
+            continue; // symlinks & submodules: out of scope
+        }
+        let old_bytes = match e.status {
+            Status::Untracked => Vec::new(),
+            _ => git::blob(repo, old_rev, &e.path)?,
+        };
+        let new_exists = e.status != Status::Deleted;
+        let new_bytes = if new_exists {
+            git::blob(repo, new_rev, &e.path)?
+        } else {
+            Vec::new()
+        };
+        files.extend(build(
+            e.path, e.status, mode, old_bytes, new_bytes, new_exists,
+        ));
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// A file's diff from its two versions. `None` when they don't differ.
+fn build(
+    path: String,
+    status: Status,
+    mode: String,
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
+    new_exists: bool,
+) -> Option<FileDiff> {
     let binary = is_binary(&old_bytes) || is_binary(&new_bytes);
     let mut f = FileDiff {
-        path: e.path,
-        status: e.status,
+        path,
+        status,
         mode,
         binary,
         new_exists,
@@ -225,15 +282,12 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
             note: String::new(),
             edit_buf: String::new(),
         });
-        return Ok(Some(f));
+        return Some(f);
     }
     f.old = split_lines(std::str::from_utf8(&f.old_bytes).unwrap());
     f.new = split_lines(std::str::from_utf8(&f.new_bytes).unwrap());
     f.hunks = compute_hunks(&f.old, &f.new);
-    if f.hunks.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(f))
+    (!f.hunks.is_empty()).then_some(f)
 }
 
 pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
@@ -493,26 +547,42 @@ pub fn counts(files: &[FileDiff]) -> Counts {
 }
 
 /// The message handed back to the agent. `None` when there's nothing to act on.
-pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
+/// For a read-only `source` (staged changes, a commit range) nothing was changed in
+/// git, and the message says so.
+pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Option<String> {
     let c = counts(files);
     let general = general.trim();
     let file_notes = files.iter().filter(|f| f.file_note().is_some()).count();
     if c.reject + c.edit + c.comment + file_notes == 0 && general.is_empty() {
         return None;
     }
+    let read_only = source.read_only();
     let mut s = String::new();
-    s.push_str("# Code review of your changes\n\n");
-    s.push_str(
-        "The reviewer went through your diff hunk by hunk. Approved hunks are now staged \
-         in the git index: keep them as they are. Rejected hunks have been reverted in the \
-         working tree. Hunks the reviewer edited already contain their version, which is \
-         staged. Address everything below.\n\n",
-    );
-    let _ = writeln!(
-        s,
-        "Summary: {} approved, {} rejected, {} edited by reviewer, {} commented, {} not reviewed yet.\n",
-        c.approve, c.reject, c.edit, c.comment, c.pending
-    );
+    if read_only {
+        let _ = writeln!(s, "# Code review of {}\n", source.describe());
+        s.push_str(
+            "The reviewer went through this diff hunk by hunk. Nothing was changed in git: \
+             this is feedback only. Address the rejected hunks and the comments below.\n\n",
+        );
+        let _ = writeln!(
+            s,
+            "Summary: {} approved, {} rejected, {} commented, {} not reviewed.\n",
+            c.approve, c.reject, c.comment, c.pending
+        );
+    } else {
+        s.push_str("# Code review of your changes\n\n");
+        s.push_str(
+            "The reviewer went through your diff hunk by hunk. Approved hunks are now staged \
+             in the git index: keep them as they are. Rejected hunks have been reverted in the \
+             working tree. Hunks the reviewer edited already contain their version, which is \
+             staged. Address everything below.\n\n",
+        );
+        let _ = writeln!(
+            s,
+            "Summary: {} approved, {} rejected, {} edited by reviewer, {} commented, {} not reviewed yet.\n",
+            c.approve, c.reject, c.edit, c.comment, c.pending
+        );
+    }
     if !general.is_empty() {
         let _ = writeln!(s, "## General feedback\n\n{general}\n");
     }
@@ -611,21 +681,26 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
             }
         }
     };
-    section(
-        &mut s,
-        "Rejected (reverted in the working tree)",
-        Decision::Reject,
-    );
-    section(
-        &mut s,
-        "Edited by the reviewer (already applied)",
-        Decision::Edit,
-    );
-    section(
-        &mut s,
-        "Comments (kept changes are still unstaged; adjust as asked)",
-        Decision::Comment,
-    );
+    if read_only {
+        section(&mut s, "Rejected", Decision::Reject);
+        section(&mut s, "Comments", Decision::Comment);
+    } else {
+        section(
+            &mut s,
+            "Rejected (reverted in the working tree)",
+            Decision::Reject,
+        );
+        section(
+            &mut s,
+            "Edited by the reviewer (already applied)",
+            Decision::Edit,
+        );
+        section(
+            &mut s,
+            "Comments (kept changes are still unstaged; adjust as asked)",
+            Decision::Comment,
+        );
+    }
     Some(s)
 }
 
@@ -789,6 +864,79 @@ mod tests {
     }
 
     #[test]
+    fn staged_and_range_sources() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("verdict-src-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let commit = |m: &str| {
+            sh(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                m,
+            ])
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
+        sh(&["add", "."]);
+        commit("c1");
+        // Commit 2: modify a, delete gone, add b.
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
+        sh(&["add", "-A"]);
+        commit("c2");
+        // Staged change, plus an unstaged one that --staged must not show.
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        sh(&["add", "a.txt"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let staged = load_source(&dir, &git::Source::Staged, None).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].new.concat(), "one\ntwo\nthree\n");
+
+        let range = git::parse_range(&dir, "HEAD~1..").unwrap();
+        let files = load_source(&dir, &range, None).unwrap();
+        let got: Vec<(&str, Status)> = files.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        assert_eq!(
+            got,
+            [
+                ("a.txt", Status::Modified),
+                ("b.txt", Status::Untracked),
+                ("gone.txt", Status::Deleted)
+            ]
+        );
+        assert_eq!(files[0].old.concat(), "one\n");
+        assert_eq!(files[0].new.concat(), "one\ntwo\n");
+        assert!(files[2].new.is_empty() && files[2].old.concat() == "bye\n");
+
+        // A...B starts from the merge base: a branch off c1 compared with main.
+        sh(&["branch", "side", "HEAD~1"]);
+        let tri = git::parse_range(&dir, "side...main").unwrap();
+        assert_eq!(load_source(&dir, &tri, None).unwrap().len(), 3);
+        assert!(git::parse_range(&dir, "nope..").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn gaps_tile_the_file() {
         let f = file(OLD, NEW);
         let gaps = f.gaps();
@@ -816,7 +964,7 @@ mod tests {
         }
         f.file_mode = Some(Decision::Reject);
         f.note = "wrong file entirely".into();
-        let m = feedback(std::slice::from_ref(&f), "").unwrap();
+        let m = feedback(std::slice::from_ref(&f), "", &git::Source::Worktree).unwrap();
         assert!(m.contains("(whole file, all 2 hunks)"), "{m}");
         assert_eq!(m.matches("wrong file entirely").count(), 1);
         assert!(m.contains("Hunk 1/2") && m.contains("Hunk 2/2"));
@@ -829,7 +977,7 @@ mod tests {
         }
         g.file_mode = Some(Decision::Comment);
         g.note = "split this module later".into();
-        let m = feedback(std::slice::from_ref(&g), "").unwrap();
+        let m = feedback(std::slice::from_ref(&g), "", &git::Source::Worktree).unwrap();
         assert!(
             m.contains("About the whole file:** split this module later"),
             "{m}"
@@ -840,10 +988,10 @@ mod tests {
     fn feedback_only_when_needed() {
         let mut f = file(OLD, NEW);
         f.hunks[0].decision = Decision::Approve;
-        assert!(feedback(std::slice::from_ref(&f), "").is_none());
+        assert!(feedback(std::slice::from_ref(&f), "", &git::Source::Worktree).is_none());
         f.hunks[1].decision = Decision::Reject;
         f.hunks[1].note = "keep lowercase".into();
-        let m = feedback(std::slice::from_ref(&f), "").unwrap();
+        let m = feedback(std::slice::from_ref(&f), "", &git::Source::Worktree).unwrap();
         assert!(m.contains("keep lowercase") && m.contains("-l") && m.contains("+L"));
     }
 }

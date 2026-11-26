@@ -4,6 +4,7 @@
 //! only draw it and turn input into these calls; an `Effect` tells them what to
 //! focus or open next.
 
+use crate::git::Source;
 use crate::model::{self, DLine, Decision, FileDiff, Hunk};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -20,10 +21,14 @@ pub enum Effect {
     EditHunk(usize, usize),
     /// Binary files can't be edited or shown in full.
     Binary,
+    /// Editing needs the working tree; this review is feedback only.
+    ReadOnly,
 }
 
 pub struct Review {
     pub files: Vec<FileDiff>,
+    /// What's being reviewed. Read-only sources only produce feedback.
+    pub source: Source,
     /// (file index, hunk index) for every hunk, in display order.
     flat: Vec<(usize, usize)>,
     sel: usize,
@@ -33,6 +38,8 @@ pub struct Review {
     pub general: String,
     /// Side-by-side view instead of unified.
     pub split: bool,
+    /// What the agent said at the end of its turn, when known (hook reviews).
+    pub agent_message: Option<String>,
     /// Something was decided or written since the review opened.
     pub dirty: bool,
     /// The selection moved (or its file unfolded) and should be scrolled into view.
@@ -40,7 +47,7 @@ pub struct Review {
 }
 
 impl Review {
-    pub fn new(files: Vec<FileDiff>, split: bool) -> Review {
+    pub fn new(files: Vec<FileDiff>, split: bool, source: Source) -> Review {
         let flat = files
             .iter()
             .enumerate()
@@ -48,12 +55,14 @@ impl Review {
             .collect();
         Review {
             files,
+            source,
             flat,
             sel: 0,
             collapsed: HashSet::new(),
             full: HashMap::new(),
             general: String::new(),
             split,
+            agent_message: None,
             dirty: false,
             moved: true,
         }
@@ -154,6 +163,9 @@ impl Review {
         let Some((fi, hi)) = self.sel_pair() else {
             return Effect::None;
         };
+        if d == Decision::Edit && self.source.read_only() {
+            return Effect::ReadOnly;
+        }
         if self.files[fi].binary && d == Decision::Edit {
             return Effect::Binary;
         }
@@ -306,10 +318,13 @@ impl Review {
             || self.files.iter().any(|f| f.file_note().is_some())
     }
 
-    /// Apply every decision to the index and working tree; return the feedback.
+    /// Apply every decision to the index and working tree (unless the review is read
+    /// only); return the feedback.
     pub fn submit(&self, repo: &Path) -> Result<Option<String>, String> {
-        model::apply(repo, &self.files)?;
-        Ok(model::feedback(&self.files, &self.general))
+        if !self.source.read_only() {
+            model::apply(repo, &self.files)?;
+        }
+        Ok(model::feedback(&self.files, &self.general, &self.source))
     }
 }
 
@@ -347,6 +362,7 @@ mod tests {
         Review::new(
             vec![file("a.txt", OLD, NEW), file("b.txt", "x\n", "y\n")],
             false,
+            Source::Worktree,
         )
     }
 
@@ -464,6 +480,20 @@ mod tests {
         r.select_quietly(0, 1);
         assert!(!r.take_moved());
         assert_eq!(r.sel_pair(), Some((0, 1)));
+    }
+
+    #[test]
+    fn read_only_reviews_refuse_edits_and_say_so() {
+        let mut r = review();
+        r.source = Source::Staged;
+        assert_eq!(r.set_decision(Edit), Effect::ReadOnly);
+        r.set_decision(Reject);
+        r.files[0].hunks[0].note = "no".into();
+        // Submitting doesn't touch git (this path isn't a repo at all).
+        let m = r.submit(Path::new("/nonexistent")).unwrap().unwrap();
+        assert!(m.starts_with("# Code review of staged changes"), "{m}");
+        assert!(m.contains("Nothing was changed in git"));
+        assert!(!m.contains("reverted"));
     }
 
     #[test]

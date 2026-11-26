@@ -6,7 +6,7 @@
 
 use crate::frontend::{Mode, Outcome, REG, hl_jobs, run_highlighter};
 use crate::git::Status;
-use crate::model::{self, DLine, Decision, FileDiff, FileHl, Kind};
+use crate::model::{self, DLine, Decision, FileHl, Kind};
 use crate::review::{Effect, Review};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -218,6 +218,8 @@ enum State {
     ConfirmQuit,
     ConfirmSubmit,
     Help,
+    /// The agent's last message, scrolled down this many lines.
+    Agent(u16),
 }
 
 enum Action {
@@ -269,18 +271,13 @@ struct App {
     list_top: usize,
 }
 
-pub fn run(
-    repo: PathBuf,
-    files: Vec<FileDiff>,
-    mode: Mode,
-    split: bool,
-) -> Result<Option<Outcome>, String> {
+pub fn run(repo: PathBuf, review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
     let (tx, rx) = mpsc::channel();
-    let jobs = hl_jobs(&files);
+    let jobs = hl_jobs(&review.files);
     std::thread::spawn(move || run_highlighter(jobs, tx, || {}));
     let mut app = App {
         repo,
-        r: Review::new(files, split),
+        r: review,
         mode,
         state: State::Normal,
         scroll: 0,
@@ -385,6 +382,7 @@ impl App {
             Effect::FileNote(fi) => self.open_input(Target::File(fi)),
             Effect::EditHunk(fi, hi) => return Action::EditHunk(fi, hi),
             Effect::Binary => self.info("binary file: it can't be edited or shown in full"),
+            Effect::ReadOnly => self.info("this review is feedback only, so hunks can't be edited"),
         }
         Action::None
     }
@@ -496,6 +494,20 @@ impl App {
                 self.state = State::Normal;
                 return Action::None;
             }
+            State::Agent(scroll) => {
+                match k.code {
+                    KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+                    KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *scroll = scroll.saturating_add(10),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
+                    KeyCode::Char('t' | 'q') | KeyCode::Esc | KeyCode::Enter => {
+                        self.state = State::Normal
+                    }
+                    _ => {}
+                }
+                return Action::None;
+            }
             State::Normal => {}
         }
         let page = (self.main_area.height as usize / 2).max(1);
@@ -511,6 +523,13 @@ impl App {
             // Next to A (approve file), so ask first. Ctrl+S submits at once.
             KeyCode::Char('S') => self.state = State::ConfirmSubmit,
             KeyCode::Char('?') => self.state = State::Help,
+            KeyCode::Char('t') => {
+                if self.r.agent_message.is_some() {
+                    self.state = State::Agent(0);
+                } else {
+                    self.info("no message from the agent for this review");
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => self.r.next(),
             KeyCode::Char('k') | KeyCode::Up => self.r.prev(),
             KeyCode::Char('g') | KeyCode::Home => self.r.first(),
@@ -684,6 +703,9 @@ impl App {
         if matches!(self.state, State::Help) {
             help(f, area);
         }
+        if let (State::Agent(scroll), Some(msg)) = (&mut self.state, &self.r.agent_message) {
+            agent_message(f, area, msg, scroll);
+        }
     }
 
     fn top_bar(&self, f: &mut Frame, area: Rect) {
@@ -693,6 +715,14 @@ impl App {
             Span::styled(
                 format!(" {name} "),
                 Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if self.r.source.read_only() {
+                    format!("{} · feedback only ", self.r.source.describe())
+                } else {
+                    String::new()
+                },
+                fg(pal::ACCENT),
             ),
             Span::styled(format!(" {} hunks", c.total), fg(pal::DIM)),
         ];
@@ -715,6 +745,9 @@ impl App {
                 ),
                 fg(pal::AMBER),
             ));
+        }
+        if self.r.agent_message.is_some() {
+            spans.push(Span::styled(" · t: what the agent said", fg(pal::ACCENT)));
         }
         let submit = match (self.mode, self.r.will_send()) {
             (Mode::Hook, true) => " S send feedback ",
@@ -1455,6 +1488,40 @@ fn status_color(s: Status) -> Color {
     }
 }
 
+/// The agent's last message in a scrollable box over the review.
+fn agent_message(f: &mut Frame, area: Rect, msg: &str, scroll: &mut u16) {
+    let w = (area.width * 9 / 10).clamp(20.min(area.width), 110);
+    let h = area.height.saturating_sub(4).max(3).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    let lines: Vec<Line> = msg
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_owned(), fg(pal::TEXT))))
+        .collect();
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Keep the last screenful reachable, and no further. (Borders and padding take 4
+    // columns and 2 rows.)
+    let wrapped = para.line_count(w.saturating_sub(4).max(1));
+    let max = wrapped.saturating_sub(h.saturating_sub(2) as usize) as u16;
+    *scroll = (*scroll).min(max);
+    let more = if max > 0 { " · j/k scroll" } else { "" };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        para.scroll((*scroll, 0)).block(
+            Block::bordered()
+                .title(format!(" What the agent said (t closes{more}) "))
+                .border_style(fg(pal::ACCENT))
+                .padding(ratatui::widgets::Padding::horizontal(1))
+                .style(Style::new().bg(pal::PANEL)),
+        ),
+        rect,
+    );
+}
+
 fn help(f: &mut Frame, area: Rect) {
     const KEYS: &[(&str, &str)] = &[
         ("j / k, ↓ / ↑", "next / previous hunk"),
@@ -1469,6 +1536,7 @@ fn help(f: &mut Frame, area: Rect) {
         ("A / R / C", "approve / reject / comment on the whole file"),
         ("Enter, i", "write or change the note for the hunk or file"),
         ("m", "general message to the agent"),
+        ("t", "what the agent said (from the hook)"),
         ("Ctrl+A", "approve every pending hunk"),
         ("f", "full file: show unchanged code between hunks"),
         ("s", "split view: old and new side by side"),

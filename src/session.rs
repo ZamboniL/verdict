@@ -125,14 +125,7 @@ pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
         let content = &v["message"]["content"];
         match v["type"].as_str() {
             Some("user") => {
-                // A new prompt (not a tool result or an injected meta message) starts a turn.
-                let is_prompt = v["isMeta"].as_bool() != Some(true)
-                    && (content.is_string()
-                        || content.as_array().is_some_and(|a| {
-                            a.iter()
-                                .any(|b| matches!(b["type"].as_str(), Some("text" | "image")))
-                        }));
-                if is_prompt {
+                if is_prompt(&v) {
                     saw_prompt = true;
                     opaque = false;
                     paths.clear();
@@ -178,10 +171,92 @@ pub fn turn_activity(transcript: &Path, repo: &Path) -> Activity {
     }
 }
 
+/// The agent's final reply this turn: its text after the last tool call. `None` if
+/// the transcript can't be read or the turn has no text.
+pub fn last_reply(transcript: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(transcript).ok()?;
+    let mut reply: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let content = &v["message"]["content"];
+        match v["type"].as_str() {
+            Some("user") if is_prompt(&v) => reply.clear(),
+            Some("assistant") => {
+                for b in content.as_array().into_iter().flatten() {
+                    match b["type"].as_str() {
+                        Some("tool_use") => reply.clear(),
+                        Some("text") => {
+                            if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                                reply.push(t.trim().to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!reply.is_empty()).then(|| reply.join("\n\n"))
+}
+
+/// A user entry that starts a turn: a typed prompt, not a tool result or an
+/// injected meta message.
+fn is_prompt(v: &serde_json::Value) -> bool {
+    let content = &v["message"]["content"];
+    v["isMeta"].as_bool() != Some(true)
+        && (content.is_string()
+            || content.as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|b| matches!(b["type"].as_str(), Some("text" | "image")))
+            }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn last_reply_is_the_text_after_the_last_tool_call() {
+        let f = std::env::temp_dir().join(format!("verdict-reply-{}.jsonl", std::process::id()));
+        let user = |c: &str| format!(r#"{{"type":"user","message":{{"content":{c}}}}}"#);
+        let text = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{t}"}}]}}}}"#
+            )
+        };
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#;
+        std::fs::write(
+            &f,
+            [
+                user(r#""first""#),
+                text("old turn"),
+                user(r#""fix the limiter""#),
+                text("Looking at it."),
+                tool.to_owned(),
+                user(r#"[{"type":"tool_result","content":"ok"}]"#),
+                text("Fixed the refill."),
+                text("Left a println for now."),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            last_reply(&f).as_deref(),
+            Some("Fixed the refill.\n\nLeft a println for now.")
+        );
+        // A turn that ends on a tool call has no reply yet.
+        std::fs::write(
+            &f,
+            [user(r#""go""#), text("On it."), tool.to_owned()].join("\n"),
+        )
+        .unwrap();
+        assert_eq!(last_reply(&f), None);
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn reads_turn_activity_from_transcript() {
