@@ -121,9 +121,6 @@ gh extension install github/gh-actions-lock
 gh actions-lock
 ```
 
-`dtolnay/rust-toolchain@stable` follows a branch, so Dependabot doesn't move it.
-Run `gh actions-lock --relock` now and then to pick up its new commits.
-
 The commit that first ran `rustfmt` over everything is listed in
 `.git-blame-ignore-revs`. GitHub's blame view skips it automatically. For local
 `git blame`, run once:
