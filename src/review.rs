@@ -67,6 +67,8 @@ pub struct Review {
     pub split: bool,
     /// What the agent said at the end of its turn, when known (hook reviews).
     pub agent_message: Option<String>,
+    /// Which agent session made these changes, when the feedback goes back to one.
+    pub session: Option<String>,
     /// Something was decided or written since the review opened.
     pub dirty: bool,
     /// The selection moved (or its file unfolded) and should be scrolled into view.
@@ -92,6 +94,7 @@ impl Review {
             general: String::new(),
             split,
             agent_message: None,
+            session: None,
             dirty: false,
             moved: true,
             lines: None,

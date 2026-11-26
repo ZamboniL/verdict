@@ -21,6 +21,9 @@ pub enum Mode {
     Hook,
     /// Launched by hand: feedback is printed / copied.
     Manual,
+    /// Launched by hand on changes a session made: feedback goes back to that
+    /// session, resuming it or waiting for its next prompt.
+    Session,
 }
 
 pub struct Outcome {
@@ -206,7 +209,7 @@ pub fn run(
         return run_gui(repo, review, mode);
     }
     match mode {
-        Mode::Manual => run_tui(repo, review, mode),
+        Mode::Manual | Mode::Session => run_tui(repo, review, mode),
         // The agent's own interface owns our terminal, so the review needs another one.
         Mode::Hook => match elsewhere(&repo, &review, cfg) {
             Some(r) => r,

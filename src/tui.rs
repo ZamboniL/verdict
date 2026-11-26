@@ -856,13 +856,17 @@ impl App {
                 fg(pal::AMBER),
             ));
         }
+        if let Some(s) = &self.r.session {
+            spans.push(Span::styled(format!(" · session {s}"), fg(pal::ACCENT)));
+        }
         if self.r.agent_message.is_some() {
             spans.push(Span::styled(" · t: what the agent said", fg(pal::ACCENT)));
         }
         let submit = match (self.mode, self.r.will_send()) {
             (Mode::Hook, true) => " S send feedback ",
             (Mode::Hook, false) => " S let agent finish ",
-            (Mode::Manual, _) => " S submit ",
+            (Mode::Session, true) => " S send to agent ",
+            (Mode::Session, false) | (Mode::Manual, _) => " S submit ",
         };
         f.buffer_mut().set_style(area, Style::new().bg(pal::PANEL));
         f.render_widget(Line::from(spans), area);
@@ -989,7 +993,10 @@ impl App {
                 let what = match (self.mode, self.r.will_send()) {
                     (Mode::Hook, true) => "apply it and send the feedback to the agent",
                     (Mode::Hook, false) => "apply it and let the agent finish",
-                    (Mode::Manual, _) => "apply it",
+                    (Mode::Session, true) => {
+                        "apply it and send the feedback to the agent's session"
+                    }
+                    (Mode::Session, false) | (Mode::Manual, _) => "apply it",
                 };
                 let pending = if c.pending > 0 {
                     format!(" ({} hunks still pending stay as they are)", c.pending)

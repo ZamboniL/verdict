@@ -53,15 +53,17 @@ fn dir(repo: &Path) -> Option<PathBuf> {
     Some(git::git_dir(repo)?.join("verdict").join("sessions"))
 }
 
-fn file(repo: &Path, session: &str) -> Option<PathBuf> {
+/// A session id that's safe to use as a file name. `None` if nothing is left.
+pub fn safe_id(session: &str) -> Option<String> {
     let safe: String = session
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    if safe.is_empty() {
-        return None;
-    }
-    Some(dir(repo)?.join(format!("{safe}.json")))
+    (!safe.is_empty()).then_some(safe)
+}
+
+fn file(repo: &Path, session: &str) -> Option<PathBuf> {
+    Some(dir(repo)?.join(format!("{}.json", safe_id(session)?)))
 }
 
 pub fn load(repo: &Path, session: &str) -> Option<Snapshot> {
@@ -198,6 +200,40 @@ pub fn last_reply(transcript: &Path) -> Option<String> {
         }
     }
     (!reply.is_empty()).then(|| reply.join("\n\n"))
+}
+
+/// The first thing the user typed in the session, on one line, to name it.
+pub fn first_prompt(transcript: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(transcript).ok()?;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["type"].as_str() != Some("user") || !is_prompt(&v) {
+            continue;
+        }
+        let content = &v["message"]["content"];
+        let typed = match content.as_str() {
+            Some(s) => s.to_owned(),
+            None => content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let one: String = typed.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one.is_empty() {
+            continue;
+        }
+        return Some(if one.chars().count() > 60 {
+            one.chars().take(59).collect::<String>() + "…"
+        } else {
+            one
+        });
+    }
+    None
 }
 
 /// A user entry that starts a turn: a typed prompt, not a tool result or an

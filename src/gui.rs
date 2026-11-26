@@ -722,12 +722,18 @@ impl App {
                     .on_hover_text(reg.warnings.join("\n"));
                 }
             }
+            if let Some(s) = &self.r.session {
+                ui.add_space(6.0);
+                pill(ui, &format!("session {s}"), pal::ACCENT)
+                    .on_hover_text("Your feedback goes back to this agent session");
+            }
 
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let label = match (self.mode, will_send) {
                     (Mode::Hook, true) => "Send feedback",
                     (Mode::Hook, false) => "Let agent finish",
-                    (Mode::Manual, _) => "Submit",
+                    (Mode::Session, true) => "Send to agent",
+                    (Mode::Session, false) | (Mode::Manual, _) => "Submit",
                 };
                 if button(ui, label, Some("Ctrl+Enter"), Look::Primary, true, true).clicked() {
                     self.submit(ui.ctx());

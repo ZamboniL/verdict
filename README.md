@@ -45,6 +45,9 @@ verdict does one job:
   instead of a whole file deleted and another added.
 - **Nothing gets lost**: an unsubmitted review is saved as you go and comes back
   after a crash, a closed window or a hook timeout.
+- **Review later, still reach the agent**: run `verdict` after the session's turn
+  is over and your feedback still goes back to the session that made the changes.
+  verdict resumes it if it has ended.
 - Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
   gutter. Cards fold away when you're done with them.
 - Syntax highlighting for about 200 languages out of the box. You can add more
@@ -166,6 +169,9 @@ Add both hooks to `~/.claude/settings.json`, or to a project's
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "verdict hook", "timeout": 86400 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "verdict hook", "timeout": 30 }] }
     ]
   }
 }
@@ -188,7 +194,33 @@ Add both hooks to `~/.claude/settings.json`, or to a project's
      response.
 
 The long `Stop` timeout lets you take your time reviewing. Set `VERDICT_DISABLE=1`
-in the environment to turn verdict off for a session.
+in the environment to turn verdict off for a session. `SessionEnd` is optional. It
+tells verdict a session has closed, so a later review can resume it (see below).
+
+### Reviewing after the turn is over
+
+You can skip the review when it opens, let the hook time out, or close Claude
+Code. verdict still remembers which session made which changes. Run `verdict` in
+the repo later and it:
+
+1. Finds the session whose changes are still on disk exactly as it left them, and
+   reviews only those files. The session is shown in the top bar, and **t** shows
+   its last message. If several sessions left changes, it reviews the most
+   recently active one and lists the others. `verdict --session ID` picks one (the
+   start of the id is enough). `verdict --no-session` reviews every change and
+   only prints the feedback.
+2. When you submit, sends the feedback back to that session:
+   - **If the session has ended**, verdict runs `claude --resume <id> <feedback>`,
+     in the same terminal (after the window closes, if you used the window). You
+     land in the resumed chat with your review already sent. Without a terminal,
+     it opens one in tmux or with the `terminal` command from `[ui]`.
+   - **If the session may still be open**, or resuming fails, the feedback is
+     queued. The `UserPromptSubmit` hook adds it to the next prompt you send in
+     that session.
+
+A long review isn't passed inline. It's saved to `.git/verdict/feedback/<id>.md`
+and the agent is asked to read it. `VERDICT_CLAUDE` sets the command used instead
+of `claude`.
 
 ## Reviewing
 
@@ -291,6 +323,13 @@ files whose content is exactly what you reviewed. Submitting removes the draft,
 and so do **Skip** in the window and quitting with `q` in the terminal, since
 you're discarding the review on purpose. Drafts older than 14 days are dropped.
 
+**Sessions after their turn.** At `Stop`, verdict writes the files the session
+changed, with the content it left them in, to `.git/verdict/owners/<id>.json`. A
+later review matches files to sessions by that content, so a file you or another
+session changed since doesn't match. An interrupted review's draft comes back for
+the same files, so its feedback goes to the right session too. Feedback waiting
+for an open session is kept in `.git/verdict/pending/<id>.md`.
+
 **Which session changed what.** Several agent sessions can work in the same repo,
 or just chat, so verdict tracks changes per session. A snapshot of content hashes
 taken at the start of each turn tells it what changed during that turn. The
@@ -381,7 +420,9 @@ when a file changes.
 verdict [PATH]     review uncommitted changes in the repo containing PATH
 verdict --staged   review staged changes (feedback only)
 verdict RANGE      review a commit range such as HEAD~3.. (feedback only)
-verdict hook       Claude Code hook entry point (UserPromptSubmit and Stop)
+verdict hook       Claude Code hook entry point (UserPromptSubmit, Stop, SessionEnd)
+verdict --session ID   review a session's changes and send the feedback back to it
+verdict --no-session   review every change, only print the feedback
 verdict langs      list languages and grammar warnings
 verdict themes     list syntax themes (* = active)
 verdict lang FILE  show which language FILE is highlighted as

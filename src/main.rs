@@ -4,6 +4,7 @@ mod frontend;
 mod git;
 #[cfg(feature = "gui")]
 mod gui;
+mod handoff;
 mod highlight;
 mod model;
 mod review;
@@ -31,10 +32,19 @@ USAGE:
                      Review a commit range, feedback only: A..B, A.. (to HEAD), or
                      A...B (from where B branched off A), e.g. HEAD~3.. or main...feature
   verdict hook       Claude Code hook entry point (reads hook JSON on stdin)
+                     for UserPromptSubmit, Stop and SessionEnd
   verdict langs      List languages (builtin + yours) and grammar load warnings
   verdict themes     List syntax themes; the active one is marked with *
   verdict lang FILE  Show which language FILE is highlighted as
   verdict init       Create the config dir with an example config.toml
+
+SESSIONS:
+  When the changes came from a Claude Code session (with the hooks set up), a plain
+  `verdict` reviews only that session's files and sends your feedback back to it:
+  it resumes an ended session with `claude --resume`, or queues the feedback for
+  the next prompt in a session that's still open.
+  --session ID       Review the changes of this session (an id or the start of one)
+  --no-session       Review every change and only print the feedback
 
 INTERFACE:
   --gui              Review in a native window
@@ -56,22 +66,30 @@ fn main() -> ExitCode {
     wslg_env();
     let mut flag = None;
     let mut staged = false;
-    let args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| {
-            if a == "--staged" || a == "--cached" {
-                staged = true;
-                return false;
-            }
-            match frontend::parse_flag(a) {
-                Some(c) => {
-                    flag = Some(c);
-                    false
+    let mut sess = SessionArg::Auto;
+    let mut args: Vec<String> = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--staged" || a == "--cached" {
+            staged = true;
+        } else if a == "--no-session" {
+            sess = SessionArg::Off;
+        } else if a == "--session" {
+            match it.next() {
+                Some(id) => sess = SessionArg::Id(id),
+                None => {
+                    eprintln!("verdict: --session needs a session id");
+                    return ExitCode::FAILURE;
                 }
-                None => true,
             }
-        })
-        .collect();
+        } else if let Some(id) = a.strip_prefix("--session=") {
+            sess = SessionArg::Id(id.to_owned());
+        } else if let Some(c) = frontend::parse_flag(&a) {
+            flag = Some(c);
+        } else {
+            args.push(a);
+        }
+    }
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
             print!("{HELP}");
@@ -92,7 +110,7 @@ fn main() -> ExitCode {
             }
         },
         Some("init") => init(),
-        _ => manual(&args, staged, flag),
+        _ => manual(&args, staged, flag, sess),
     }
 }
 
@@ -111,9 +129,64 @@ fn wslg_env() {
     }
 }
 
+/// Which session a review by hand sends its feedback to.
+enum SessionArg {
+    /// The session whose changes are on disk, if any.
+    Auto,
+    /// This one (an id or the start of one).
+    Id(String),
+    /// None: review everything and print the feedback.
+    Off,
+}
+
+/// The session whose changes a review by hand is about, and the files it changed.
+fn pick_session(
+    repo: &Path,
+    arg: SessionArg,
+) -> Result<Option<(String, handoff::Owner, std::collections::HashSet<String>)>, String> {
+    if matches!(arg, SessionArg::Off) {
+        return Ok(None);
+    }
+    let now = session::snapshot(repo).map_err(|e| e.to_string())?;
+    let mut found = handoff::attribute(repo, &now);
+    if let SessionArg::Id(id) = arg {
+        let Some((id, _)) = handoff::find(repo, &id) else {
+            return Err(format!("no session matching {id} has changes in this repo"));
+        };
+        return match found.into_iter().find(|f| f.id == id) {
+            Some(f) => Ok(Some((f.id, f.owner, f.files))),
+            None => Err(format!(
+                "session {id} has no changes left on disk as it made them"
+            )),
+        };
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let f = found.remove(0);
+    let others = now.len() - f.files.len();
+    eprintln!(
+        "verdict: reviewing the changes of session {}",
+        f.owner.label(&f.id)
+    );
+    for o in &found {
+        eprintln!(
+            "  also changed by session {}: verdict --session {}",
+            o.owner.label(&o.id),
+            o.id
+        );
+    }
+    if others > 0 && found.is_empty() {
+        eprintln!(
+            "  {others} other changed file(s) not from this session: verdict --no-session reviews everything"
+        );
+    }
+    Ok(Some((f.id, f.owner, f.files)))
+}
+
 /// `verdict [--staged] [RANGE] [PATH]`: an argument that isn't an existing path and
 /// contains ".." is a range.
-fn manual(args: &[String], staged: bool, flag: Option<Choice>) -> ExitCode {
+fn manual(args: &[String], staged: bool, flag: Option<Choice>, sess: SessionArg) -> ExitCode {
     let (ranges, paths): (Vec<&String>, Vec<&String>) = args
         .iter()
         .partition(|a| a.contains("..") && !Path::new(a.as_str()).exists());
@@ -137,7 +210,23 @@ fn manual(args: &[String], staged: bool, flag: Option<Choice>) -> ExitCode {
         None if staged => git::Source::Staged,
         None => git::Source::Worktree,
     };
-    let files = match model::load_source(&repo, &source, None) {
+    let picked = if source == git::Source::Worktree {
+        match pick_session(&repo, sess) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("verdict: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        if let SessionArg::Id(_) = sess {
+            eprintln!("verdict: --session only works for uncommitted changes");
+            return ExitCode::FAILURE;
+        }
+        None
+    };
+    let only = picked.as_ref().map(|(_, _, files)| files);
+    let files = match model::load_source(&repo, &source, only) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("verdict: {e}");
@@ -156,12 +245,41 @@ fn manual(args: &[String], staged: bool, flag: Option<Choice>) -> ExitCode {
     }
     let cfg = frontend::ui_config();
     let choice = frontend::choice(flag, &cfg);
-    let review = review::Review::new(files, cfg.split, source);
-    match frontend::run(repo.clone(), review, frontend::Mode::Manual, choice, &cfg) {
+    let mut review = review::Review::new(files, cfg.split, source);
+    let mode = match &picked {
+        Some((id, owner, _)) => {
+            review.session = Some(owner.label(id));
+            review.agent_message = owner.last_reply();
+            frontend::Mode::Session
+        }
+        None => frontend::Mode::Manual,
+    };
+    let outcome = frontend::run(repo.clone(), review, mode, choice, &cfg);
+    // The review changed files: keep what's left of them as the session's.
+    if let (Some((id, _, files)), Ok(Some(_))) = (&picked, &outcome) {
+        if let Ok(snap) = session::snapshot(&repo) {
+            handoff::update(&repo, id, |o| {
+                for f in files {
+                    match snap.get(f) {
+                        Some(sha) => o.files.insert(f.clone(), sha.clone()),
+                        None => o.files.remove(f),
+                    };
+                }
+            });
+        }
+    }
+    match outcome {
         Ok(Some(frontend::Outcome { message: Some(m) })) => {
-            print!("{m}");
             if let Some(p) = git::git_dir(&repo) {
                 let _ = std::fs::write(p.join("verdict-feedback.md"), &m);
+            }
+            match &picked {
+                Some((id, owner, _)) => {
+                    // Doesn't return when it resumes the session in this terminal.
+                    let said = handoff::deliver(&repo, id, owner, &m, &cfg.terminal);
+                    eprintln!("verdict: {said}");
+                }
+                None => print!("{m}"),
             }
             ExitCode::SUCCESS
         }
@@ -271,13 +389,15 @@ fn init() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Claude Code hook entry point, for two events:
+/// Claude Code hook entry point, for three events:
 ///
-/// - `UserPromptSubmit`: snapshot the working tree for this session (prints nothing,
-///   since stdout from this event would be added to the prompt).
+/// - `UserPromptSubmit`: snapshot the working tree for this session. Prints nothing,
+///   since stdout from this event is added to the prompt, unless feedback from a
+///   review done after the session's last turn is waiting for it.
 /// - `Stop`: review only the files this session changed during the turn. Exit 0 with
 ///   no output lets the agent stop; printing {"decision":"block","reason":...} makes it
 ///   continue with `reason` as instructions.
+/// - `SessionEnd`: mark the session as ended, so a later review resumes it.
 ///
 /// Any failure on our side must never wedge the agent, so every error path exits 0 silently.
 fn hook(flag: Option<Choice>) -> ExitCode {
@@ -299,11 +419,39 @@ fn hook(flag: Option<Choice>) -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    if v["hook_event_name"].as_str() == Some("UserPromptSubmit") {
-        if let Ok(snap) = session::snapshot(&repo) {
-            session::save(&repo, sess, &snap);
+    let transcript = v["transcript_path"].as_str().map(String::from);
+    let cwd_str = cwd.to_str().map(String::from);
+    let note = |o: &mut handoff::Owner| {
+        if transcript.is_some() {
+            o.transcript = transcript.clone();
         }
-        return ExitCode::SUCCESS;
+        if cwd_str.is_some() {
+            o.cwd = cwd_str.clone();
+        }
+    };
+
+    match v["hook_event_name"].as_str() {
+        Some("UserPromptSubmit") => {
+            if let Ok(snap) = session::snapshot(&repo) {
+                session::save(&repo, sess, &snap);
+            }
+            handoff::update(&repo, sess, |o| {
+                note(o);
+                o.ended = false;
+            });
+            if let Some(feedback) = handoff::take(&repo, sess) {
+                println!("{feedback}");
+            }
+            return ExitCode::SUCCESS;
+        }
+        Some("SessionEnd") => {
+            // Only sessions that changed something here are worth resuming.
+            if handoff::load(&repo, sess).is_some() {
+                handoff::update(&repo, sess, |o| o.ended = true);
+            }
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
     }
 
     // Stop. Without a snapshot from the start of this turn we can't tell this
@@ -333,6 +481,17 @@ fn hook(flag: Option<Choice>) -> ExitCode {
         Ok(f) if !f.is_empty() => f,
         _ => return ExitCode::SUCCESS,
     };
+    // Recorded before the review opens: if it's closed, or the hook times out, a
+    // review by hand later still knows these changes are this session's.
+    handoff::update(&repo, sess, |o| {
+        note(o);
+        o.ended = false;
+        for f in &touched {
+            if let Some(sha) = now.get(f) {
+                o.files.insert(f.clone(), sha.clone());
+            }
+        }
+    });
     let cfg = frontend::ui_config();
     let choice = frontend::choice(flag, &cfg);
     let mut review = review::Review::new(files, cfg.split, git::Source::Worktree);
@@ -351,6 +510,16 @@ fn hook(flag: Option<Choice>) -> ExitCode {
     // continues, the next Stop shows only what it changes in response.
     if let Ok(snap) = session::snapshot(&repo) {
         session::save(&repo, sess, &snap);
+        // What's left of the session's changes after the review. Files no longer
+        // in the snapshot were fully approved (staged) or reverted.
+        handoff::update(&repo, sess, |o| {
+            for f in &touched {
+                match snap.get(f) {
+                    Some(sha) => o.files.insert(f.clone(), sha.clone()),
+                    None => o.files.remove(f),
+                };
+            }
+        });
     }
     match outcome {
         Ok(Some(frontend::Outcome { message: Some(m) })) => {
