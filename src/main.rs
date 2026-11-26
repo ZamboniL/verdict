@@ -147,7 +147,11 @@ fn langs() -> ExitCode {
     syns.sort_by_key(|s| s.name.to_lowercase());
     syns.dedup_by(|a, b| a.name == b.name);
     for s in syns {
-        let user = if reg.user_names.contains(&s.name) { "  [user]" } else { "" };
+        let user = if reg.user_names.contains(&s.name) {
+            "  [user]"
+        } else {
+            ""
+        };
         let mut exts = s.file_extensions.join(" ");
         if exts.len() > 60 {
             exts.truncate(57);
@@ -176,9 +180,19 @@ fn lang(file: &str) -> ExitCode {
         .and_then(|t| t.lines().next().map(|l| format!("{l}\n")));
     // Associations with "/" match repo-relative paths.
     let p = Path::new(file);
-    let rel = git::toplevel(p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")))
-        .and_then(|top| std::fs::canonicalize(p).ok()?.strip_prefix(top).ok().map(|r| r.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| file.to_owned());
+    let rel = git::toplevel(
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+    .and_then(|top| {
+        std::fs::canonicalize(p)
+            .ok()?
+            .strip_prefix(top)
+            .ok()
+            .map(|r| r.to_string_lossy().into_owned())
+    })
+    .unwrap_or_else(|| file.to_owned());
     match reg.syntax_for(&rel, first.as_deref()) {
         Some(s) => println!("{} ({})", s.name, s.scope.build_string()),
         None => println!("plain text (no language matched)"),
@@ -203,8 +217,15 @@ fn init() -> ExitCode {
     } else {
         println!("wrote {}", cfg.display());
     }
-    println!("drop grammars in {}/grammars, themes in {}/themes,", dir.display(), dir.display());
-    println!("or unpacked VS Code extensions in {}/extensions", dir.display());
+    println!(
+        "drop grammars in {}/grammars, themes in {}/themes,",
+        dir.display(),
+        dir.display()
+    );
+    println!(
+        "or unpacked VS Code extensions in {}/extensions",
+        dir.display()
+    );
     ExitCode::SUCCESS
 }
 

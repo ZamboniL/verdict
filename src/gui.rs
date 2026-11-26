@@ -44,7 +44,12 @@ fn decision_color(d: Decision) -> Color32 {
     }
 }
 
-pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode, split: bool) -> Result<Option<Outcome>, String> {
+pub fn run(
+    repo: PathBuf,
+    files: Vec<FileDiff>,
+    mode: Mode,
+    split: bool,
+) -> Result<Option<Outcome>, String> {
     let result: Rc<RefCell<Option<Outcome>>> = Rc::default();
     let name = repo
         .file_name()
@@ -110,7 +115,11 @@ fn prefer_x11() -> bool {
         _ => {}
     }
     let var = |k: &str| std::env::var(k).ok();
-    let wayland = wayland_reachable(var("WAYLAND_SOCKET"), var("WAYLAND_DISPLAY"), var("XDG_RUNTIME_DIR"));
+    let wayland = wayland_reachable(
+        var("WAYLAND_SOCKET"),
+        var("WAYLAND_DISPLAY"),
+        var("XDG_RUNTIME_DIR"),
+    );
     let x11 = var("DISPLAY").is_some_and(|d| !d.is_empty());
     if !pick_x11(var("XDG_SESSION_TYPE").as_deref(), wayland, x11) {
         return false;
@@ -128,12 +137,20 @@ fn prefer_x11() -> bool {
 
 /// The session type decides, unless exactly one display server is reachable.
 fn pick_x11(session_type: Option<&str>, wayland: bool, x11: bool) -> bool {
-    let use_wayland = if wayland != x11 { wayland } else { session_type == Some("wayland") };
+    let use_wayland = if wayland != x11 {
+        wayland
+    } else {
+        session_type == Some("wayland")
+    };
     !use_wayland
 }
 
 /// WAYLAND_SOCKET, then WAYLAND_DISPLAY, then a wayland-0 socket in XDG_RUNTIME_DIR.
-fn wayland_reachable(socket: Option<String>, display: Option<String>, runtime_dir: Option<String>) -> bool {
+fn wayland_reachable(
+    socket: Option<String>,
+    display: Option<String>,
+    runtime_dir: Option<String>,
+) -> bool {
     if let Some(s) = socket {
         return !s.is_empty();
     }
@@ -172,9 +189,12 @@ fn setup_style(ctx: &egui::Context) {
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal::BORDER);
     ctx.set_visuals(v);
     ctx.global_style_mut(|s| {
-        s.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
-        s.text_styles.insert(TextStyle::Button, FontId::proportional(13.5));
-        s.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
+        s.text_styles
+            .insert(TextStyle::Body, FontId::proportional(14.0));
+        s.text_styles
+            .insert(TextStyle::Button, FontId::proportional(13.5));
+        s.text_styles
+            .insert(TextStyle::Monospace, FontId::monospace(13.0));
         s.spacing.item_spacing = vec2(8.0, 6.0);
         s.spacing.button_padding = vec2(8.0, 3.0);
     });
@@ -380,7 +400,11 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let cur_file = self.r.cur_file();
             for (fi, f) in self.r.files.iter().enumerate() {
-                let decided = f.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
+                let decided = f
+                    .hunks
+                    .iter()
+                    .filter(|h| h.decision != Decision::Pending)
+                    .count();
                 let rejected = f.hunks.iter().any(|h| h.decision == Decision::Reject);
                 let status_col = match f.status {
                     crate::git::Status::Modified => pal::AMBER,
@@ -403,7 +427,10 @@ impl App {
                     pal::DIM
                 };
                 job.append(&format!("{decided}/{}", f.hunks.len()), 8.0, fmt(prog_col));
-                if ui.add(egui::Button::selectable(cur_file == Some(fi), job)).clicked() {
+                if ui
+                    .add(egui::Button::selectable(cur_file == Some(fi), job))
+                    .clicked()
+                {
                     jump = Some(fi);
                 }
             }
@@ -664,7 +691,11 @@ impl eframe::App for App {
             .default_size(280.0)
             .show(ui, |ui| self.file_list(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(pal::BG).inner_margin(egui::Margin::same(8)))
+            .frame(
+                egui::Frame::new()
+                    .fill(pal::BG)
+                    .inner_margin(egui::Margin::same(8)),
+            )
             .show(ui, |ui| self.diff_view(ui));
     }
 }
@@ -698,7 +729,14 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
     let mut clicked = false;
     let mut action = None;
     let border = if c.selected {
-        Stroke::new(2.0, if h.decision == Decision::Pending { pal::ACCENT } else { decision_color(h.decision) })
+        Stroke::new(
+            2.0,
+            if h.decision == Decision::Pending {
+                pal::ACCENT
+            } else {
+                decision_color(h.decision)
+            },
+        )
     } else {
         Stroke::new(1.0, decision_color(h.decision))
     };
@@ -744,7 +782,9 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
                 Decision::Reject if c.file_reason => {
                     ui.add(
                         TextEdit::singleline(&mut h.note)
-                            .hint_text("Covered by the file reason. Optional: extra detail for this hunk")
+                            .hint_text(
+                                "Covered by the file reason. Optional: extra detail for this hunk",
+                            )
                             .desired_width(f32::INFINITY),
                     );
                 }
@@ -765,14 +805,19 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
                     }
                 }
                 Decision::Edit => {
-                    ui.label(RichText::new("Your replacement for the + lines:").small().color(pal::BLUE));
+                    ui.label(
+                        RichText::new("Your replacement for the + lines:")
+                            .small()
+                            .color(pal::BLUE),
+                    );
                     let syn_name = c.hl.map(|hl| hl.lang.clone());
                     let mono = c.mono.clone();
-                    let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                        let mut job = editor_job(buf.as_str(), syn_name.as_deref(), &mono);
-                        job.wrap.max_width = wrap;
-                        ui.painter().layout_job(job)
-                    };
+                    let mut layouter =
+                        move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                            let mut job = editor_job(buf.as_str(), syn_name.as_deref(), &mono);
+                            job.wrap.max_width = wrap;
+                            ui.painter().layout_job(job)
+                        };
                     let r = ui.add(
                         TextEdit::multiline(&mut h.edit_buf)
                             .code_editor()
@@ -793,7 +838,11 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
                 _ => {}
             }
         });
-    HunkOut { rect: resp.response.rect, clicked, action }
+    HunkOut {
+        rect: resp.response.rect,
+        clicked,
+        action,
+    }
 }
 
 /// Unchanged lines shown between hunks in the full-file view.
@@ -803,7 +852,12 @@ fn gap_ui(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) {
     }
     // Match the hunk cards' content inset (1px stroke + 8px margin).
     egui::Frame::new()
-        .inner_margin(egui::Margin { left: 9, right: 9, top: 2, bottom: 2 })
+        .inner_margin(egui::Margin {
+            left: 9,
+            right: 9,
+            top: 2,
+            bottom: 2,
+        })
         .show(ui, |ui| {
             diff_lines(ui, lines, c);
         });
@@ -816,10 +870,8 @@ fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::R
     let num_w = c.digits as f32 * c.char_w + 10.0;
     let text_x = num_w * 2.0 + c.char_w * 2.0 + 6.0;
     let width = (text_x + max_chars(lines.iter()) * c.char_w + 12.0).max(ui.available_width());
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(width, c.row_h * lines.len() as f32),
-        Sense::click(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(width, c.row_h * lines.len() as f32), Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -836,9 +888,27 @@ fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::R
         }
         let y = top + 1.0;
         let num = |n: Option<usize>| n.map(|n| n.to_string()).unwrap_or_default();
-        painter.text(pos2(rect.left() + num_w - 6.0, y), egui::Align2::RIGHT_TOP, num(l.old_no), c.mono.clone(), pal::DIM);
-        painter.text(pos2(rect.left() + num_w * 2.0 - 6.0, y), egui::Align2::RIGHT_TOP, num(l.new_no), c.mono.clone(), pal::DIM);
-        paint_code(painter, pos2(rect.left() + num_w * 2.0 + 4.0, y), text_x - num_w * 2.0 - 4.0, l, c);
+        painter.text(
+            pos2(rect.left() + num_w - 6.0, y),
+            egui::Align2::RIGHT_TOP,
+            num(l.old_no),
+            c.mono.clone(),
+            pal::DIM,
+        );
+        painter.text(
+            pos2(rect.left() + num_w * 2.0 - 6.0, y),
+            egui::Align2::RIGHT_TOP,
+            num(l.new_no),
+            c.mono.clone(),
+            pal::DIM,
+        );
+        paint_code(
+            painter,
+            pos2(rect.left() + num_w * 2.0 + 4.0, y),
+            text_x - num_w * 2.0 - 4.0,
+            l,
+            c,
+        );
     }
     selection_bar(painter, rect, c);
     resp
@@ -851,7 +921,10 @@ fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::
     let num_w = c.digits as f32 * c.char_w + 10.0;
     let text_x = num_w + c.char_w * 2.0 + 6.0;
     let half = (text_x + max_chars(lines.iter()) * c.char_w + 12.0).max(ui.available_width() / 2.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(half * 2.0, c.row_h * pairs.len() as f32), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(half * 2.0, c.row_h * pairs.len() as f32),
+        Sense::click(),
+    );
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -876,12 +949,21 @@ fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::
             let no = if side == 0.0 { l.old_no } else { l.new_no };
             let y = top + 1.0;
             let p = painter.with_clip_rect(cell.intersect(clip));
-            p.text(pos2(x0 + num_w - 6.0, y), egui::Align2::RIGHT_TOP, no.map(|n| n.to_string()).unwrap_or_default(), c.mono.clone(), pal::DIM);
+            p.text(
+                pos2(x0 + num_w - 6.0, y),
+                egui::Align2::RIGHT_TOP,
+                no.map(|n| n.to_string()).unwrap_or_default(),
+                c.mono.clone(),
+                pal::DIM,
+            );
             paint_code(&p, pos2(x0 + num_w + 4.0, y), text_x - num_w - 4.0, l, c);
         }
     }
     let mid = rect.left() + half;
-    painter.line_segment([pos2(mid, rect.top()), pos2(mid, rect.bottom())], Stroke::new(1.0, pal::BORDER));
+    painter.line_segment(
+        [pos2(mid, rect.top()), pos2(mid, rect.bottom())],
+        Stroke::new(1.0, pal::BORDER),
+    );
     selection_bar(painter, rect, c);
     resp
 }
@@ -902,7 +984,13 @@ fn line_bg(k: Kind) -> Option<Color32> {
 }
 
 /// The +/- sign at `at`, then the highlighted code `code_dx` further right.
-fn paint_code(painter: &egui::Painter, at: egui::Pos2, code_dx: f32, l: &model::DLine, c: &HunkCtx) {
+fn paint_code(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    code_dx: f32,
+    l: &model::DLine,
+    c: &HunkCtx,
+) {
     let (sign, sign_col) = match l.kind {
         Kind::Ctx => (" ", pal::DIM),
         Kind::Add => ("+", pal::GREEN),
@@ -919,7 +1007,11 @@ fn paint_code(painter: &egui::Painter, at: egui::Pos2, code_dx: f32, l: &model::
         _ => job.append(
             &l.text.replace('\t', "    "),
             0.0,
-            TextFormat { font_id: c.mono.clone(), color: pal::TEXT, ..Default::default() },
+            TextFormat {
+                font_id: c.mono.clone(),
+                color: pal::TEXT,
+                ..Default::default()
+            },
         ),
     }
     let galley = painter.layout_job(job);
@@ -929,7 +1021,10 @@ fn paint_code(painter: &egui::Painter, at: egui::Pos2, code_dx: f32, l: &model::
 fn selection_bar(painter: &egui::Painter, rect: Rect, c: &HunkCtx) {
     if c.selected {
         painter.rect_filled(
-            Rect::from_min_size(rect.left_top() - Vec2::new(8.0, 0.0), vec2(3.0, rect.height())),
+            Rect::from_min_size(
+                rect.left_top() - Vec2::new(8.0, 0.0),
+                vec2(3.0, rect.height()),
+            ),
             0.0,
             pal::ACCENT,
         );
@@ -940,13 +1035,21 @@ fn append_spans(job: &mut LayoutJob, spans: &Line, font: &FontId, expand_tabs: b
     for sp in spans {
         let color = Color32::from_rgb(sp.rgb[0], sp.rgb[1], sp.rgb[2]);
         job.append(
-            &if expand_tabs { sp.text.replace('\t', "    ") } else { sp.text.clone() },
+            &if expand_tabs {
+                sp.text.replace('\t', "    ")
+            } else {
+                sp.text.clone()
+            },
             0.0,
             TextFormat {
                 font_id: font.clone(),
                 color,
                 italics: sp.italic,
-                underline: if sp.underline { Stroke::new(1.0, color) } else { Stroke::NONE },
+                underline: if sp.underline {
+                    Stroke::new(1.0, color)
+                } else {
+                    Stroke::NONE
+                },
                 ..Default::default()
             },
         );
@@ -956,7 +1059,11 @@ fn append_spans(job: &mut LayoutJob, spans: &Line, font: &FontId, expand_tabs: b
 /// Highlighted layout for the inline editor (re-run as you type; hunks are small).
 fn editor_job(text: &str, syntax: Option<&str>, font: &FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
-    let plain = TextFormat { font_id: font.clone(), color: pal::TEXT, ..Default::default() };
+    let plain = TextFormat {
+        font_id: font.clone(),
+        color: pal::TEXT,
+        ..Default::default()
+    };
     let syn = REG
         .get()
         .zip(syntax)

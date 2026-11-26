@@ -80,7 +80,10 @@ struct Tty {
 
 impl Tty {
     fn open() -> Result<Tty, String> {
-        let mut t = Tty { term: Self::new_term().map_err(|e| format!("no terminal available: {e}"))?, kbd: false };
+        let mut t = Tty {
+            term: Self::new_term().map_err(|e| format!("no terminal available: {e}"))?,
+            kbd: false,
+        };
         t.enter().map_err(|e| e.to_string())?;
         Ok(t)
     }
@@ -140,7 +143,12 @@ fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Ok(mut tty) = File::options().write(true).open("/dev/tty") {
-            let _ = execute!(tty, DisableMouseCapture, terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = execute!(
+                tty,
+                DisableMouseCapture,
+                terminal::LeaveAlternateScreen,
+                cursor::Show
+            );
         }
         let _ = terminal::disable_raw_mode();
         prev(info);
@@ -227,7 +235,11 @@ enum RowKind {
     SplitDiff(Option<usize>, Option<usize>),
     /// Unchanged line of the full-file view: gap index, line index.
     Gap(usize, usize),
-    Text { indent: u16, text: String, style: Style },
+    Text {
+        indent: u16,
+        text: String,
+        style: Style,
+    },
     Blank,
 }
 
@@ -257,7 +269,12 @@ struct App {
     list_top: usize,
 }
 
-pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode, split: bool) -> Result<Option<Outcome>, String> {
+pub fn run(
+    repo: PathBuf,
+    files: Vec<FileDiff>,
+    mode: Mode,
+    split: bool,
+) -> Result<Option<Outcome>, String> {
     let (tx, rx) = mpsc::channel();
     let jobs = hl_jobs(&files);
     std::thread::spawn(move || run_highlighter(jobs, tx, || {}));
@@ -374,7 +391,12 @@ impl App {
 
     fn set_decision(&mut self, d: Decision) -> Action {
         // Pressing e again reopens the editor; x clears an edit.
-        if d == Decision::Edit && self.r.sel_hunk().is_some_and(|h| h.decision == Decision::Edit) {
+        if d == Decision::Edit
+            && self
+                .r
+                .sel_hunk()
+                .is_some_and(|h| h.decision == Decision::Edit)
+        {
             if let Some((fi, hi)) = self.sel_pair() {
                 return Action::EditHunk(fi, hi);
             }
@@ -392,16 +414,22 @@ impl App {
     }
 
     fn file_action(&mut self, d: Decision) -> Action {
-        let Some(fi) = self.cur_file() else { return Action::None };
+        let Some(fi) = self.cur_file() else {
+            return Action::None;
+        };
         let e = self.r.file_action(fi, d);
         self.effect(e)
     }
 
     /// Enter: write the note that fits the selection.
     fn edit_note(&mut self) {
-        let Some((fi, hi)) = self.sel_pair() else { return };
+        let Some((fi, hi)) = self.sel_pair() else {
+            return;
+        };
         match self.r.files[fi].hunks[hi].decision {
-            Decision::Reject | Decision::Comment | Decision::Edit => self.open_input(Target::Hunk(fi, hi)),
+            Decision::Reject | Decision::Comment | Decision::Edit => {
+                self.open_input(Target::Hunk(fi, hi))
+            }
             _ if self.r.files[fi].file_mode.is_some() => self.open_input(Target::File(fi)),
             _ => self.info("press r to reject or c to comment first"),
         }
@@ -529,7 +557,9 @@ impl App {
     }
 
     fn input_key(&mut self, k: KeyEvent) -> Action {
-        let State::Input(inp) = &mut self.state else { return Action::None };
+        let State::Input(inp) = &mut self.state else {
+            return Action::None;
+        };
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
@@ -546,7 +576,10 @@ impl App {
                 let State::Input(inp) = std::mem::replace(&mut self.state, State::Normal) else {
                     unreachable!()
                 };
-                self.set_text(inp.target, inp.buf.iter().collect::<String>().trim_end().to_owned());
+                self.set_text(
+                    inp.target,
+                    inp.buf.iter().collect::<String>().trim_end().to_owned(),
+                );
             }
             KeyCode::Char('o') if ctrl => return Action::EditInput,
             KeyCode::Char('a') if ctrl => inp.cur = 0,
@@ -629,7 +662,13 @@ impl App {
         ])
         .areas(area);
         self.top_bar(f, top);
-        let longest = self.r.files.iter().map(|f| f.path.chars().count()).max().unwrap_or(0) as u16;
+        let longest = self
+            .r
+            .files
+            .iter()
+            .map(|f| f.path.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
         let list_w = (longest + 10).min(area.width / 3).min(48);
         if area.width >= 90 && self.r.files.len() > 1 {
             let [list, main] =
@@ -651,7 +690,10 @@ impl App {
         let c = self.r.counts();
         let name = self.repo.file_name().unwrap_or_default().to_string_lossy();
         let mut spans = vec![
-            Span::styled(format!(" {name} "), Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {name} "),
+                Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" {} hunks", c.total), fg(pal::DIM)),
         ];
         for (n, label, col) in [
@@ -667,7 +709,10 @@ impl App {
         }
         if let Some(reg) = REG.get().filter(|r| !r.warnings.is_empty()) {
             spans.push(Span::styled(
-                format!(" · {} highlight warning(s), see `verdict langs`", reg.warnings.len()),
+                format!(
+                    " · {} highlight warning(s), see `verdict langs`",
+                    reg.warnings.len()
+                ),
                 fg(pal::AMBER),
             ));
         }
@@ -679,14 +724,19 @@ impl App {
         f.buffer_mut().set_style(area, Style::new().bg(pal::PANEL));
         f.render_widget(Line::from(spans), area);
         f.render_widget(
-            Line::from(Span::styled(submit, Style::new().fg(Color::Black).bg(pal::ACCENT)))
-                .right_aligned(),
+            Line::from(Span::styled(
+                submit,
+                Style::new().fg(Color::Black).bg(pal::ACCENT),
+            ))
+            .right_aligned(),
             area,
         );
     }
 
     fn file_list(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::new().borders(Borders::RIGHT).border_style(fg(pal::SEL));
+        let block = Block::new()
+            .borders(Borders::RIGHT)
+            .border_style(fg(pal::SEL));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let cur = self.cur_file();
@@ -700,7 +750,11 @@ impl App {
         }
         for (row, fi) in (self.list_top..self.r.files.len()).take(h).enumerate() {
             let file = &self.r.files[fi];
-            let decided = file.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
+            let decided = file
+                .hunks
+                .iter()
+                .filter(|h| h.decision != Decision::Pending)
+                .count();
             let total = file.hunks.len();
             let prog_col = if file.hunks.iter().any(|h| h.decision == Decision::Reject) {
                 pal::RED
@@ -711,23 +765,34 @@ impl App {
             };
             let prog = format!(" {decided}/{total}");
             let room = (inner.width as usize).saturating_sub(3 + prog.chars().count());
-            let rect = Rect { y: inner.y + row as u16, height: 1, ..inner };
+            let rect = Rect {
+                y: inner.y + row as u16,
+                height: 1,
+                ..inner
+            };
             if cur == Some(fi) {
                 f.buffer_mut().set_style(rect, Style::new().bg(pal::SEL));
             }
             f.render_widget(
                 Line::from(vec![
-                    Span::styled(format!(" {} ", file.status.letter()), fg(status_color(file.status))),
+                    Span::styled(
+                        format!(" {} ", file.status.letter()),
+                        fg(status_color(file.status)),
+                    ),
                     Span::styled(truncate_left(&file.path, room), fg(pal::TEXT)),
                 ]),
                 rect,
             );
-            f.render_widget(Line::from(Span::styled(prog, fg(prog_col))).right_aligned(), rect);
+            f.render_widget(
+                Line::from(Span::styled(prog, fg(prog_col))).right_aligned(),
+                rect,
+            );
         }
     }
 
     fn bottom_bar(&self, f: &mut Frame, area: Rect) {
-        let [status, keys] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        let [status, keys] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
         f.buffer_mut().set_style(area, Style::new().bg(pal::PANEL));
         let hint = |s: &str| Line::from(Span::styled(s.to_owned(), fg(pal::DIM)));
         match &self.state {
@@ -735,13 +800,20 @@ impl App {
                 let prompt = self.prompt(inp.target);
                 let pw = prompt.chars().count() as u16 + 1;
                 // Newlines show as ↵; scroll sideways to keep the cursor in view.
-                let shown: Vec<char> = inp.buf.iter().map(|&c| if c == '\n' { '↵' } else { c }).collect();
+                let shown: Vec<char> = inp
+                    .buf
+                    .iter()
+                    .map(|&c| if c == '\n' { '↵' } else { c })
+                    .collect();
                 let room = status.width.saturating_sub(pw + 1).max(1) as usize;
                 let start = inp.cur.saturating_sub(room);
                 let text: String = shown[start..].iter().take(room).collect();
                 f.render_widget(
                     Line::from(vec![
-                        Span::styled(format!(" {prompt}"), Style::new().fg(pal::ACCENT).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!(" {prompt}"),
+                            Style::new().fg(pal::ACCENT).add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(text, fg(pal::TEXT)),
                     ]),
                     status,
@@ -756,7 +828,11 @@ impl App {
                 );
             }
             State::ConfirmQuit => {
-                let what = if self.mode == Mode::Hook { "let the agent finish" } else { "quit" };
+                let what = if self.mode == Mode::Hook {
+                    "let the agent finish"
+                } else {
+                    "quit"
+                };
                 f.render_widget(
                     Line::from(Span::styled(
                         format!(" Discard your review and {what}? Nothing will be applied. (y/N)"),
@@ -772,7 +848,11 @@ impl App {
                     (Mode::Hook, false) => "apply it and let the agent finish",
                     (Mode::Manual, _) => "apply it",
                 };
-                let pending = if c.pending > 0 { format!(" ({} hunks still pending stay as they are)", c.pending) } else { String::new() };
+                let pending = if c.pending > 0 {
+                    format!(" ({} hunks still pending stay as they are)", c.pending)
+                } else {
+                    String::new()
+                };
                 f.render_widget(
                     Line::from(Span::styled(
                         format!(" Submit your review: {what}?{pending} (y/N)"),
@@ -810,7 +890,11 @@ impl App {
             },
             Target::Hunk(fi, hi) => {
                 let f = &self.r.files[fi];
-                let n = if f.hunks.len() > 1 { format!(" {}/{}", hi + 1, f.hunks.len()) } else { String::new() };
+                let n = if f.hunks.len() > 1 {
+                    format!(" {}/{}", hi + 1, f.hunks.len())
+                } else {
+                    String::new()
+                };
                 match f.hunks[hi].decision {
                     Decision::Reject if f.file_mode == Some(Decision::Reject) => {
                         format!("Extra detail for hunk{n} (optional): ")
@@ -863,7 +947,11 @@ impl App {
                 match h.decision {
                     Decision::Reject if file_reason && h.note.trim().is_empty() => {}
                     Decision::Reject | Decision::Comment => {
-                        let label = if h.decision == Decision::Reject { "Why: " } else { "Comment: " };
+                        let label = if h.decision == Decision::Reject {
+                            "Why: "
+                        } else {
+                            "Comment: "
+                        };
                         push_note(&mut rows, fi, Some(hi), 4, label, &h.note, col, text_w);
                     }
                     Decision::Edit => {
@@ -875,10 +963,18 @@ impl App {
                             },
                             Some(hi),
                         ));
-                        let body = if h.edit_buf.is_empty() { "(removed)" } else { &h.edit_buf };
+                        let body = if h.edit_buf.is_empty() {
+                            "(removed)"
+                        } else {
+                            &h.edit_buf
+                        };
                         for l in body.lines() {
                             rows.push(row(
-                                RowKind::Text { indent: 6, text: l.replace('\t', "    "), style: fg(pal::TEXT) },
+                                RowKind::Text {
+                                    indent: 6,
+                                    text: l.replace('\t', "    "),
+                                    style: fg(pal::TEXT),
+                                },
                                 Some(hi),
                             ));
                         }
@@ -903,7 +999,10 @@ impl App {
     fn diff_view(&mut self, f: &mut Frame, area: Rect) {
         self.main_area = area;
         if self.r.files.is_empty() {
-            f.render_widget(Line::from(" No changes to review.").style(fg(pal::DIM)), area);
+            f.render_widget(
+                Line::from(" No changes to review.").style(fg(pal::DIM)),
+                area,
+            );
             return;
         }
         let rows = self.rows(area.width as usize);
@@ -914,7 +1013,9 @@ impl App {
                 let mut range = rows
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| r.fi == fi && (r.hi == Some(hi) || self.r.collapsed.contains(&fi)))
+                    .filter(|(_, r)| {
+                        r.fi == fi && (r.hi == Some(hi) || self.r.collapsed.contains(&fi))
+                    })
                     .map(|(i, _)| i);
                 if let Some(first) = range.next() {
                     let last = range.next_back().unwrap_or(first);
@@ -936,7 +1037,11 @@ impl App {
         self.visible.clear();
         let buf = f.buffer_mut();
         for (i, r) in rows.iter().skip(self.scroll).take(h).enumerate() {
-            let rect = Rect { y: area.y + i as u16, height: 1, ..area };
+            let rect = Rect {
+                y: area.y + i as u16,
+                height: 1,
+                ..area
+            };
             self.visible.push((r.fi, r.hi));
             let selected = sel.is_some() && sel.map(|p| (p.0, Some(p.1))) == Some((r.fi, r.hi));
             self.render_row(buf, rect, r, selected);
@@ -962,17 +1067,31 @@ impl App {
             RowKind::FileHeader => {
                 buf.set_style(rect, Style::new().bg(pal::FILE));
                 let total = f.hunks.len();
-                let decided = f.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
+                let decided = f
+                    .hunks
+                    .iter()
+                    .filter(|h| h.decision != Decision::Pending)
+                    .count();
                 let kind = match f.status {
                     Status::Modified => "modified",
                     Status::Deleted => "deleted",
                     Status::Untracked => "new file",
                 };
-                let arrow = if self.r.collapsed.contains(&r.fi) { "▸" } else { "▾" };
+                let arrow = if self.r.collapsed.contains(&r.fi) {
+                    "▸"
+                } else {
+                    "▾"
+                };
                 let mut spans = vec![
                     Span::styled(format!(" {arrow} "), fg(pal::DIM)),
-                    Span::styled(format!("{} ", f.status.letter()), fg(status_color(f.status))),
-                    Span::styled(f.path.clone(), Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{} ", f.status.letter()),
+                        fg(status_color(f.status)),
+                    ),
+                    Span::styled(
+                        f.path.clone(),
+                        Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(format!("  {kind}"), fg(pal::DIM)),
                 ];
                 if let Some(hl) = &f.hl {
@@ -984,7 +1103,10 @@ impl App {
                 if self.r.split {
                     spans.push(Span::styled(" · split", fg(pal::ACCENT)));
                 }
-                spans.push(Span::styled(format!(" · {decided}/{total} decided"), fg(pal::DIM)));
+                spans.push(Span::styled(
+                    format!(" · {decided}/{total} decided"),
+                    fg(pal::DIM),
+                ));
                 Line::from(spans).render(rect, buf);
                 let badge = if f.all(Decision::Approve) {
                     Some(("file approved", pal::GREEN))
@@ -996,15 +1118,21 @@ impl App {
                     None
                 };
                 if let Some((label, col)) = badge {
-                    Line::from(Span::styled(format!(" {label} "), Style::new().fg(Color::Black).bg(col)))
-                        .right_aligned()
-                        .render(rect, buf);
+                    Line::from(Span::styled(
+                        format!(" {label} "),
+                        Style::new().fg(Color::Black).bg(col),
+                    ))
+                    .right_aligned()
+                    .render(rect, buf);
                 }
             }
             RowKind::Folded => {
                 let n = f.hunks.len();
                 Line::from(Span::styled(
-                    format!("   {n} {} folded (Space to expand)", if n == 1 { "hunk" } else { "hunks" }),
+                    format!(
+                        "   {n} {} folded (Space to expand)",
+                        if n == 1 { "hunk" } else { "hunks" }
+                    ),
                     fg(pal::DIM),
                 ))
                 .render(rect, buf);
@@ -1026,7 +1154,10 @@ impl App {
                 let badge = if h.decision == Decision::Pending {
                     Span::styled(" pending ", fg(pal::DIM))
                 } else {
-                    Span::styled(format!(" {} ", decision_label(h.decision)), Style::new().fg(Color::Black).bg(col))
+                    Span::styled(
+                        format!(" {} ", decision_label(h.decision)),
+                        Style::new().fg(Color::Black).bg(col),
+                    )
                 };
                 Line::from(badge).right_aligned().render(rect, buf);
             }
@@ -1037,10 +1168,24 @@ impl App {
             RowKind::SplitDiff(left, right) => {
                 let h = &f.hunks[r.hi.unwrap_or(0)];
                 let pick = |i: &Option<usize>| i.map(|i| &h.lines[i]);
-                self.render_split(buf, rect, bar, pick(left), pick(right), f.hl.as_ref(), digits);
+                self.render_split(
+                    buf,
+                    rect,
+                    bar,
+                    pick(left),
+                    pick(right),
+                    f.hl.as_ref(),
+                    digits,
+                );
             }
             RowKind::Gap(g, li) => {
-                if let Some(l) = self.r.full.get(&r.fi).and_then(|g2| g2.get(*g)).and_then(|g| g.get(*li)) {
+                if let Some(l) = self
+                    .r
+                    .full
+                    .get(&r.fi)
+                    .and_then(|g2| g2.get(*g))
+                    .and_then(|g| g.get(*li))
+                {
                     if self.r.split {
                         self.render_split(buf, rect, bar, Some(l), Some(l), f.hl.as_ref(), digits);
                     } else {
@@ -1048,9 +1193,17 @@ impl App {
                     }
                 }
             }
-            RowKind::Text { indent, text, style } => {
-                Line::from(vec![bar, Span::raw(" ".repeat(*indent as usize)), Span::styled(text.clone(), *style)])
-                    .render(rect, buf);
+            RowKind::Text {
+                indent,
+                text,
+                style,
+            } => {
+                Line::from(vec![
+                    bar,
+                    Span::raw(" ".repeat(*indent as usize)),
+                    Span::styled(text.clone(), *style),
+                ])
+                .render(rect, buf);
             }
             RowKind::Blank => {}
         }
@@ -1066,12 +1219,22 @@ impl App {
         digits: usize,
     ) {
         if let Some(bg) = line_bg(l.kind) {
-            buf.set_style(Rect { x: rect.x + 1, width: rect.width.saturating_sub(1), ..rect }, Style::new().bg(bg));
+            buf.set_style(
+                Rect {
+                    x: rect.x + 1,
+                    width: rect.width.saturating_sub(1),
+                    ..rect
+                },
+                Style::new().bg(bg),
+            );
         }
         let num = |n: Option<usize>| n.map(|n| n.to_string()).unwrap_or_default();
         let mut spans = vec![
             bar,
-            Span::styled(format!(" {:>w$} {:>w$} ", num(l.old_no), num(l.new_no), w = digits), fg(pal::DIM)),
+            Span::styled(
+                format!(" {:>w$} {:>w$} ", num(l.old_no), num(l.new_no), w = digits),
+                fg(pal::DIM),
+            ),
         ];
         spans.extend(self.code_spans(l, hl));
         Line::from(spans).render(rect, buf);
@@ -1090,14 +1253,43 @@ impl App {
         hl: Option<&FileHl>,
         digits: usize,
     ) {
-        Line::from(bar).render(Rect { width: 1.min(rect.width), ..rect }, buf);
+        Line::from(bar).render(
+            Rect {
+                width: 1.min(rect.width),
+                ..rect
+            },
+            buf,
+        );
         let inner = rect.width.saturating_sub(2);
         let lw = inner / 2;
         let halves = [
-            (Rect { x: rect.x + 1, width: lw, ..rect }, left, true),
-            (Rect { x: rect.x + 2 + lw, width: inner - lw, ..rect }, right, false),
+            (
+                Rect {
+                    x: rect.x + 1,
+                    width: lw,
+                    ..rect
+                },
+                left,
+                true,
+            ),
+            (
+                Rect {
+                    x: rect.x + 2 + lw,
+                    width: inner - lw,
+                    ..rect
+                },
+                right,
+                false,
+            ),
         ];
-        Line::from(Span::styled("│", fg(pal::SEL))).render(Rect { x: rect.x + 1 + lw, width: 1, ..rect }, buf);
+        Line::from(Span::styled("│", fg(pal::SEL))).render(
+            Rect {
+                x: rect.x + 1 + lw,
+                width: 1,
+                ..rect
+            },
+            buf,
+        );
         for (area, line, old) in halves {
             let Some(l) = line else {
                 buf.set_style(area, Style::new().bg(pal::EMPTY));
@@ -1108,7 +1300,11 @@ impl App {
             }
             let no = if old { l.old_no } else { l.new_no };
             let mut spans = vec![Span::styled(
-                format!(" {:>w$} ", no.map(|n| n.to_string()).unwrap_or_default(), w = digits),
+                format!(
+                    " {:>w$} ",
+                    no.map(|n| n.to_string()).unwrap_or_default(),
+                    w = digits
+                ),
                 fg(pal::DIM),
             )];
             spans.extend(self.code_spans(l, hl));
@@ -1139,7 +1335,10 @@ impl App {
                     if s.underline {
                         st = st.add_modifier(Modifier::UNDERLINED);
                     }
-                    (s.text.trim_end_matches(['\n', '\r']).replace('\t', "    "), st)
+                    (
+                        s.text.trim_end_matches(['\n', '\r']).replace('\t', "    "),
+                        st,
+                    )
                 })
                 .collect(),
             _ => vec![(l.text.replace('\t', "    "), fg(pal::TEXT))],
@@ -1151,7 +1350,10 @@ impl App {
                 skip -= n;
                 continue;
             }
-            spans.push(Span::styled(text.chars().skip(skip).collect::<String>(), st));
+            spans.push(Span::styled(
+                text.chars().skip(skip).collect::<String>(),
+                st,
+            ));
             skip = 0;
         }
         spans
@@ -1191,10 +1393,21 @@ fn push_note(
         return;
     }
     let pad = label.chars().count();
-    for (i, line) in wrap(note, width.saturating_sub(pad + indent as usize).max(10)).into_iter().enumerate() {
-        let lead = if i == 0 { label.to_owned() } else { " ".repeat(pad) };
+    for (i, line) in wrap(note, width.saturating_sub(pad + indent as usize).max(10))
+        .into_iter()
+        .enumerate()
+    {
+        let lead = if i == 0 {
+            label.to_owned()
+        } else {
+            " ".repeat(pad)
+        };
         rows.push(Row {
-            kind: RowKind::Text { indent, text: format!("{lead}{line}"), style: fg(col) },
+            kind: RowKind::Text {
+                indent,
+                text: format!("{lead}{line}"),
+                style: fg(col),
+            },
             fi,
             hi,
         });
@@ -1275,7 +1488,10 @@ fn help(f: &mut Frame, area: Rect) {
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
-                Span::styled(format!(" {k:<20}"), Style::new().fg(pal::ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" {k:<20}"),
+                    Style::new().fg(pal::ACCENT).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(*d, fg(pal::TEXT)),
             ])
         })
@@ -1290,14 +1506,12 @@ fn help(f: &mut Frame, area: Rect) {
     };
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::bordered()
-                    .title(" verdict keys (any key closes) ")
-                    .border_style(fg(pal::ACCENT))
-                    .style(Style::new().bg(pal::PANEL)),
-            ),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::bordered()
+                .title(" verdict keys (any key closes) ")
+                .border_style(fg(pal::ACCENT))
+                .style(Style::new().bg(pal::PANEL)),
+        ),
         rect,
     );
 }

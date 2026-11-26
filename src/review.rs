@@ -151,12 +151,18 @@ impl Review {
     /// Decide the selected hunk; deciding the same again clears it. Approving moves on
     /// to the next undecided hunk.
     pub fn set_decision(&mut self, d: Decision) -> Effect {
-        let Some((fi, hi)) = self.sel_pair() else { return Effect::None };
+        let Some((fi, hi)) = self.sel_pair() else {
+            return Effect::None;
+        };
         if self.files[fi].binary && d == Decision::Edit {
             return Effect::Binary;
         }
         let h = &mut self.files[fi].hunks[hi];
-        h.decision = if h.decision == d { Decision::Pending } else { d };
+        h.decision = if h.decision == d {
+            Decision::Pending
+        } else {
+            d
+        };
         self.dirty = true;
         match h.decision {
             Decision::Reject | Decision::Comment => Effect::HunkNote(fi, hi),
@@ -171,7 +177,9 @@ impl Review {
 
     /// Back to undecided, dropping any edit.
     pub fn clear(&mut self) {
-        let Some((fi, hi)) = self.sel_pair() else { return };
+        let Some((fi, hi)) = self.sel_pair() else {
+            return;
+        };
         let f = &mut self.files[fi];
         let h = &mut f.hunks[hi];
         h.decision = Decision::Pending;
@@ -202,7 +210,9 @@ impl Review {
     /// Comment toggles a note about the file without touching hunk decisions.
     /// Approving a file folds it and moves on to the next undecided hunk.
     pub fn file_action(&mut self, fi: usize, d: Decision) -> Effect {
-        let Some(f) = self.files.get_mut(fi) else { return Effect::None };
+        let Some(f) = self.files.get_mut(fi) else {
+            return Effect::None;
+        };
         self.dirty = true;
         match d {
             Decision::Approve | Decision::Reject => {
@@ -334,11 +344,17 @@ mod tests {
 
     /// Two files: a.txt with two hunks, b.txt with one.
     fn review() -> Review {
-        Review::new(vec![file("a.txt", OLD, NEW), file("b.txt", "x\n", "y\n")], false)
+        Review::new(
+            vec![file("a.txt", OLD, NEW), file("b.txt", "x\n", "y\n")],
+            false,
+        )
     }
 
     fn decisions(r: &Review) -> Vec<Decision> {
-        r.files.iter().flat_map(|f| f.hunks.iter().map(|h| h.decision)).collect()
+        r.files
+            .iter()
+            .flat_map(|f| f.hunks.iter().map(|h| h.decision))
+            .collect()
     }
 
     use Decision::*;

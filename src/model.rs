@@ -167,7 +167,9 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
     let mode = match e.status {
         Status::Untracked => {
             use std::os::unix::fs::PermissionsExt;
-            let exec = meta.as_ref().is_some_and(|m| m.permissions().mode() & 0o111 != 0);
+            let exec = meta
+                .as_ref()
+                .is_some_and(|m| m.permissions().mode() & 0o111 != 0);
             if exec { "100755" } else { "100644" }.to_owned()
         }
         _ => git::index_mode(repo, &e.path).unwrap_or_else(|| "100644".into()),
@@ -317,9 +319,13 @@ pub fn split_pairs(lines: &[DLine]) -> Vec<(Option<usize>, Option<usize>)> {
             i += 1;
             continue;
         }
-        let dels: Vec<usize> = (i..lines.len()).take_while(|&j| lines[j].kind == Kind::Del).collect();
+        let dels: Vec<usize> = (i..lines.len())
+            .take_while(|&j| lines[j].kind == Kind::Del)
+            .collect();
         let after = i + dels.len();
-        let adds: Vec<usize> = (after..lines.len()).take_while(|&j| lines[j].kind == Kind::Add).collect();
+        let adds: Vec<usize> = (after..lines.len())
+            .take_while(|&j| lines[j].kind == Kind::Add)
+            .collect();
         for k in 0..dels.len().max(adds.len()) {
             out.push((dels.get(k).copied(), adds.get(k).copied()));
         }
@@ -407,7 +413,10 @@ pub fn apply(repo: &Path, files: &[FileDiff]) -> git::Result<()> {
         }
 
         let d = |h: &Hunk| h.decision;
-        if f.hunks.iter().any(|h| matches!(d(h), Decision::Approve | Decision::Edit)) {
+        if f.hunks
+            .iter()
+            .any(|h| matches!(d(h), Decision::Approve | Decision::Edit))
+        {
             if !f.new_exists && f.hunks.iter().all(|h| d(h) == Decision::Approve) {
                 git::unstage_remove(repo, &f.path)?;
             } else {
@@ -419,7 +428,10 @@ pub fn apply(repo: &Path, files: &[FileDiff]) -> git::Result<()> {
                 git::stage(repo, &f.path, idx.concat().as_bytes(), &f.mode)?;
             }
         }
-        if f.hunks.iter().any(|h| matches!(d(h), Decision::Reject | Decision::Edit)) {
+        if f.hunks
+            .iter()
+            .any(|h| matches!(d(h), Decision::Reject | Decision::Edit))
+        {
             let wt = mix(f, |h| match h.decision {
                 Decision::Reject => Pick::Old,
                 Decision::Edit => Pick::Custom(edited_lines(f, h)),
@@ -508,14 +520,19 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
     // Where a whole-file note goes: with the rejection if the file was rejected as a
     // whole, otherwise under comments.
     let note_in_reject = |f: &FileDiff| {
-        f.file_mode == Some(Decision::Reject) && f.hunks.iter().any(|h| h.decision == Decision::Reject)
+        f.file_mode == Some(Decision::Reject)
+            && f.hunks.iter().any(|h| h.decision == Decision::Reject)
     };
 
     let section = |s: &mut String, title: &str, want: Decision| {
         let mut first = true;
         for f in files {
-            let hunks: Vec<(usize, &Hunk)> =
-                f.hunks.iter().enumerate().filter(|(_, h)| h.decision == want).collect();
+            let hunks: Vec<(usize, &Hunk)> = f
+                .hunks
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.decision == want)
+                .collect();
             let note_here = match want {
                 Decision::Reject => note_in_reject(f).then(|| f.file_note()).flatten(),
                 Decision::Comment => (!note_in_reject(f)).then(|| f.file_note()).flatten(),
@@ -541,7 +558,11 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
             };
             let _ = writeln!(s, "### `{}`{scope}\n", f.path);
             if let Some(n) = note_here {
-                let label = if want == Decision::Reject { "Why the file was rejected" } else { "About the whole file" };
+                let label = if want == Decision::Reject {
+                    "Why the file was rejected"
+                } else {
+                    "About the whole file"
+                };
                 let _ = writeln!(s, "**{label}:** {n}\n");
             }
             for (i, h) in hunks {
@@ -554,10 +575,22 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
                 let fe = fence(&diff);
                 if want == Decision::Edit {
                     let _ = writeln!(s, "Your version:\n{fe}diff\n{diff}{fe}\n");
-                    let body = if h.edit_buf.is_empty() { "(removed)\n".to_owned() } else { h.edit_buf.clone() };
-                    let body = if body.ends_with('\n') { body } else { body + "\n" };
+                    let body = if h.edit_buf.is_empty() {
+                        "(removed)\n".to_owned()
+                    } else {
+                        h.edit_buf.clone()
+                    };
+                    let body = if body.ends_with('\n') {
+                        body
+                    } else {
+                        body + "\n"
+                    };
                     let fe2 = fence(&body);
-                    let _ = writeln!(s, "Replaced by the reviewer with:\n{fe2}{}\n{body}{fe2}\n", f.ext());
+                    let _ = writeln!(
+                        s,
+                        "Replaced by the reviewer with:\n{fe2}{}\n{body}{fe2}\n",
+                        f.ext()
+                    );
                 } else {
                     let _ = writeln!(s, "{fe}diff\n{diff}{fe}\n");
                 }
@@ -570,14 +603,29 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
                 if !note.is_empty() {
                     let _ = writeln!(s, "**{label}:** {note}\n");
                 } else if want == Decision::Reject && note_here.is_none() {
-                    let _ = writeln!(s, "**{label}:** (no reason given; reconsider the approach)\n");
+                    let _ = writeln!(
+                        s,
+                        "**{label}:** (no reason given; reconsider the approach)\n"
+                    );
                 }
             }
         }
     };
-    section(&mut s, "Rejected (reverted in the working tree)", Decision::Reject);
-    section(&mut s, "Edited by the reviewer (already applied)", Decision::Edit);
-    section(&mut s, "Comments (kept changes are still unstaged; adjust as asked)", Decision::Comment);
+    section(
+        &mut s,
+        "Rejected (reverted in the working tree)",
+        Decision::Reject,
+    );
+    section(
+        &mut s,
+        "Edited by the reviewer (already applied)",
+        Decision::Edit,
+    );
+    section(
+        &mut s,
+        "Comments (kept changes are still unstaged; adjust as asked)",
+        Decision::Comment,
+    );
     Some(s)
 }
 
@@ -620,9 +668,21 @@ mod tests {
         let mut f = file(OLD, NEW);
         f.hunks[0].decision = Decision::Approve;
         f.hunks[1].decision = Decision::Reject;
-        let idx = mix(&f, |h| if h.decision == Decision::Approve { Pick::New } else { Pick::Old });
+        let idx = mix(&f, |h| {
+            if h.decision == Decision::Approve {
+                Pick::New
+            } else {
+                Pick::Old
+            }
+        });
         assert_eq!(idx.concat(), "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\n");
-        let wt = mix(&f, |h| if h.decision == Decision::Reject { Pick::Old } else { Pick::New });
+        let wt = mix(&f, |h| {
+            if h.decision == Decision::Reject {
+                Pick::Old
+            } else {
+                Pick::New
+            }
+        });
         assert_eq!(wt.concat(), OLD.replace("b\n", "B\n"));
         let all_new = mix(&f, |_| Pick::New);
         assert_eq!(all_new.concat(), NEW);
@@ -632,7 +692,13 @@ mod tests {
     fn edit_replaces_hunk() {
         let mut f = file(OLD, NEW);
         f.hunks[0].edit_buf = "XX\nYY".into();
-        let out = mix(&f, |h| if h.old.start == 1 { Pick::Custom(edited_lines(&f, h)) } else { Pick::Old });
+        let out = mix(&f, |h| {
+            if h.old.start == 1 {
+                Pick::Custom(edited_lines(&f, h))
+            } else {
+                Pick::Old
+            }
+        });
         assert_eq!(out.concat(), OLD.replace("b\n", "XX\nYY\n"));
     }
 
@@ -652,14 +718,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sh = |args: &[&str]| {
-            let ok = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
-            assert!(ok.status.success(), "{:?}", String::from_utf8_lossy(&ok.stderr));
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                ok.status.success(),
+                "{:?}",
+                String::from_utf8_lossy(&ok.stderr)
+            );
         };
         sh(&["init", "-q"]);
         std::fs::write(dir.join("t.txt"), OLD).unwrap();
         std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
         sh(&["add", "."]);
-        sh(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        sh(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
         std::fs::write(dir.join("t.txt"), NEW).unwrap();
         std::fs::write(dir.join("new.txt"), "fresh\n").unwrap();
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
@@ -690,8 +773,14 @@ mod tests {
         let f = file("a\nb\nc\nd\n", "a\nB\nC\nX\nd\n");
         let lines = &f.hunks[0].lines;
         let text = |i: Option<usize>| i.map(|i| lines[i].text.as_str()).unwrap_or("");
-        let rows: Vec<(&str, &str)> = split_pairs(lines).into_iter().map(|(l, r)| (text(l), text(r))).collect();
-        assert_eq!(rows, [("a", "a"), ("b", "B"), ("c", "C"), ("", "X"), ("d", "d")]);
+        let rows: Vec<(&str, &str)> = split_pairs(lines)
+            .into_iter()
+            .map(|(l, r)| (text(l), text(r)))
+            .collect();
+        assert_eq!(
+            rows,
+            [("a", "a"), ("b", "B"), ("c", "C"), ("", "X"), ("d", "d")]
+        );
         // only removals
         let g = file("a\nb\nc\n", "a\nc\n");
         let pairs = split_pairs(&g.hunks[0].lines);
@@ -741,7 +830,10 @@ mod tests {
         g.file_mode = Some(Decision::Comment);
         g.note = "split this module later".into();
         let m = feedback(std::slice::from_ref(&g), "").unwrap();
-        assert!(m.contains("About the whole file:** split this module later"), "{m}");
+        assert!(
+            m.contains("About the whole file:** split this module later"),
+            "{m}"
+        );
     }
 
     #[test]
