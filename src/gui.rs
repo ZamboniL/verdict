@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! egui review window.
 
-use crate::highlight::{Line, Registry};
+use crate::frontend::{Mode, Outcome, REG, hl_jobs, run_highlighter};
+use crate::highlight::Line;
 use crate::model::{self, Decision, FileDiff, FileHl, Hunk, Kind};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Event, FontId, Key, Modifiers, Rect, RichText, Sense,
@@ -11,52 +12,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::sync::mpsc;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Launched by the Claude Code Stop hook: feedback goes back to the agent.
-    Hook,
-    /// Launched by hand: feedback is printed / copied.
-    Manual,
-}
-
-pub struct Outcome {
-    pub message: Option<String>,
-}
-
-/// Files longer than this are only partly highlighted.
-const MAX_HL_LINES: usize = 50_000;
-
-/// Loaded once, in the background, so the window appears instantly.
-static REG: OnceLock<Registry> = OnceLock::new();
-
-struct HlJob {
-    file: usize,
-    path: String,
-    old: Vec<String>,
-    new: Vec<String>,
-    upto: (usize, usize),
-}
-
-fn run_highlighter(jobs: Vec<HlJob>, tx: mpsc::Sender<(usize, FileHl)>, ctx: egui::Context) {
-    let reg = REG.get_or_init(Registry::load);
-    ctx.request_repaint();
-    for j in jobs {
-        let first = j.new.first().or(j.old.first()).map(String::as_str);
-        let Some(syn) = reg.syntax_for(&j.path, first) else { continue };
-        let hl = FileHl {
-            lang: syn.name.clone(),
-            old: reg.highlight(syn, &j.old, j.upto.0),
-            new: reg.highlight(syn, &j.new, j.upto.1),
-        };
-        if tx.send((j.file, hl)).is_err() {
-            return;
-        }
-        ctx.request_repaint();
-    }
-}
 
 mod pal {
     use super::Color32;
@@ -107,20 +63,9 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
-            let jobs = files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| !f.binary)
-                .map(|(i, f)| HlJob {
-                    file: i,
-                    path: f.path.clone(),
-                    old: f.old.clone(),
-                    new: f.new.clone(),
-                    upto: (f.old.len().min(MAX_HL_LINES), f.new.len().min(MAX_HL_LINES)),
-                })
-                .collect();
+            let jobs = hl_jobs(&files);
             let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || run_highlighter(jobs, tx, ctx));
+            std::thread::spawn(move || run_highlighter(jobs, tx, move || ctx.request_repaint()));
             let flat = files
                 .iter()
                 .enumerate()
