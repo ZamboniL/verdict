@@ -31,6 +31,8 @@ verdict does one job:
 ## Features
 
 - Approve, reject, edit or comment on each **hunk**.
+- **Comment on single lines or line ranges.** The comment sits under its lines,
+  and the agent gets the exact lines quoted with it.
 - Approve, reject or comment on a **whole file**. A whole-file rejection carries
   one reason for all its hunks.
 - Edit hunks inline. The agent sees exactly what you changed.
@@ -196,6 +198,7 @@ in the environment to turn verdict off for a session.
 | Reject (revert it, with a reason) | `r` | `Shift+R` |
 | Edit inline | `e` | — |
 | Comment (keep it, send a note) | `c` | `Shift+C` |
+| Comment on lines | `v`, then `c` | — |
 
 | Key | Does |
 |---|---|
@@ -204,6 +207,7 @@ in the environment to turn verdict off for a session.
 | `g` / `G` | first / last hunk |
 | `n` | jump to the next undecided hunk |
 | `x` | clear the hunk's decision |
+| `v` | line mode: pick lines to comment on |
 | `f` | show the whole file around its hunks |
 | `s` | split view: old and new side by side |
 | `t` | what the agent said (reviews opened by the hook) |
@@ -214,6 +218,20 @@ in the environment to turn verdict off for a session.
 The terminal interface adds `Enter` (write the note), `m` (general message) and
 `q` (quit). `?` lists them all. To start in the split view, set `layout = "split"`
 in the `[ui]` section of `config.toml`.
+
+### Commenting on lines
+
+Press **v** to pick lines in the selected hunk, or click a line number (Shift+click
+for a range). In line mode, `j` / `k` move line by line, across hunks, and
+`J` / `K` extend the selection. Press **c** or **Enter** to write a comment on the
+picked lines, and **Esc** to leave line mode. Picking a single line inside an
+existing comment opens that comment again.
+
+A line comment on an undecided hunk marks it as commented, so the change stays
+unstaged. On an approved hunk it stays approved, and the comment is still sent.
+Comments you leave empty are dropped.
+
+### Decisions
 
 Pressing an active decision again clears it. **Approve file** folds the card and
 moves on to the next undecided file. Hunks you leave undecided stay as they are,
@@ -239,6 +257,15 @@ Hunk 1/2 @@ -15,6 +15,7 @@
 **Why it was rejected:** Remove the debug println, use the tracing crate if you need logs here.
 ````
 
+A line comment is quoted with its lines:
+
+````markdown
+**On line 16:** This can underflow when `rate` is 0.
+```diff
++        self.tokens -= self.rate;
+```
+````
+
 ## How it works
 
 **The git index is the "approved" state.** verdict compares the index with your
@@ -257,7 +284,7 @@ added file when at least half their lines match, like git's own rename detection
 and shows the pair as one renamed file. Approving any of its hunks stages the move.
 Rejecting all of them moves the file back.
 
-**Unsubmitted reviews.** Your decisions, notes and edits are saved in
+**Unsubmitted reviews.** Your decisions, notes, edits and comments are saved in
 `.git/verdict/draft.json` as you go. If verdict closes before you submit, the next
 review of the same diff starts where you left off. A draft only comes back for
 files whose content is exactly what you reviewed. Submitting removes the draft,
@@ -366,6 +393,8 @@ verdict init       create the config directory with an example config.toml
 - **Two sessions running shell commands in the same repo at the same time** can
   still see each other's edits. A shell command could have touched any file, so
   verdict can't attribute those edits to one session.
+- **Line comments** can only point at lines inside a hunk, not at the unchanged
+  code shown by the full-file view.
 - **Symlinks and submodules** are skipped. **Binary files** can be approved or
   rejected as a whole, but not edited.
 - **Rejecting part of a change can leave code that doesn't build.** For example,

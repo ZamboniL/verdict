@@ -40,6 +40,12 @@ impl DLine {
             emph: Vec::new(),
         }
     }
+
+    /// A line of the file (not a placeholder such as a binary file's summary), so a
+    /// comment can point at it.
+    pub fn is_code(&self) -> bool {
+        self.old_no.is_some() || self.new_no.is_some()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
@@ -50,6 +56,15 @@ pub enum Decision {
     Reject,
     Edit,
     Comment,
+}
+
+/// A comment on some of a hunk's lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineComment {
+    /// First and last line it covers, as indices into the hunk's `lines`.
+    pub first: usize,
+    pub last: usize,
+    pub text: String,
 }
 
 pub struct Hunk {
@@ -64,6 +79,32 @@ pub struct Hunk {
     pub decision: Decision,
     pub note: String,
     pub edit_buf: String,
+    /// Comments on single lines or line ranges, kept in the order they were added.
+    pub comments: Vec<LineComment>,
+}
+
+impl Hunk {
+    /// Line comments that have something written in them.
+    pub fn written_comments(&self) -> impl Iterator<Item = &LineComment> {
+        self.comments.iter().filter(|c| !c.text.trim().is_empty())
+    }
+
+    /// "line 12", "lines 12-14", or "removed line 7" when the lines exist only on the
+    /// old side.
+    pub fn lines_label(&self, first: usize, last: usize) -> String {
+        let span = self.lines.get(first..=last).unwrap_or_default();
+        let new: Vec<usize> = span.iter().filter_map(|l| l.new_no).collect();
+        let (nums, side) = if new.is_empty() {
+            (span.iter().filter_map(|l| l.old_no).collect(), "removed ")
+        } else {
+            (new, "")
+        };
+        match (nums.first(), nums.last()) {
+            (Some(a), Some(b)) if a == b => format!("{side}line {a}"),
+            (Some(a), Some(b)) => format!("{side}lines {a}-{b}"),
+            _ => "lines".into(),
+        }
+    }
 }
 
 pub struct FileDiff {
@@ -379,6 +420,7 @@ fn build(
             decision: Decision::Pending,
             note: String::new(),
             edit_buf: String::new(),
+            comments: Vec::new(),
         });
         return Some(f);
     }
@@ -403,6 +445,7 @@ fn build(
             decision: Decision::Pending,
             note: String::new(),
             edit_buf: String::new(),
+            comments: Vec::new(),
         });
     }
     Some(f)
@@ -465,6 +508,7 @@ pub fn compute_hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
             lines,
             decision: Decision::Pending,
             note: String::new(),
+            comments: Vec::new(),
         });
     }
     hunks
@@ -775,8 +819,12 @@ fn fence(body: &str) -> &'static str {
 }
 
 fn hunk_diff(h: &Hunk) -> String {
+    lines_diff(&h.lines)
+}
+
+fn lines_diff(lines: &[DLine]) -> String {
     let mut s = String::new();
-    for l in &h.lines {
+    for l in lines {
         let p = match l.kind {
             Kind::Ctx => ' ',
             Kind::Del => '-',
@@ -812,6 +860,14 @@ pub fn counts(files: &[FileDiff]) -> Counts {
     c
 }
 
+/// Some hunk has a line comment with text in it.
+pub fn has_line_comments(files: &[FileDiff]) -> bool {
+    files
+        .iter()
+        .flat_map(|f| &f.hunks)
+        .any(|h| h.written_comments().next().is_some())
+}
+
 /// The message handed back to the agent. `None` when there's nothing to act on.
 /// For a read-only `source` (staged changes, a commit range) nothing was changed in
 /// git, and the message says so.
@@ -819,7 +875,10 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
     let c = counts(files);
     let general = general.trim();
     let file_notes = files.iter().filter(|f| f.file_note().is_some()).count();
-    if c.reject + c.edit + c.comment + file_notes == 0 && general.is_empty() {
+    if c.reject + c.edit + c.comment + file_notes == 0
+        && general.is_empty()
+        && !has_line_comments(files)
+    {
         return None;
     }
     let read_only = source.read_only();
@@ -867,7 +926,14 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
                 .hunks
                 .iter()
                 .enumerate()
-                .filter(|(_, h)| h.decision == want)
+                .filter(|(_, h)| {
+                    h.decision == want
+                        // Line comments on a hunk that's approved or undecided go
+                        // with the comments.
+                        || (want == Decision::Comment
+                            && matches!(h.decision, Decision::Approve | Decision::Pending)
+                            && h.written_comments().next().is_some())
+                })
                 .collect();
             let note_here = match want {
                 Decision::Reject => note_in_reject(f).then(|| f.file_note()).flatten(),
@@ -915,10 +981,16 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
                 let _ = writeln!(s, "**{label}:** {n}\n");
             }
             for (i, h) in hunks {
+                let state = match (want, h.decision) {
+                    (Decision::Comment, Decision::Approve) if read_only => " (approved)",
+                    (Decision::Comment, Decision::Approve) => " (approved and staged)",
+                    (Decision::Comment, Decision::Pending) => " (not reviewed yet)",
+                    _ => "",
+                };
                 if total > 1 {
-                    let _ = writeln!(s, "Hunk {}/{total} {}\n", i + 1, h.header);
+                    let _ = writeln!(s, "Hunk {}/{total} {}{state}\n", i + 1, h.header);
                 } else {
-                    let _ = writeln!(s, "{}\n", h.header);
+                    let _ = writeln!(s, "{}{state}\n", h.header);
                 }
                 let diff = hunk_diff(h);
                 let fe = fence(&diff);
@@ -951,10 +1023,23 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
                 };
                 if !note.is_empty() {
                     let _ = writeln!(s, "**{label}:** {note}\n");
-                } else if want == Decision::Reject && note_here.is_none() {
+                } else if want == Decision::Reject
+                    && note_here.is_none()
+                    && h.written_comments().next().is_none()
+                {
                     let _ = writeln!(
                         s,
                         "**{label}:** (no reason given; reconsider the approach)\n"
+                    );
+                }
+                for c in h.written_comments() {
+                    let quote = lines_diff(&h.lines[c.first..=c.last.min(h.lines.len() - 1)]);
+                    let fe = fence(&quote);
+                    let _ = writeln!(
+                        s,
+                        "**On {}:** {}\n{fe}diff\n{quote}{fe}\n",
+                        h.lines_label(c.first, c.last),
+                        c.text.trim()
                     );
                 }
             }
@@ -1450,5 +1535,46 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_comments_in_feedback() {
+        let mut f = file(OLD, NEW);
+        // A note on an approved hunk's line goes with the comments.
+        f.hunks[0].decision = Decision::Approve;
+        let li = f.hunks[0]
+            .lines
+            .iter()
+            .position(|l| l.kind == Kind::Add)
+            .unwrap();
+        f.hunks[0].comments.push(LineComment {
+            first: li,
+            last: li,
+            text: "nice".into(),
+        });
+        // A rejected hunk with only a line comment doesn't claim "no reason".
+        f.hunks[1].decision = Decision::Reject;
+        f.hunks[1].comments.push(LineComment {
+            first: 0,
+            last: 2,
+            text: "not here".into(),
+        });
+        let m = feedback(std::slice::from_ref(&f), "", &git::Source::Worktree).unwrap();
+        assert!(
+            m.contains("Hunk 1/2 @@ -1,5 +1,5 @@ (approved and staged)"),
+            "{m}"
+        );
+        assert!(m.contains("**On line 2:** nice\n```diff\n+B\n```"), "{m}");
+        assert!(m.contains("**On lines 9-11:** not here"), "{m}");
+        assert!(!m.contains("no reason given"), "{m}");
+        // Empty comments don't count.
+        let mut g = file(OLD, NEW);
+        g.hunks[0].decision = Decision::Approve;
+        g.hunks[0].comments.push(LineComment {
+            first: 0,
+            last: 0,
+            text: "  ".into(),
+        });
+        assert!(feedback(std::slice::from_ref(&g), "", &git::Source::Worktree).is_none());
     }
 }

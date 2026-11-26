@@ -53,7 +53,7 @@ and set up the hooks as described in the README.
 | `src/git.rs` | thin wrapper over the `git` CLI (no libgit2) |
 | `src/model.rs` | diffs, hunks, applying decisions, the feedback message |
 | `src/session.rs` | per-session turn snapshots, transcript analysis |
-| `src/review.rs` | review state shared by both interfaces: decisions, selection, folds |
+| `src/review.rs` | review state shared by both interfaces: decisions, selection, folds, line mode |
 | `src/draft.rs` | saving unsubmitted reviews and restoring them |
 | `src/frontend.rs` | choosing the window or the terminal, the background highlighter |
 | `src/gui.rs` | the egui review window |

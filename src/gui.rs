@@ -380,6 +380,7 @@ pub fn run(repo: PathBuf, mut review: Review, mode: Mode) -> Result<Option<Outco
                 capture,
                 drafts,
                 notice,
+                focus_line: None,
             }))
         }),
     )
@@ -547,6 +548,8 @@ struct App {
     drafts: Drafts,
     /// Something to tell the reviewer, shown in the bottom bar until dismissed.
     notice: Option<String>,
+    /// Focus this line comment's text box: file, hunk, comment.
+    focus_line: Option<(usize, usize, usize)>,
 }
 
 impl App {
@@ -556,7 +559,15 @@ impl App {
             Effect::HunkNote(..) => self.focus_note = true,
             Effect::EditHunk(..) => self.focus_edit = true,
             Effect::FileNote(fi) => self.focus_file_note = Some(fi),
-            Effect::None | Effect::Binary | Effect::ReadOnly => {}
+            Effect::LineNote(fi, hi, ci) => self.focus_line = Some((fi, hi, ci)),
+            Effect::NoLines => self.notice = Some("This hunk has no lines to comment on.".into()),
+            Effect::Binary => {
+                self.notice = Some(
+                    "Binary file: it can't be edited, shown in full or commented on by line."
+                        .into(),
+                )
+            }
+            Effect::None | Effect::ReadOnly => {}
         }
     }
 
@@ -597,8 +608,26 @@ impl App {
         let shifted = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, k));
         let cur = self.r.cur_file();
         let mut handled = true;
+        let line_mode = self.r.lines.is_some();
+        // Line mode: j/k move by line, J/K extend, c or Enter comments.
+        if line_mode && shifted(Key::J) {
+            self.r.move_line(true, true);
+        } else if line_mode && shifted(Key::K) {
+            self.r.move_line(false, true);
+        } else if line_mode && (pressed(Key::J) || pressed(Key::ArrowDown)) {
+            self.r.move_line(true, false);
+        } else if line_mode && (pressed(Key::K) || pressed(Key::ArrowUp)) {
+            self.r.move_line(false, false);
+        } else if line_mode && (pressed(Key::C) || pressed(Key::Enter)) {
+            let e = self.r.comment_lines();
+            self.effect(e);
+        } else if line_mode && pressed(Key::Escape) {
+            self.r.lines = None;
+        } else if pressed(Key::V) {
+            let e = self.r.toggle_lines();
+            self.effect(e);
         // Shift variants first: plain-key matching ignores Shift.
-        if let (Some(fi), true) = (cur, shifted(Key::A)) {
+        } else if let (Some(fi), true) = (cur, shifted(Key::A)) {
             self.file_action(fi, Decision::Approve);
         } else if let (Some(fi), true) = (cur, shifted(Key::R)) {
             self.file_action(fi, Decision::Reject);
@@ -762,6 +791,37 @@ impl App {
                 self.notice = None;
             }
         }
+        if let Some(l) = self.r.lines {
+            let (a, b) = l.range();
+            let what = self.r.files[l.fi].hunks[l.hi].lines_label(a, b);
+            let (mut comment, mut done) = (false, false);
+            ui.horizontal(|ui| {
+                let mut label = what.clone();
+                if let Some(c) = label.get_mut(..1) {
+                    c.make_ascii_uppercase();
+                }
+                pill(ui, &format!("Picked: {label}"), pal::ACCENT);
+                comment = button(
+                    ui,
+                    "Comment",
+                    Some("c"),
+                    Look::Tinted(pal::AMBER),
+                    false,
+                    true,
+                )
+                .clicked();
+                done = button(ui, "Done", Some("Esc"), Look::Plain, false, true).clicked();
+                key_hint(ui, "j k", "move");
+                key_hint(ui, "J K", "extend");
+                key_hint(ui, "Shift+click", "extend");
+            });
+            if comment {
+                let e = self.r.comment_lines();
+                self.effect(e);
+            } else if done {
+                self.r.lines = None;
+            }
+        }
         note_box(
             ui,
             &mut self.r.general,
@@ -775,6 +835,7 @@ impl App {
             key_hint(ui, "a r e c", "approve · reject · edit · comment");
             key_hint(ui, "A R C", "whole file");
             key_hint(ui, "x", "clear");
+            key_hint(ui, "v", "lines");
             key_hint(ui, "n", "next pending");
             key_hint(ui, "[ ]", "files");
             key_hint(ui, "f", "full file");
@@ -932,6 +993,10 @@ impl App {
         let mut file_act: Option<(usize, Decision)> = None;
         let mut toggle_fold: Option<usize> = None;
         let mut full_toggle: Option<usize> = None;
+        let mut line_click: Option<(usize, usize, usize, bool)> = None;
+        let mut remove_comment: Option<(usize, usize, usize)> = None;
+        let lines_sel = self.r.lines;
+        let shift = ui.input(|i| i.modifiers.shift);
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             // Headers and notes stay within the window even when code scrolls sideways.
@@ -1183,12 +1248,25 @@ impl App {
                         focus_edit: false,
                         split,
                         gap: true,
+                        picked: None,
+                        cursor: None,
+                        scroll_to_cursor: false,
+                        focus_comment: None,
                     };
                     for (hi, h) in hunks.iter_mut().enumerate() {
                         if let Some(g) = gaps.and_then(|g| g.get(hi)) {
                             gap_ui(ui, g, &gap_ctx);
                         }
                         let selected = sel_pair == Some((fi, hi));
+                        let here = lines_sel.filter(|l| (l.fi, l.hi) == (fi, hi));
+                        let scroll_to_cursor = here.is_some() && selected && self.scroll_to_sel;
+                        let focus_comment = match self.focus_line {
+                            Some((f2, h2, ci)) if (f2, h2) == (fi, hi) => {
+                                self.focus_line = None;
+                                Some(ci)
+                            }
+                            _ => None,
+                        };
                         let ctx = HunkCtx {
                             hl: hl.as_ref(),
                             editable: !binary && !read_only,
@@ -1209,10 +1287,23 @@ impl App {
                             focus_edit: selected && std::mem::take(&mut self.focus_edit),
                             split,
                             gap: false,
+                            picked: here.map(|l| l.range()),
+                            cursor: here.map(|l| l.cursor),
+                            scroll_to_cursor,
+                            focus_comment,
                         };
                         let out = hunk_ui(ui, h, ctx);
+                        if scroll_to_cursor {
+                            self.scroll_to_sel = false;
+                        }
                         if out.clicked {
                             new_sel = Some((fi, hi));
+                        }
+                        if let Some(li) = out.line_click {
+                            line_click = Some((fi, hi, li, shift));
+                        }
+                        if let Some(ci) = out.remove_comment {
+                            remove_comment = Some((fi, hi, ci));
                         }
                         if let Some(d) = out.action {
                             new_sel = Some((fi, hi));
@@ -1276,6 +1367,12 @@ impl App {
         }
         if let Some((fi, hi)) = new_sel {
             self.r.select_quietly(fi, hi);
+        }
+        if let Some((fi, hi, li, extend)) = line_click {
+            self.r.click_line(fi, hi, li, extend);
+        }
+        if let Some((fi, hi, ci)) = remove_comment {
+            self.r.remove_comment(fi, hi, ci);
         }
         if let Some(d) = action {
             self.set_decision(d);
@@ -1517,17 +1614,39 @@ struct HunkCtx<'a> {
     split: bool,
     /// Unchanged code between hunks (full-file view): drawn quieter.
     gap: bool,
+    /// Lines picked for a comment in this hunk (first, last), and the line cursor.
+    picked: Option<(usize, usize)>,
+    cursor: Option<usize>,
+    /// Scroll the line cursor into view.
+    scroll_to_cursor: bool,
+    /// Focus this line comment's text box.
+    focus_comment: Option<usize>,
 }
 
 struct HunkOut {
     rect: Rect,
     clicked: bool,
     action: Option<Decision>,
+    /// A line number was clicked: pick that line.
+    line_click: Option<usize>,
+    /// A line comment's Delete button was clicked.
+    remove_comment: Option<usize>,
+}
+
+/// What a block of rows reports back.
+#[derive(Default)]
+struct RowsOut {
+    /// Clicked outside the line numbers.
+    clicked: bool,
+    /// Clicked a line number: that hunk line.
+    line: Option<usize>,
 }
 
 fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
     let mut clicked = false;
     let mut action = None;
+    let mut line_click = None;
+    let mut remove_comment = None;
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let inner = ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -1582,8 +1701,36 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
                 });
             });
 
-        if diff_lines(ui, &h.lines, &c).clicked() {
-            clicked = true;
+        // Rows, cut after each line that ends a comment so the comment sits under it.
+        let rows: Vec<model::Pair> = if c.split {
+            model::split_pairs(&h.lines)
+        } else {
+            (0..h.lines.len()).map(|i| (Some(i), Some(i))).collect()
+        };
+        let mut commented = vec![false; h.lines.len()];
+        for cm in &h.comments {
+            for flag in commented.iter_mut().take(cm.last + 1).skip(cm.first) {
+                *flag = true;
+            }
+        }
+        let mut start = 0;
+        for r in 0..rows.len() {
+            let (a, b) = rows[r];
+            let ends: Vec<usize> = (0..h.comments.len())
+                .filter(|&ci| [a, b].contains(&Some(h.comments[ci].last)))
+                .collect();
+            if ends.is_empty() && r + 1 < rows.len() {
+                continue;
+            }
+            let out = rows_ui(ui, &h.lines, &rows[start..=r], &c, &commented);
+            clicked |= out.clicked;
+            line_click = line_click.or(out.line);
+            start = r + 1;
+            for ci in ends {
+                if comment_ui(ui, h, ci, &c) {
+                    remove_comment = Some(ci);
+                }
+            }
         }
 
         if h.decision == Decision::Pending || h.decision == Decision::Approve {
@@ -1612,13 +1759,18 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
                         );
                     }
                     Decision::Reject | Decision::Comment => {
-                        let (title, hint) = if h.decision == Decision::Reject {
-                            (
+                        let has_lines = !h.comments.is_empty();
+                        let (title, hint) = match (h.decision, has_lines) {
+                            (Decision::Reject, false) => (
                                 "WHY IT'S REJECTED",
                                 "What should it do instead? Sent to the agent",
-                            )
-                        } else {
-                            ("COMMENT", "Sent to the agent")
+                            ),
+                            (Decision::Reject, true) => (
+                                "WHY IT'S REJECTED",
+                                "Optional with line comments: a reason for the whole hunk",
+                            ),
+                            (_, false) => ("COMMENT", "Sent to the agent"),
+                            (_, true) => ("COMMENT ON THE HUNK", "Optional: about the whole hunk"),
                         };
                         caption(ui, title, col);
                         let r = note_box(ui, &mut h.note, hint, col, 2);
@@ -1688,34 +1840,153 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
         rect,
         clicked,
         action,
+        line_click,
+        remove_comment,
     }
+}
+
+/// A line comment under the line it ends on. True if its Delete button was clicked.
+fn comment_ui(ui: &mut egui::Ui, h: &mut Hunk, ci: usize, c: &HunkCtx) -> bool {
+    let label = h.lines_label(h.comments[ci].first, h.comments[ci].last);
+    let mut delete = false;
+    egui::Frame::new()
+        .fill(tint(pal::CARD, pal::AMBER, 0.05))
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 12,
+            top: 6,
+            bottom: 8,
+        })
+        .show(ui, |ui| {
+            ui.set_max_width(c.view_w - 28.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                caption(
+                    ui,
+                    &format!("COMMENT ON {}", label.to_uppercase()),
+                    pal::AMBER,
+                );
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    delete = button(ui, "Delete", None, Look::Plain, false, true).clicked();
+                });
+            });
+            let r = note_box(
+                ui,
+                &mut h.comments[ci].text,
+                "Sent to the agent with these lines",
+                pal::AMBER,
+                2,
+            );
+            if c.focus_comment == Some(ci) {
+                r.request_focus();
+            }
+        });
+    delete
 }
 
 /// Unchanged lines shown between hunks in the full-file view.
 fn gap_ui(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) {
     if !lines.is_empty() {
-        diff_lines(ui, lines, c);
+        let rows: Vec<_> = (0..lines.len()).map(|i| (Some(i), Some(i))).collect();
+        rows_ui(ui, lines, &rows, c, &[]);
     }
 }
 
-fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
-    if c.split {
-        return split_lines(ui, lines, c);
+/// Some rows of a hunk: `rows` index into `lines`, the same line twice in the unified
+/// view, old and new side in the split view. `commented` flags lines with a comment.
+fn rows_ui(
+    ui: &mut egui::Ui,
+    lines: &[model::DLine],
+    rows: &[model::Pair],
+    c: &HunkCtx,
+    commented: &[bool],
+) -> RowsOut {
+    let (resp, rect, gutters) = if c.split {
+        split_lines(ui, lines, rows, c, commented)
+    } else {
+        diff_lines(ui, lines, rows, c, commented)
+    };
+    let mut out = RowsOut::default();
+    if !resp.clicked() {
+        return out;
     }
+    let Some(pos) = resp.interact_pointer_pos() else {
+        return out;
+    };
+    let row = (((pos.y - rect.top()) / c.row_h) as usize).min(rows.len().saturating_sub(1));
+    let (left, right) = rows.get(row).copied().unwrap_or_default();
+    // Line numbers pick lines, like on a code host; elsewhere selects the hunk.
+    out.line = match gutters.iter().position(|g| g.contains(pos.x)) {
+        Some(0) => left.or(right),
+        Some(_) => right.or(left),
+        None => None,
+    }
+    .filter(|&li| lines[li].is_code() && !c.gap);
+    out.clicked = out.line.is_none();
+    out
+}
+
+/// Accent shading over a picked line, and the line cursor's bar at its left edge.
+fn paint_pick(p: &egui::Painter, row: Rect, picked: bool, cursor: bool) {
+    if picked {
+        p.rect_filled(
+            row,
+            0,
+            Color32::from_rgba_unmultiplied(0x8b, 0x9c, 0xff, 34),
+        );
+    }
+    if cursor {
+        p.rect_filled(
+            Rect::from_min_size(row.min, vec2(3.0, row.height())),
+            0,
+            pal::ACCENT,
+        );
+    }
+}
+
+impl HunkCtx<'_> {
+    fn is_picked(&self, li: usize) -> bool {
+        self.picked.is_some_and(|(a, b)| (a..=b).contains(&li))
+    }
+}
+
+/// Unified rows. Returns the response, the rect, and the x span of the line numbers.
+fn diff_lines(
+    ui: &mut egui::Ui,
+    lines: &[model::DLine],
+    rows: &[model::Pair],
+    c: &HunkCtx,
+    commented: &[bool],
+) -> (egui::Response, Rect, Vec<egui::Rangef>) {
     let num_w = c.digits as f32 * c.char_w + 14.0;
     let gutter = num_w * 2.0;
     let width =
         (gutter + 8.0 + c.char_w * 2.0 + c.widest * c.char_w + 16.0).max(ui.available_width());
     let (rect, resp) =
-        ui.allocate_exact_size(vec2(width, c.row_h * lines.len() as f32), Sense::click());
+        ui.allocate_exact_size(vec2(width, c.row_h * rows.len() as f32), Sense::click());
+    let gutters = vec![egui::Rangef::new(rect.left(), rect.left() + gutter)];
+    let hovering_gutter = resp
+        .hover_pos()
+        .is_some_and(|p| gutters[0].contains(p.x) && !c.gap);
+    let resp = if hovering_gutter {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Click to comment on this line, Shift+click for a range")
+    } else {
+        resp.on_hover_cursor(egui::CursorIcon::Default)
+    };
     if !ui.is_rect_visible(rect) {
-        return resp;
+        return (resp, rect, gutters);
     }
     let mut painter = ui.painter().clone();
     let clip = ui.clip_rect();
-    for (i, l) in lines.iter().enumerate() {
+    for (i, &(li, _)) in rows.iter().enumerate() {
+        let Some(li) = li else { continue };
+        let l = &lines[li];
         let top = rect.top() + i as f32 * c.row_h;
         let row = Rect::from_min_size(pos2(rect.left(), top), vec2(width, c.row_h));
+        if c.scroll_to_cursor && c.cursor == Some(li) {
+            ui.scroll_to_rect(row, None);
+        }
         if !clip.intersects(row) {
             continue;
         }
@@ -1760,8 +2031,12 @@ fn diff_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::R
             c,
         );
         painter.set_opacity(1.0);
+        if commented.get(li).copied().unwrap_or(false) {
+            painter.circle_filled(pos2(rect.left() + 7.0, cy), 3.0, pal::AMBER);
+        }
+        paint_pick(&painter, row, c.is_picked(li), c.cursor == Some(li));
     }
-    resp.on_hover_cursor(egui::CursorIcon::Default)
+    (resp, rect, gutters)
 }
 
 /// Gutter background, code background and line-number color for a row.
@@ -1786,8 +2061,13 @@ fn row_colors(k: Kind, gap: bool) -> (Color32, Option<Color32>, Color32) {
 
 /// Side-by-side rows: each half has its own line number, sign and code, and grows
 /// to fit the card's longest line (the scroll area scrolls sideways past that).
-fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::Response {
-    let pairs = model::split_pairs(lines);
+fn split_lines(
+    ui: &mut egui::Ui,
+    lines: &[model::DLine],
+    pairs: &[model::Pair],
+    c: &HunkCtx,
+    commented: &[bool],
+) -> (egui::Response, Rect, Vec<egui::Rangef>) {
     let num_w = c.digits as f32 * c.char_w + 14.0;
     let half =
         (num_w + 8.0 + c.char_w * 2.0 + c.widest * c.char_w + 16.0).max(ui.available_width() / 2.0);
@@ -1795,13 +2075,32 @@ fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::
         vec2(half * 2.0, c.row_h * pairs.len() as f32),
         Sense::click(),
     );
+    let gutters = vec![
+        egui::Rangef::new(rect.left(), rect.left() + num_w),
+        egui::Rangef::new(rect.left() + half, rect.left() + half + num_w),
+    ];
+    let resp = if resp
+        .hover_pos()
+        .is_some_and(|p| gutters.iter().any(|g| g.contains(p.x)) && !c.gap)
+    {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Click to comment on this line, Shift+click for a range")
+    } else {
+        resp
+    };
     if !ui.is_rect_visible(rect) {
-        return resp;
+        return (resp, rect, gutters);
     }
     let clip = ui.clip_rect();
-    let painter = ui.painter();
+    let painter = ui.painter().clone();
     for (i, &(left, right)) in pairs.iter().enumerate() {
         let top = rect.top() + i as f32 * c.row_h;
+        if c.scroll_to_cursor && c.cursor.is_some() && [left, right].contains(&c.cursor) {
+            ui.scroll_to_rect(
+                Rect::from_min_size(pos2(rect.left(), top), vec2(half * 2.0, c.row_h)),
+                None,
+            );
+        }
         for (side, idx) in [(0.0, left), (1.0, right)] {
             let x0 = rect.left() + side * half;
             let cell = Rect::from_min_size(pos2(x0, top), vec2(half, c.row_h));
@@ -1835,11 +2134,17 @@ fn split_lines(ui: &mut egui::Ui, lines: &[model::DLine], c: &HunkCtx) -> egui::
                 p.set_opacity(0.55);
             }
             paint_code(&p, pos2(x0 + num_w + 8.0, top + 2.5), c.char_w * 2.0, l, c);
+            p.set_opacity(1.0);
+            let li = idx.unwrap_or_default();
+            if commented.get(li).copied().unwrap_or(false) {
+                p.circle_filled(pos2(x0 + 7.0, cell.center().y), 3.0, pal::AMBER);
+            }
+            paint_pick(&p, cell, c.is_picked(li), c.cursor == Some(li));
         }
     }
     let mid = rect.left() + half;
     painter.vline(mid, rect.y_range(), Stroke::new(1.0, pal::BORDER));
-    resp
+    (resp, rect, gutters)
 }
 
 fn max_chars<'a>(lines: impl Iterator<Item = &'a model::DLine>) -> f32 {

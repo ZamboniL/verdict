@@ -39,6 +39,8 @@ mod pal {
     /// The words that changed inside an added / removed line.
     pub const ADD_EMPH: Color = Color::Rgb(0x2c, 0x5c, 0x3c);
     pub const DEL_EMPH: Color = Color::Rgb(0x6e, 0x2e, 0x37);
+    /// Lines picked for a comment.
+    pub const PICKED: Color = Color::Rgb(0x34, 0x40, 0x6b);
     /// The empty side of a split row.
     pub const EMPTY: Color = Color::Rgb(0x1c, 0x1e, 0x24);
     pub const GREEN: Color = Color::Rgb(0x5f, 0xc2, 0x7e);
@@ -205,6 +207,8 @@ fn run_editor(tty: &mut Tty, text: &str, ext: &str) -> Result<String, String> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     Hunk(usize, usize),
+    /// A line comment: file, hunk, comment.
+    Line(usize, usize, usize),
     File(usize),
     General,
 }
@@ -256,6 +260,18 @@ struct Row {
     hi: Option<usize>,
 }
 
+impl Row {
+    /// The hunk lines this row shows, left and right: the same line twice in the
+    /// unified view.
+    fn lines(&self) -> model::Pair {
+        match self.kind {
+            RowKind::Diff(li) => (Some(li), Some(li)),
+            RowKind::SplitDiff(l, r) => (l, r),
+            _ => (None, None),
+        }
+    }
+}
+
 struct App {
     repo: PathBuf,
     r: Review,
@@ -271,7 +287,8 @@ struct App {
     // Layout from the last draw, for the mouse and paging.
     main_area: Rect,
     list_area: Rect,
-    visible: Vec<(usize, Option<usize>)>,
+    /// File, hunk and hunk lines (see `Row::lines`) of each visible row.
+    visible: Vec<(usize, Option<usize>, model::Pair)>,
     list_top: usize,
     drafts: Drafts,
 }
@@ -369,6 +386,7 @@ impl App {
     fn text_of(&self, t: Target) -> String {
         match t {
             Target::Hunk(fi, hi) => self.r.files[fi].hunks[hi].note.clone(),
+            Target::Line(fi, hi, ci) => self.r.files[fi].hunks[hi].comments[ci].text.clone(),
             Target::File(fi) => self.r.files[fi].note.clone(),
             Target::General => self.r.general.clone(),
         }
@@ -378,8 +396,23 @@ impl App {
         self.r.dirty = true;
         match t {
             Target::Hunk(fi, hi) => self.r.files[fi].hunks[hi].note = s,
+            Target::Line(fi, hi, ci) => {
+                self.r.files[fi].hunks[hi].comments[ci].text = s;
+                self.r.drop_if_empty(fi, hi, ci);
+            }
             Target::File(fi) => self.r.files[fi].note = s,
             Target::General => self.r.general = s,
+        }
+    }
+
+    /// Leave a text box without saving. A new line comment left empty goes away.
+    fn cancel_input(&mut self) {
+        if let State::Input(Input {
+            target: Target::Line(fi, hi, ci),
+            ..
+        }) = std::mem::replace(&mut self.state, State::Normal)
+        {
+            self.r.drop_if_empty(fi, hi, ci);
         }
     }
 
@@ -396,6 +429,8 @@ impl App {
             Effect::HunkNote(fi, hi) => self.open_input(Target::Hunk(fi, hi)),
             Effect::FileNote(fi) => self.open_input(Target::File(fi)),
             Effect::EditHunk(fi, hi) => return Action::EditHunk(fi, hi),
+            Effect::LineNote(fi, hi, ci) => self.open_input(Target::Line(fi, hi, ci)),
+            Effect::NoLines => self.info("this hunk has no lines to comment on"),
             Effect::Binary => self.info("binary file: it can't be edited or shown in full"),
             Effect::ReadOnly => self.info("this review is feedback only, so hunks can't be edited"),
         }
@@ -466,7 +501,12 @@ impl App {
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.key(k),
             Event::Mouse(m) => {
-                self.mouse(m.kind, m.column, m.row);
+                self.mouse(
+                    m.kind,
+                    m.column,
+                    m.row,
+                    m.modifiers.contains(KeyModifiers::SHIFT),
+                );
                 Action::None
             }
             _ => Action::None,
@@ -527,6 +567,27 @@ impl App {
             }
             State::Normal => {}
         }
+        if self.r.lines.is_some() {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    return self.lines(|r| r.move_line(true, false));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    return self.lines(|r| r.move_line(false, false));
+                }
+                KeyCode::Char('J') => return self.lines(|r| r.move_line(true, true)),
+                KeyCode::Char('K') => return self.lines(|r| r.move_line(false, true)),
+                KeyCode::Char('c') | KeyCode::Enter | KeyCode::Char('i') => {
+                    let e = self.r.comment_lines();
+                    return self.effect(e);
+                }
+                KeyCode::Esc => {
+                    self.r.lines = None;
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
         let page = (self.main_area.height as usize / 2).max(1);
         match k.code {
             KeyCode::Char('c') if ctrl => self.ask_quit(),
@@ -578,9 +639,18 @@ impl App {
                 }
             }
             KeyCode::Char('m') => self.open_input(Target::General),
+            KeyCode::Char('v') => {
+                let e = self.r.toggle_lines();
+                return self.effect(e);
+            }
             KeyCode::Enter | KeyCode::Char('i') => self.edit_note(),
             _ => {}
         }
+        Action::None
+    }
+
+    fn lines(&mut self, f: impl FnOnce(&mut Review)) -> Action {
+        f(&mut self.r);
         Action::None
     }
 
@@ -599,7 +669,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
-            KeyCode::Esc => self.state = State::Normal,
+            KeyCode::Esc => self.cancel_input(),
             KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => {
                 inp.buf.insert(inp.cur, '\n');
                 inp.cur += 1;
@@ -660,7 +730,7 @@ impl App {
         self.scroll = self.scroll.saturating_add_signed(d);
     }
 
-    fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
+    fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16, shift: bool) {
         let inside = |r: Rect| r.contains(Position { x, y });
         match kind {
             MouseEventKind::ScrollDown if inside(self.main_area) => self.scroll_by(3),
@@ -670,9 +740,14 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) if matches!(self.state, State::Normal) => {
                 if inside(self.main_area) {
                     let row = (y - self.main_area.y) as usize;
-                    match self.visible.get(row) {
-                        Some(&(fi, Some(hi))) => self.r.select_quietly(fi, hi),
-                        Some(&(fi, None)) => self.r.select_quietly(fi, 0),
+                    let col = x - self.main_area.x;
+                    match self.visible.get(row).copied() {
+                        Some((fi, Some(hi), sides)) => match self.gutter_hit(fi, col, sides) {
+                            // A line number: pick that line for a comment (Shift extends).
+                            Some(li) => self.r.click_line(fi, hi, li, shift),
+                            None => self.r.select_quietly(fi, hi),
+                        },
+                        Some((fi, None, _)) => self.r.select_quietly(fi, 0),
                         None => {}
                     }
                 } else if inside(self.list_area) {
@@ -683,6 +758,24 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The hunk line whose line number is at column `col` of a diff row, if any.
+    fn gutter_hit(&self, fi: usize, col: u16, (left, right): model::Pair) -> Option<usize> {
+        let f = &self.r.files[fi];
+        let digits = f.old.len().max(f.new.len()).to_string().len().max(3) as u16;
+        if !self.r.split {
+            // Bar, then " old new ".
+            return (col < 2 * digits + 4).then_some(left).flatten();
+        }
+        let lw = self.main_area.width.saturating_sub(2) / 2;
+        if col < digits + 3 {
+            left.or(right)
+        } else if col >= lw + 2 && col < lw + digits + 4 {
+            right.or(left)
+        } else {
+            None
         }
     }
 
@@ -923,8 +1016,26 @@ impl App {
                     hint(" m: write a general message to the agent (optional)")
                 };
                 f.render_widget(line, status);
+                if let Some(l) = self.r.lines {
+                    let (a, b) = l.range();
+                    let what = self.r.files[l.fi].hunks[l.hi].lines_label(a, b);
+                    f.render_widget(
+                        Line::from(vec![
+                            Span::styled(
+                                format!(" LINES {what} "),
+                                Style::new().fg(Color::Black).bg(pal::ACCENT),
+                            ),
+                            Span::styled(
+                                " j/k move · J/K extend · c/Enter comment · Esc done · a/r/e hunk",
+                                fg(pal::DIM),
+                            ),
+                        ]),
+                        keys,
+                    );
+                    return;
+                }
                 f.render_widget(
-                    hint(" j/k move · a/r/e/c hunk · A/R/C file · x clear · Enter note · f full file · s split · Space fold · n next pending · ? help · S submit · q quit"),
+                    hint(" j/k move · a/r/e/c hunk · A/R/C file · x clear · Enter note · v lines · f full file · s split · Space fold · n next pending · ? help · S submit · q quit"),
                     keys,
                 );
             }
@@ -938,6 +1049,11 @@ impl App {
                 Some(Decision::Reject) => "Why reject the whole file? ".into(),
                 _ => "Comment on the file: ".into(),
             },
+            Target::Line(fi, hi, ci) => {
+                let h = &self.r.files[fi].hunks[hi];
+                let c = &h.comments[ci];
+                format!("Comment on {}: ", h.lines_label(c.first, c.last))
+            }
             Target::Hunk(fi, hi) => {
                 let f = &self.r.files[fi];
                 let n = if f.hunks.len() > 1 {
@@ -984,18 +1100,31 @@ impl App {
                     rows.extend((0..g.len()).map(|li| row(RowKind::Gap(hi, li), None)));
                 }
                 rows.push(row(RowKind::HunkHeader, Some(hi)));
+                // Each line comment goes right under the last line it covers.
+                let comments_after = |rows: &mut Vec<Row>, ends: &[usize]| {
+                    for c in h.comments.iter().filter(|c| ends.contains(&c.last)) {
+                        let label = format!("{}: ", capitalize(&h.lines_label(c.first, c.last)));
+                        push_note(rows, fi, Some(hi), 6, &label, &c.text, pal::AMBER, text_w);
+                    }
+                };
                 if self.r.split {
-                    rows.extend(
-                        model::split_pairs(&h.lines)
-                            .into_iter()
-                            .map(|(l, r)| row(RowKind::SplitDiff(l, r), Some(hi))),
-                    );
+                    for (l, r) in model::split_pairs(&h.lines) {
+                        rows.push(row(RowKind::SplitDiff(l, r), Some(hi)));
+                        let ends: Vec<usize> = l.into_iter().chain(r).collect();
+                        comments_after(&mut rows, &ends);
+                    }
                 } else {
-                    rows.extend((0..h.lines.len()).map(|li| row(RowKind::Diff(li), Some(hi))));
+                    for li in 0..h.lines.len() {
+                        rows.push(row(RowKind::Diff(li), Some(hi)));
+                        comments_after(&mut rows, &[li]);
+                    }
                 }
                 let col = decision_color(h.decision);
                 match h.decision {
                     Decision::Reject if file_reason && h.note.trim().is_empty() => {}
+                    // Line comments carry it; don't nag for a hunk-wide note too.
+                    Decision::Reject | Decision::Comment
+                        if !h.comments.is_empty() && h.note.trim().is_empty() => {}
                     Decision::Reject | Decision::Comment => {
                         let label = if h.decision == Decision::Reject {
                             "Why: "
@@ -1067,7 +1196,26 @@ impl App {
                         r.fi == fi && (r.hi == Some(hi) || self.r.collapsed.contains(&fi))
                     })
                     .map(|(i, _)| i);
-                if let Some(first) = range.next() {
+                // In line mode, the cursor line is what has to be in view.
+                let cursor = self.r.lines.and_then(|l| {
+                    rows.iter().position(|r| {
+                        (r.fi, r.hi) == (l.fi, Some(l.hi))
+                            && match r.kind {
+                                RowKind::Diff(li) => li == l.cursor,
+                                RowKind::SplitDiff(a, b) => {
+                                    a == Some(l.cursor) || b == Some(l.cursor)
+                                }
+                                _ => false,
+                            }
+                    })
+                });
+                if let Some(at) = cursor {
+                    if at < self.scroll {
+                        self.scroll = at;
+                    } else if at + 1 > self.scroll + h {
+                        self.scroll = (at + 1).saturating_sub(h);
+                    }
+                } else if let Some(first) = range.next() {
                     let last = range.next_back().unwrap_or(first);
                     // Show the file header too when this is the file's first hunk.
                     let first = if hi == 0 || self.r.collapsed.contains(&fi) {
@@ -1092,7 +1240,7 @@ impl App {
                 height: 1,
                 ..area
             };
-            self.visible.push((r.fi, r.hi));
+            self.visible.push((r.fi, r.hi, r.lines()));
             let selected = sel.is_some() && sel.map(|p| (p.0, Some(p.1))) == Some((r.fi, r.hi));
             self.render_row(buf, rect, r, selected);
         }
@@ -1219,12 +1367,18 @@ impl App {
                 Line::from(badge).right_aligned().render(rect, buf);
             }
             RowKind::Diff(li) => {
-                let h = &f.hunks[r.hi.unwrap_or(0)];
+                let hi = r.hi.unwrap_or(0);
+                let h = &f.hunks[hi];
+                let bar = self.line_bar(r.fi, hi, &[*li], bar);
                 self.render_dline(buf, rect, bar, &h.lines[*li], f.hl.as_ref(), digits);
+                self.mark_line(buf, rect, r.fi, hi, &[*li]);
             }
             RowKind::SplitDiff(left, right) => {
-                let h = &f.hunks[r.hi.unwrap_or(0)];
+                let hi = r.hi.unwrap_or(0);
+                let h = &f.hunks[hi];
                 let pick = |i: &Option<usize>| i.map(|i| &h.lines[i]);
+                let both: Vec<usize> = left.iter().chain(right).copied().collect();
+                let bar = self.line_bar(r.fi, hi, &both, bar);
                 self.render_split(
                     buf,
                     rect,
@@ -1234,6 +1388,7 @@ impl App {
                     f.hl.as_ref(),
                     digits,
                 );
+                self.mark_line(buf, rect, r.fi, hi, &both);
             }
             RowKind::Gap(g, li) => {
                 if let Some(l) = self
@@ -1263,6 +1418,43 @@ impl App {
                 .render(rect, buf);
             }
             RowKind::Blank => {}
+        }
+    }
+
+    /// The selection bar, or the line cursor's arrow on the line it's on.
+    fn line_bar(&self, fi: usize, hi: usize, lis: &[usize], bar: Span<'static>) -> Span<'static> {
+        match self.r.lines {
+            Some(l) if (l.fi, l.hi) == (fi, hi) && lis.contains(&l.cursor) => {
+                Span::styled("▶", fg(pal::ACCENT))
+            }
+            _ => bar,
+        }
+    }
+
+    /// Shade lines picked for a comment; color the line numbers of commented lines.
+    fn mark_line(&self, buf: &mut Buffer, rect: Rect, fi: usize, hi: usize, lis: &[usize]) {
+        let rest = Rect {
+            x: rect.x + 1,
+            width: rect.width.saturating_sub(1),
+            ..rect
+        };
+        if self
+            .r
+            .lines
+            .is_some_and(|l| lis.iter().any(|&li| l.contains(fi, hi, li)))
+        {
+            buf.set_style(rest, Style::new().bg(pal::PICKED));
+        }
+        let h = &self.r.files[fi].hunks[hi];
+        if h.comments
+            .iter()
+            .any(|c| lis.iter().any(|li| (c.first..=c.last).contains(li)))
+        {
+            let gutter = Rect {
+                width: 1.min(rest.width),
+                ..rest
+            };
+            buf.set_string(gutter.x, gutter.y, "●", fg(pal::AMBER));
         }
     }
 
@@ -1502,6 +1694,14 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
 fn truncate_left(s: &str, room: usize) -> String {
     let n = s.chars().count();
     if n <= room {
@@ -1564,6 +1764,11 @@ fn help(f: &mut Frame, area: Rect) {
         ("r", "reject hunk (revert it) and give a reason"),
         ("e", "edit the hunk in $EDITOR"),
         ("c", "comment on the hunk"),
+        ("v", "line mode: pick lines to comment on (or click a line)"),
+        ("  j / k", "  move to the next / previous line"),
+        ("  J / K", "  extend the picked lines down / up"),
+        ("  c, Enter", "  comment on the picked lines"),
+        ("  Esc", "  leave line mode"),
         ("x", "clear the hunk's decision"),
         ("A / R / C", "approve / reject / comment on the whole file"),
         ("Enter, i", "write or change the note for the hunk or file"),

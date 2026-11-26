@@ -9,7 +9,7 @@
 //! discarding the review on purpose, removes its entries.
 
 use crate::git::{self, Source};
-use crate::model::{Decision, FileDiff};
+use crate::model::{Decision, FileDiff, LineComment};
 use crate::review::Review;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,6 +53,15 @@ struct HunkDraft {
     note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     edit: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    comments: Vec<CommentDraft>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+struct CommentDraft {
+    first: usize,
+    last: usize,
+    text: String,
 }
 
 /// FNV-1a: stable across builds, unlike `DefaultHasher`.
@@ -113,13 +122,22 @@ fn capture(f: &FileDiff, saved: u64) -> Option<FileDraft> {
             decision: h.decision,
             note: h.note.clone(),
             edit: (h.decision == Decision::Edit).then(|| h.edit_buf.clone()),
+            comments: h
+                .comments
+                .iter()
+                .map(|c| CommentDraft {
+                    first: c.first,
+                    last: c.last,
+                    text: c.text.clone(),
+                })
+                .collect(),
         })
         .collect();
     let empty = f.file_mode.is_none()
         && f.note.is_empty()
         && hunks
             .iter()
-            .all(|h| h.decision == Decision::Pending && h.note.is_empty());
+            .all(|h| h.decision == Decision::Pending && h.note.is_empty() && h.comments.is_empty());
     (!empty).then(|| FileDraft {
         saved,
         path: f.path.clone(),
@@ -132,10 +150,13 @@ fn capture(f: &FileDiff, saved: u64) -> Option<FileDraft> {
 /// Put a saved draft back into `f`. False if it doesn't fit the file's hunks.
 fn restore(f: &mut FileDiff, d: &FileDraft, read_only: bool) -> bool {
     let fits = d.hunks.len() == f.hunks.len()
-        && d.hunks
-            .iter()
-            .zip(&f.hunks)
-            .all(|(dh, h)| dh.header == h.header);
+        && d.hunks.iter().zip(&f.hunks).all(|(dh, h)| {
+            dh.header == h.header
+                && dh
+                    .comments
+                    .iter()
+                    .all(|c| c.first <= c.last && c.last < h.lines.len())
+        });
     if !fits {
         return false;
     }
@@ -150,6 +171,15 @@ fn restore(f: &mut FileDiff, d: &FileDraft, read_only: bool) -> bool {
         if let (Decision::Edit, Some(e)) = (h.decision, &dh.edit) {
             h.edit_buf = e.clone();
         }
+        h.comments = dh
+            .comments
+            .iter()
+            .map(|c| LineComment {
+                first: c.first,
+                last: c.last,
+                text: c.text.clone(),
+            })
+            .collect();
     }
     true
 }
@@ -358,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn decisions_and_notes_come_back() {
+    fn decisions_notes_and_comments_come_back() {
         let dir = repo();
         let mut r = review(vec![file("a.txt", OLD, NEW), file("b.txt", "x\n", "y\n")]);
         let (mut d, n) = Drafts::open(&dir, &mut r);
@@ -367,6 +397,11 @@ mod tests {
         r.files[0].hunks[0].note = "no capitals".into();
         r.files[0].hunks[1].decision = Decision::Edit;
         r.files[0].hunks[1].edit_buf = "Q\n".into();
+        r.files[0].hunks[1].comments.push(LineComment {
+            first: 3,
+            last: 4,
+            text: "why?".into(),
+        });
         r.general = "thanks".into();
         d.save(&r);
 
@@ -379,6 +414,7 @@ mod tests {
         assert_eq!(h[0].note, "no capitals");
         assert_eq!(h[1].decision, Decision::Edit);
         assert_eq!(h[1].edit_buf, "Q\n");
+        assert_eq!(h[1].comments[0].text, "why?");
         assert_eq!(again.files[1].hunks[0].decision, Decision::Pending);
         assert_eq!(again.general, "thanks");
         assert!(again.dirty);

@@ -5,7 +5,7 @@
 //! focus or open next.
 
 use crate::git::Source;
-use crate::model::{self, DLine, Decision, FileDiff, Hunk};
+use crate::model::{self, DLine, Decision, FileDiff, Hunk, LineComment};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -23,6 +23,33 @@ pub enum Effect {
     Binary,
     /// Editing needs the working tree; this review is feedback only.
     ReadOnly,
+    /// Ask for the text of a line comment: file, hunk, comment index.
+    LineNote(usize, usize, usize),
+    /// The hunk has no lines to point at (a binary file, a rename alone).
+    NoLines,
+}
+
+/// Lines picked for a comment: `anchor` to `cursor`, in either order, as indices into
+/// one hunk's `lines`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LineSel {
+    pub fi: usize,
+    pub hi: usize,
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+impl LineSel {
+    /// First and last line, in order.
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub fn contains(&self, fi: usize, hi: usize, li: usize) -> bool {
+        let (a, b) = self.range();
+        (fi, hi) == (self.fi, self.hi) && (a..=b).contains(&li)
+    }
 }
 
 pub struct Review {
@@ -44,6 +71,8 @@ pub struct Review {
     pub dirty: bool,
     /// The selection moved (or its file unfolded) and should be scrolled into view.
     moved: bool,
+    /// Line mode: lines picked for a comment, in the selected hunk.
+    pub lines: Option<LineSel>,
 }
 
 impl Review {
@@ -65,6 +94,7 @@ impl Review {
             agent_message: None,
             dirty: false,
             moved: true,
+            lines: None,
         }
     }
 
@@ -99,12 +129,24 @@ impl Review {
         if let Some(fi) = self.cur_file() {
             self.collapsed.remove(&fi);
         }
+        self.keep_lines();
     }
 
     /// Select without scrolling or unfolding, e.g. for a click on a visible hunk.
     pub fn select_quietly(&mut self, fi: usize, hi: usize) {
         if let Some(i) = self.flat.iter().position(|&p| p == (fi, hi)) {
             self.sel = i;
+        }
+        self.keep_lines();
+    }
+
+    /// Line mode only lasts while its hunk is selected.
+    fn keep_lines(&mut self) {
+        if self
+            .lines
+            .is_some_and(|l| Some((l.fi, l.hi)) != self.sel_pair())
+        {
+            self.lines = None;
         }
     }
 
@@ -275,6 +317,187 @@ impl Review {
         }
     }
 
+    // ---- line comments ----------------------------------------------------
+
+    /// Lines of hunk (fi, hi) a comment can point at.
+    fn code_lines(&self, fi: usize, hi: usize) -> Vec<usize> {
+        let h = &self.files[fi].hunks[hi];
+        (0..h.lines.len())
+            .filter(|&i| h.lines[i].is_code())
+            .collect()
+    }
+
+    /// Enter line mode on the selected hunk, at its first changed line; leave it if
+    /// it's on.
+    pub fn toggle_lines(&mut self) -> Effect {
+        if self.lines.take().is_some() {
+            return Effect::None;
+        }
+        let Some((fi, hi)) = self.sel_pair() else {
+            return Effect::None;
+        };
+        if self.files[fi].binary {
+            return Effect::Binary;
+        }
+        let h = &self.files[fi].hunks[hi];
+        let code = self.code_lines(fi, hi);
+        let start = code
+            .iter()
+            .copied()
+            .find(|&i| h.lines[i].kind != model::Kind::Ctx)
+            .or(code.first().copied());
+        let Some(li) = start else {
+            return Effect::NoLines;
+        };
+        self.lines = Some(LineSel {
+            fi,
+            hi,
+            anchor: li,
+            cursor: li,
+        });
+        self.moved = true;
+        Effect::None
+    }
+
+    /// Move the line cursor. Extending grows the selection within the hunk; otherwise
+    /// one line is picked, and moving past the hunk's edge goes on into the next or
+    /// previous hunk.
+    pub fn move_line(&mut self, down: bool, extend: bool) {
+        let Some(mut l) = self.lines else {
+            return;
+        };
+        let code = self.code_lines(l.fi, l.hi);
+        let pos = code.iter().position(|&i| i == l.cursor).unwrap_or(0);
+        let next = if down {
+            code.get(pos + 1).copied()
+        } else {
+            pos.checked_sub(1).map(|p| code[p])
+        };
+        match next {
+            Some(li) => {
+                l.cursor = li;
+                if !extend {
+                    l.anchor = li;
+                }
+                self.lines = Some(l);
+            }
+            None if extend => {}
+            None => {
+                // Into the neighboring hunk, if it has lines.
+                let before = self.sel;
+                if down {
+                    self.next();
+                } else {
+                    self.prev();
+                }
+                let Some((fi, hi)) = self.sel_pair().filter(|_| self.sel != before) else {
+                    self.lines = Some(l);
+                    return;
+                };
+                let code = self.code_lines(fi, hi);
+                let li = if down { code.first() } else { code.last() };
+                self.lines = li.map(|&li| LineSel {
+                    fi,
+                    hi,
+                    anchor: li,
+                    cursor: li,
+                });
+            }
+        }
+        self.moved = true;
+    }
+
+    /// A click on line `li` of hunk (fi, hi): pick it, or extend the selection to it.
+    pub fn click_line(&mut self, fi: usize, hi: usize, li: usize, extend: bool) {
+        let Some(line) = self
+            .files
+            .get(fi)
+            .and_then(|f| f.hunks.get(hi)?.lines.get(li))
+        else {
+            return;
+        };
+        let code = line.is_code();
+        self.select_quietly(fi, hi);
+        if !code {
+            return;
+        }
+        self.lines = match self.lines {
+            Some(l) if extend && (l.fi, l.hi) == (fi, hi) => Some(LineSel { cursor: li, ..l }),
+            _ => Some(LineSel {
+                fi,
+                hi,
+                anchor: li,
+                cursor: li,
+            }),
+        };
+    }
+
+    /// Comment on the picked lines: a new comment, or the one already on exactly those
+    /// lines. An undecided hunk becomes commented, so its change stays unstaged.
+    pub fn comment_lines(&mut self) -> Effect {
+        let Some(l) = self.lines.take() else {
+            return Effect::None;
+        };
+        let (first, last) = l.range();
+        let h = &mut self.files[l.fi].hunks[l.hi];
+        // The comment on exactly these lines, or the one covering a single picked line.
+        let existing = h
+            .comments
+            .iter()
+            .position(|c| (c.first, c.last) == (first, last))
+            .or_else(|| {
+                let single = first == last;
+                h.comments
+                    .iter()
+                    .position(|c| single && (c.first..=c.last).contains(&first))
+            });
+        let ci = match existing {
+            Some(ci) => ci,
+            None => {
+                h.comments.push(LineComment {
+                    first,
+                    last,
+                    text: String::new(),
+                });
+                h.comments.len() - 1
+            }
+        };
+        if h.decision == Decision::Pending {
+            h.decision = Decision::Comment;
+        }
+        self.dirty = true;
+        Effect::LineNote(l.fi, l.hi, ci)
+    }
+
+    /// Delete a line comment. A hunk that was commented only through it goes back to
+    /// undecided.
+    pub fn remove_comment(&mut self, fi: usize, hi: usize, ci: usize) {
+        let Some(h) = self.files.get_mut(fi).and_then(|f| f.hunks.get_mut(hi)) else {
+            return;
+        };
+        if ci >= h.comments.len() {
+            return;
+        }
+        h.comments.remove(ci);
+        if h.decision == Decision::Comment && h.comments.is_empty() && h.note.trim().is_empty() {
+            h.decision = Decision::Pending;
+        }
+        self.dirty = true;
+    }
+
+    /// Drop a line comment left empty, e.g. when its text box is cancelled.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub fn drop_if_empty(&mut self, fi: usize, hi: usize, ci: usize) {
+        let empty = self
+            .files
+            .get(fi)
+            .and_then(|f| f.hunks.get(hi)?.comments.get(ci))
+            .is_some_and(|c| c.text.trim().is_empty());
+        if empty {
+            self.remove_comment(fi, hi, ci);
+        }
+    }
+
     // ---- view -------------------------------------------------------------
 
     pub fn toggle_fold(&mut self, fi: usize) {
@@ -316,6 +539,7 @@ impl Review {
         c.reject + c.edit + c.comment > 0
             || !self.general.trim().is_empty()
             || self.files.iter().any(|f| f.file_note().is_some())
+            || model::has_line_comments(&self.files)
     }
 
     /// Apply every decision to the index and working tree (unless the review is read
@@ -504,5 +728,73 @@ mod tests {
         assert!(!r.will_send());
         r.general = "thanks".into();
         assert!(r.will_send());
+    }
+
+    #[test]
+    fn line_mode_moves_extends_and_crosses_hunks() {
+        let mut r = review();
+        assert_eq!(r.toggle_lines(), Effect::None);
+        // Starts on the first changed line of the hunk: "-b" at index 1.
+        let l = r.lines.unwrap();
+        assert_eq!((l.fi, l.hi, l.anchor, l.cursor), (0, 0, 1, 1));
+        r.move_line(true, true);
+        assert_eq!(r.lines.unwrap().range(), (1, 2));
+        r.move_line(true, false);
+        assert_eq!(r.lines.unwrap().range(), (3, 3));
+        // Past the hunk's last line: into the next hunk, at its first line.
+        let last = r.files[0].hunks[0].lines.len() - 1;
+        for _ in 3..=last {
+            r.move_line(true, false);
+        }
+        let l = r.lines.unwrap();
+        assert_eq!((l.fi, l.hi, l.cursor), (0, 1, 0));
+        assert_eq!(r.sel_pair(), Some((0, 1)));
+        // Extending stops at the hunk's edge.
+        r.move_line(false, true);
+        assert_eq!(r.lines.unwrap().range(), (0, 0));
+        // Selecting another hunk leaves line mode.
+        r.next_file();
+        assert!(r.lines.is_none());
+    }
+
+    #[test]
+    fn commenting_lines() {
+        let mut r = review();
+        r.click_line(0, 0, 1, false);
+        r.click_line(0, 0, 3, true);
+        assert_eq!(r.comment_lines(), Effect::LineNote(0, 0, 0));
+        assert!(r.lines.is_none());
+        let h = &r.files[0].hunks[0];
+        assert_eq!((h.comments[0].first, h.comments[0].last), (1, 3));
+        // An undecided hunk becomes commented.
+        assert_eq!(h.decision, Comment);
+        r.files[0].hunks[0].comments[0].text = "why".into();
+        // Picking one line inside it opens the same comment.
+        r.click_line(0, 0, 2, false);
+        assert_eq!(r.comment_lines(), Effect::LineNote(0, 0, 0));
+        // Deleting the only reason for the comment decision undoes it.
+        r.remove_comment(0, 0, 0);
+        assert_eq!(r.files[0].hunks[0].decision, Pending);
+        // An empty one is dropped; an approved hunk stays approved.
+        r.select(0);
+        r.set_decision(Approve);
+        r.click_line(0, 0, 1, false);
+        let Effect::LineNote(fi, hi, ci) = r.comment_lines() else {
+            panic!()
+        };
+        assert_eq!(r.files[0].hunks[0].decision, Approve);
+        r.drop_if_empty(fi, hi, ci);
+        assert!(r.files[0].hunks[0].comments.is_empty());
+    }
+
+    #[test]
+    fn binary_hunks_have_no_lines() {
+        let mut r = review();
+        r.files[1].binary = true;
+        r.last();
+        assert_eq!(r.toggle_lines(), Effect::Binary);
+        r.files[1].binary = false;
+        r.files[1].hunks[0].lines = vec![DLine::new(model::Kind::Ctx, None, None, "x".into())];
+        assert_eq!(r.toggle_lines(), Effect::NoLines);
     }
 }
