@@ -1,111 +1,316 @@
 # verdict
 
-Hunk-by-hunk review of AI-written changes. A small native app (Rust + egui) that shows
-what the agent changed, lets you **approve**, **reject** (with a reason), **edit**
-inline, or **comment** on each hunk, and sends the result back to the agent.
+**Code review for AI-written changes, hunk by hunk, fed straight back to the agent.**
 
-The git index is the "approved" state: approving stages a hunk, rejecting reverts it
-in the working tree, and nothing is written until you submit.
+verdict is a small native app, written in Rust with egui, that opens when your coding
+agent finishes a turn. It shows exactly what changed. You approve, reject, edit or
+comment on each hunk or each whole file. Your verdict goes back to the agent as its
+next instruction.
 
-## Usage
+![verdict reviewing a change: one file approved, a debug println rejected with a reason](docs/screenshot.jpg)
 
+## Why
+
+With an AI agent writing the code, most of the work is reading and judging its
+diffs. General-purpose editors aren't built for that loop. They're heavy, they're
+slow to start, and they leave you to type the feedback out yourself.
+
+verdict does one job:
+
+- **It starts fast.** It's a native binary with no runtime, and the window opens
+  in a fraction of a second.
+- **Decisions are real git operations.** Approving stages the hunk. Rejecting
+  reverts it in your working tree. Nothing changes on disk until you submit.
+- **Feedback is structured.** Each rejected hunk carries your reason, and each
+  edit is shown to the agent as its version next to yours. The agent gets one
+  clear message instead of a vague "that's wrong".
+- **It stays out of the way.** It only opens when the session that just stopped
+  changed something, and it only shows the files that session changed.
+
+## Features
+
+- Approve, reject, edit or comment on each **hunk**.
+- Approve, reject or comment on a **whole file**. A whole-file rejection carries
+  one reason for all its hunks.
+- Edit hunks inline. The agent sees exactly what you changed.
+- Each file is a card with its hunks numbered (1/3, 2/3, ...) and joined in the
+  gutter. Cards fold away when you're done with them.
+- Syntax highlighting for about 200 languages out of the box. You can add more
+  with **VS Code extensions**, TextMate grammars, Sublime syntaxes and VS Code
+  themes.
+- Files are highlighted from their first line, so a hunk that starts inside a
+  multi-line comment or string still renders correctly.
+- Keyboard-driven, but every action is also a button.
+- **Claude Code** integration through hooks. It works standalone with any agent.
+
+## Install
+
+verdict needs `git`, a Rust toolchain (1.85+, edition 2024) and a C compiler. The
+C compiler builds Oniguruma, the regex engine VS Code grammars are written for.
+
+```sh
+git clone https://github.com/<you>/verdict
+cd verdict
+cargo install --path .
 ```
-verdict [PATH]     review unstaged changes in the repo containing PATH
-verdict hook       Claude Code Stop hook entry point
-verdict langs      list languages (builtin + yours) and grammar warnings
-verdict themes     list syntax themes (* = active)
-verdict lang FILE  show which language FILE is highlighted as
-verdict init       create ~/.config/verdict with an example config.toml
+
+This installs the `verdict` binary into `~/.cargo/bin`.
+
+**Platforms**
+
+- **Linux:** tested, including **WSL2**. On WSL2 it runs as a Linux GUI app
+  through WSLg, so it reads your repo at native speed without going through the
+  slow Windows-to-WSL file bridge.
+- **macOS:** expected to work, but not tested yet.
+- **Native Windows:** not supported yet. Use WSL2.
+
+## Quick start
+
+Run it inside any git repository that has uncommitted changes:
+
+```sh
+verdict
 ```
 
-Keys: `j`/`k` move, `a` approve, `r` reject, `e` edit, `c` comment, `n` next
-pending, `Esc` leave a text box, `Ctrl+Enter` submit.
+Review, then press **Ctrl+Enter** to submit. The feedback message prints to stdout
+and is also saved to `.git/verdict-feedback.md`, so you can paste it into any
+agent: Claude Code, Codex, Aider, Cursor, or anything else.
 
-### Claude Code hook
+## Claude Code integration
+
+Add both hooks to `~/.claude/settings.json`, or to a project's
+`.claude/settings.json`:
 
 ```json
-"hooks": {
-  "Stop": [{ "hooks": [{ "type": "command", "command": "verdict hook", "timeout": 86400 }] }]
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "verdict hook", "timeout": 30 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "verdict hook", "timeout": 86400 }] }
+    ]
+  }
 }
 ```
 
-When a turn ends with unreviewed changes the window opens. Approving everything lets
-the agent stop; anything else becomes the agent's next instruction. Set
-`VERDICT_DISABLE=1` to bypass it.
+1. **When you send a prompt**, verdict records a snapshot of the working tree for
+   that session. This takes a few milliseconds and prints nothing.
+2. **When the agent finishes its turn**, verdict works out which files that
+   session changed during the turn. It compares against the snapshot and checks
+   the session's transcript for the tools it used.
+   - If nothing changed, for example because the session was only answering a
+     question, verdict stays closed.
+   - Otherwise the review window opens, showing only those files.
+3. **When you submit:**
+   - If you approved everything, the agent finishes normally.
+   - Otherwise your review becomes the agent's next instruction, and it keeps
+     working on your feedback. The next review shows only what it changed in
+     response.
+
+The long `Stop` timeout lets you take your time reviewing. Set `VERDICT_DISABLE=1`
+in the environment to turn verdict off for a session.
+
+## Reviewing
+
+| Action | Hunk | Whole file |
+|---|---|---|
+| Approve (stage it) | `a` | `Shift+A` |
+| Reject (revert it, with a reason) | `r` | `Shift+R` |
+| Edit inline | `e` | — |
+| Comment (keep it, send a note) | `c` | `Shift+C` |
+
+| Key | Does |
+|---|---|
+| `j` / `k` | next / previous hunk |
+| `n` | jump to the next undecided hunk |
+| `Space` | fold / unfold the current file |
+| `Esc` | leave a text box |
+| `Ctrl+Enter` | submit |
+
+Pressing an active decision again clears it. **Approve file** folds the card and
+moves on to the next undecided file. Hunks you leave undecided stay as they are,
+unstaged, and show up again in the next review.
+
+### What the agent receives
+
+````markdown
+# Code review of your changes
+Summary: 2 approved, 1 rejected, 0 edited by reviewer, 0 commented, 0 not reviewed yet.
+
+## Rejected (reverted in the working tree)
+
+### `src/limiter.rs` (1 of 2 hunks)
+
+Hunk 1/2 @@ -15,6 +15,7 @@
+```diff
+     pub fn try_acquire(&mut self) -> bool {
++        println!("acquire: {} tokens left", self.tokens);
+         self.refill();
+```
+
+**Why it was rejected:** Remove the debug println, use the tracing crate if you need logs here.
+````
+
+## How it works
+
+**The git index is the "approved" state.** verdict compares the index with your
+working tree. On submit:
+
+- **Approved hunks** are written into the index.
+- **Rejected hunks** are reverted in the working tree.
+- **Edited hunks** get your version in both places.
+
+Hunks you didn't decide on are left alone. There's no extra database: plain git
+shows the outcome, and `git diff --cached` shows everything you've approved.
+
+**Which session changed what.** Several agent sessions can work in the same repo,
+or just chat, so verdict tracks changes per session. A snapshot of content hashes
+taken at the start of each turn tells it what changed during that turn. The
+session's transcript tells it whether that session could have made the change:
+
+- **The session only chatted:** no review.
+- **It only used file-editing tools:** only the files it edited are shown.
+- **It ran shell commands:** every file changed during the turn is shown.
 
 ## Syntax highlighting
 
-About 200 languages and 30 themes are built in (bat's collection, via two-face).
-Whole files are highlighted from line 1 in the background, so hunks inside
-multi-line comments and strings render correctly, and the inline editor is
-highlighted as you type.
+bat's collection of syntaxes and themes is built in. Run `verdict langs` and
+`verdict themes` to see what's available.
 
 ### Extending it
 
-Everything lives in `$XDG_CONFIG_HOME/verdict` (default `~/.config/verdict`;
-`verdict init` creates it):
+Run `verdict init` to create `~/.config/verdict` (or `$XDG_CONFIG_HOME/verdict`):
 
-| Path            | What goes there |
-|-----------------|-----------------|
-| `config.toml`   | theme choice and file associations |
-| `grammars/`     | `.sublime-syntax`, `.tmLanguage` (plist), `.tmLanguage.json` |
-| `themes/`       | `.tmTheme`, VS Code color themes (`.json`) |
-| `extensions/`   | unpacked VS Code extensions |
+| Path | Accepts |
+|---|---|
+| `config.toml` | theme choice and file associations |
+| `grammars/` | `.sublime-syntax`, `.tmLanguage`, `.tmLanguage.json` |
+| `themes/` | `.tmTheme`, VS Code color themes (`.json`) |
+| `extensions/` | unpacked VS Code extensions |
 
-**VS Code extensions.** A `.vsix` is a zip archive. Unzip it into
-`extensions/<name>/`. verdict reads every `package.json` it finds there and uses
-the `contributes` section:
+**VS Code extensions.** A `.vsix` file is a zip archive. Unzip it into
+`extensions/`:
 
-- `grammars`: the TextMate grammars
-- `languages`: `extensions`, `filenames` and `firstLine`, which decide what files a grammar applies to
-- `themes`: color themes
-
-```
-unzip some-language.vsix -d ~/.config/verdict/extensions/some-language
+```sh
+unzip svelte-vscode.vsix -d ~/.config/verdict/extensions/svelte
 verdict langs | grep user
 ```
+
+verdict reads the `contributes` section of each extension's `package.json`:
+
+- `grammars`: the TextMate grammars
+- `languages`: the extensions, filenames and first-line patterns that decide
+  which files a grammar applies to
+- `themes`: color themes
 
 **config.toml**
 
 ```toml
 [highlight]
-theme = "OneHalfDark"          # builtin or any theme you added
+theme = "OneHalfDark"
 
-[languages]                    # like VS Code's files.associations
-"*.mdx" = "Markdown"           # no "/" → matches the file name
+[languages]                                # like VS Code's files.associations
+"*.mdx" = "Markdown"                       # no "/": matches the file name
 "Justfile" = "Makefile"
-"docker/**/*.env" = "source.shell.bash"   # with "/" → repo-relative path
+"docker/**/*.env" = "source.shell.bash"    # with "/": repo-relative path
 ```
 
-Association values can be a language name (`verdict langs`), a scope
-(`source.ts`) or an extension (`ts`).
+Association values can be a language name, a scope (`source.ts`) or an
+extension (`ts`).
 
 **How a language is chosen:**
-1. Your `[languages]` associations.
+
+1. Your associations.
 2. File names declared by extensions.
 3. The file extension. The longest match wins, so `d.ts` beats `ts`.
 4. The first line, for shebangs and similar.
 
-User grammars override builtin ones for the same extension.
+Languages you add take priority over builtin ones.
 
-### How TextMate grammars are supported
+`verdict lang path/to/file` shows which language a file gets.
 
-syntect (the highlighting engine) only reads Sublime's `.sublime-syntax` format.
-verdict converts TextMate grammars into it when it loads them:
+**How TextMate grammars load.** The highlighting engine,
+[syntect](https://github.com/trishume/syntect), reads Sublime's format, so
+verdict converts TextMate grammars when it loads them:
 
-- `begin`/`end` become push/pop contexts.
-- `#repository` entries become named contexts.
-- `include: source.x` resolves against every grammar verdict knows about.
+- `begin`/`end` rules become push/pop contexts.
+- The repository becomes named contexts.
+- Cross-grammar `include`s resolve against every grammar verdict knows about.
 
-Regexes run on Oniguruma, the same engine VS Code uses.
+Rules that can't be converted are skipped and listed by `verdict langs`. Known
+limits:
 
-Known limits:
 - `while` rules are approximated.
-- Injection grammars (`injectTo`) are skipped.
-- Capture-name substitutions such as `keyword.$1` are dropped.
+- Injection grammars are skipped.
+- `$1`-style scope names are dropped.
 
-Rules that can't be converted are skipped and reported by `verdict langs` and in
-the window's toolbar.
+Compiled user grammars are cached in `~/.cache/verdict` and rebuild automatically
+when a file changes.
 
-The compiled set of user grammars is cached in `~/.cache/verdict`. It rebuilds
-automatically when any grammar file changes.
+## Command reference
+
+```
+verdict [PATH]     review uncommitted changes in the repo containing PATH
+verdict hook       Claude Code hook entry point (UserPromptSubmit and Stop)
+verdict langs      list languages and grammar warnings
+verdict themes     list syntax themes (* = active)
+verdict lang FILE  show which language FILE is highlighted as
+verdict init       create the config directory with an example config.toml
+```
+
+## Limitations
+
+- **Two sessions running shell commands in the same repo at the same time** can
+  still see each other's edits. A shell command could have touched any file, so
+  verdict can't attribute those edits to one session.
+- **Symlinks and submodules** are skipped. **Binary files** can be approved or
+  rejected as a whole, but not edited.
+- **Rejecting part of a change can leave code that doesn't build.** For example,
+  rejecting the hunk that removes a field while keeping the hunks that stop using
+  it. The agent gets the rejection and usually fixes it, but verdict doesn't
+  check.
+
+## Roadmap
+
+- Optional check command, such as `cargo check`, run after applying decisions,
+  with failures added to the feedback.
+- Commit approved changes from inside verdict.
+- Word-level highlighting inside changed lines.
+- Native macOS and Windows builds.
+- Integrations for other agents beyond Claude Code's hooks.
+
+## Contributing
+
+Issues and pull requests are welcome. The code is small and split by concern:
+
+| File | What it does |
+|---|---|
+| `src/main.rs` | CLI, Claude Code hook protocol |
+| `src/git.rs` | thin wrapper over the `git` CLI (no libgit2) |
+| `src/model.rs` | diffs, hunks, applying decisions, the feedback message |
+| `src/session.rs` | per-session turn snapshots, transcript analysis |
+| `src/ui.rs` | the egui review window |
+| `src/highlight.rs` | language and theme registry, user extensions, caching |
+| `src/tm.rs` | TextMate grammar and VS Code theme conversion |
+
+```sh
+cargo test             # unit tests, including real git repos in a temp dir
+cargo run -- .         # review this repo's own uncommitted changes
+```
+
+Before sending a change, make sure `cargo test` passes and `cargo build` produces
+no warnings. If you're changing the UI, include a screenshot.
+
+## License
+
+Copyright (C) 2026 the verdict contributors.
+
+verdict is free software: you can redistribute it and/or modify it under the terms
+of the **GNU General Public License, version 3 or (at your option) any later
+version**. See [LICENSE](LICENSE) for the full text.
+
+In short:
+- You may use, study, modify and sell verdict.
+- If you **distribute** it, modified or not, you must make the complete source
+  available under the same license.

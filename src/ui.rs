@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! egui review window.
 
 use crate::highlight::{Line, Registry};
@@ -8,6 +9,7 @@ use eframe::egui::{
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -58,6 +60,7 @@ mod pal {
     pub const BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1b);
     pub const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1d, 0x23);
     pub const CARD: Color32 = Color32::from_rgb(0x1e, 0x21, 0x28);
+    pub const FILE: Color32 = Color32::from_rgb(0x18, 0x1b, 0x21);
     pub const BORDER: Color32 = Color32::from_rgb(0x2c, 0x30, 0x3a);
     pub const TEXT: Color32 = Color32::from_rgb(0xd4, 0xd7, 0xdd);
     pub const DIM: Color32 = Color32::from_rgb(0x7a, 0x80, 0x8c);
@@ -134,6 +137,8 @@ pub fn run(repo: PathBuf, files: Vec<FileDiff>, mode: Mode) -> Result<Option<Out
                 result: res,
                 done: false,
                 hl_rx: rx,
+                collapsed: HashSet::new(),
+                focus_file_note: None,
             }))
         }),
     )
@@ -175,6 +180,8 @@ struct App {
     result: Rc<RefCell<Option<Outcome>>>,
     done: bool,
     hl_rx: mpsc::Receiver<(usize, FileHl)>,
+    collapsed: HashSet<usize>,
+    focus_file_note: Option<usize>,
 }
 
 impl App {
@@ -202,14 +209,66 @@ impl App {
         }
     }
 
+    fn cur_file(&self) -> Option<usize> {
+        self.flat.get(self.sel).map(|p| p.0)
+    }
+
+    /// Select a hunk by flat index, expanding its file if collapsed.
+    fn select(&mut self, i: usize) {
+        self.sel = i;
+        self.scroll_to_sel = true;
+        if let Some(&(fi, _)) = self.flat.get(i) {
+            self.collapsed.remove(&fi);
+        }
+    }
+
+    /// Whole-file actions. Approve/Reject set every hunk (pressing again clears them);
+    /// Comment toggles a note about the file without touching hunk decisions.
+    fn file_action(&mut self, fi: usize, d: Decision) {
+        let Some(f) = self.files.get_mut(fi) else { return };
+        match d {
+            Decision::Approve | Decision::Reject => {
+                let undo = f.all(d);
+                let new = if undo { Decision::Pending } else { d };
+                for h in &mut f.hunks {
+                    h.decision = new;
+                }
+                if d == Decision::Reject {
+                    f.file_mode = (!undo).then_some(Decision::Reject);
+                    if !undo {
+                        self.focus_file_note = Some(fi);
+                    }
+                } else if f.file_mode == Some(Decision::Reject) {
+                    f.file_mode = None;
+                }
+                if d == Decision::Approve && !undo {
+                    // Done with this file: collapse it and move on.
+                    self.collapsed.insert(fi);
+                    if let Some(last) = self.flat.iter().rposition(|p| p.0 == fi) {
+                        self.sel = last;
+                    }
+                    self.next_pending();
+                }
+            }
+            Decision::Comment => {
+                if f.file_mode == Some(Decision::Comment) {
+                    f.file_mode = None;
+                } else {
+                    f.file_mode = Some(Decision::Comment);
+                    self.focus_file_note = Some(fi);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn next_pending(&mut self) {
         let n = self.flat.len();
         for k in 1..=n {
             let i = (self.sel + k) % n;
             let (fi, hi) = self.flat[i];
             if self.files[fi].hunks[hi].decision == Decision::Pending {
-                self.sel = i;
-                self.scroll_to_sel = true;
+                self.select(i);
                 return;
             }
         }
@@ -238,13 +297,24 @@ impl App {
             return;
         }
         let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        let shifted = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, k));
+        let cur = self.cur_file();
         let mut handled = true;
-        if pressed(Key::J) || pressed(Key::ArrowDown) {
-            self.sel = (self.sel + 1).min(self.flat.len() - 1);
-            self.scroll_to_sel = true;
+        // Shift variants first: plain-key matching ignores Shift.
+        if let (Some(fi), true) = (cur, shifted(Key::A)) {
+            self.file_action(fi, Decision::Approve);
+        } else if let (Some(fi), true) = (cur, shifted(Key::R)) {
+            self.file_action(fi, Decision::Reject);
+        } else if let (Some(fi), true) = (cur, shifted(Key::C)) {
+            self.file_action(fi, Decision::Comment);
+        } else if pressed(Key::J) || pressed(Key::ArrowDown) {
+            self.select((self.sel + 1).min(self.flat.len() - 1));
         } else if pressed(Key::K) || pressed(Key::ArrowUp) {
-            self.sel = self.sel.saturating_sub(1);
-            self.scroll_to_sel = true;
+            self.select(self.sel.saturating_sub(1));
+        } else if let (Some(fi), true) = (cur, pressed(Key::Space)) {
+            if !self.collapsed.remove(&fi) {
+                self.collapsed.insert(fi);
+            }
         } else if pressed(Key::N) {
             self.next_pending();
         } else if pressed(Key::A) {
@@ -266,7 +336,9 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let c = model::counts(&self.files);
-        let will_send = c.reject + c.edit + c.comment > 0 || !self.general.trim().is_empty();
+        let will_send = c.reject + c.edit + c.comment > 0
+            || !self.general.trim().is_empty()
+            || self.files.iter().any(|f| f.file_note().is_some());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let name = self.repo.file_name().unwrap_or_default().to_string_lossy();
@@ -339,7 +411,7 @@ impl App {
         );
         ui.label(
             RichText::new(
-                "j/k move · a approve · r reject · e edit · c comment · n next pending · Esc leave text box · Ctrl+Enter submit",
+                "j/k move · a r e c approve/reject/edit/comment hunk · Shift+A/R/C whole file · Space fold file · n next pending · Esc leave text box · Ctrl+Enter submit",
             )
             .small()
             .color(pal::DIM),
@@ -350,6 +422,7 @@ impl App {
     fn file_list(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(RichText::new("FILES").small().color(pal::DIM));
+        let mut jump = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let cur_file = self.flat.get(self.sel).map(|p| p.0);
             for (fi, f) in self.files.iter().enumerate() {
@@ -377,13 +450,13 @@ impl App {
                 };
                 job.append(&format!("{decided}/{}", f.hunks.len()), 8.0, fmt(prog_col));
                 if ui.add(egui::Button::selectable(cur_file == Some(fi), job)).clicked() {
-                    if let Some(i) = self.flat.iter().position(|p| p.0 == fi) {
-                        self.sel = i;
-                        self.scroll_to_sel = true;
-                    }
+                    jump = self.flat.iter().position(|p| p.0 == fi);
                 }
             }
         });
+        if let Some(i) = jump {
+            self.select(i);
+        }
     }
 
     fn diff_view(&mut self, ui: &mut egui::Ui) {
@@ -401,55 +474,180 @@ impl App {
         let sel_pair = self.flat.get(self.sel).copied();
         let mut new_sel = None;
         let mut action: Option<Decision> = None;
+        let mut file_act: Option<(usize, Decision)> = None;
+        let mut toggle_fold: Option<usize> = None;
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             ui.add_space(8.0);
             for (fi, f) in self.files.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
+                let total = f.hunks.len();
+                let decided = f.hunks.iter().filter(|h| h.decision != Decision::Pending).count();
+                let collapsed = self.collapsed.contains(&fi);
+                let file_sel = sel_pair.map(|p| p.0) == Some(fi);
+                let state = if f.hunks.iter().any(|h| h.decision == Decision::Reject) {
+                    pal::RED
+                } else if f.all(Decision::Approve) {
+                    pal::GREEN
+                } else if decided == total {
+                    pal::BLUE
+                } else {
+                    pal::BORDER
+                };
+                let file_frame = egui::Frame::new()
+                    .fill(pal::FILE)
+                    .stroke(Stroke::new(if file_sel { 1.5 } else { 1.0 }, state))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 });
+                let file_resp = file_frame.show(ui, |ui| {
+                    // Header: fold arrow, path, meta, whole-file actions.
+                    ui.horizontal(|ui| {
+                        let (r, arrow) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
+                        let c = r.center();
+                        let pts = if collapsed {
+                            vec![c + vec2(-3.0, -5.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 5.0)]
+                        } else {
+                            vec![c + vec2(-5.0, -3.0), c + vec2(5.0, -3.0), c + vec2(0.0, 4.0)]
+                        };
+                        let col = if arrow.hovered() { pal::TEXT } else { pal::DIM };
+                        ui.painter().add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+                        let path = ui.add(
+                            egui::Label::new(RichText::new(&f.path).monospace().strong().size(14.0))
+                                .sense(Sense::click()),
+                        );
+                        if arrow.clicked() || path.clicked() {
+                            toggle_fold = Some(fi);
+                        }
+                        let kind = match f.status {
+                            crate::git::Status::Modified => "modified",
+                            crate::git::Status::Deleted => "deleted",
+                            crate::git::Status::Untracked => "new file",
+                        };
+                        ui.label(RichText::new(kind).small().color(pal::DIM));
+                        if let Some(hl) = &f.hl {
+                            ui.label(RichText::new(&hl.lang).small().color(pal::DIM));
+                        }
+                        let noun = if total == 1 { "hunk" } else { "hunks" };
+                        ui.label(RichText::new(format!("{decided}/{total} {noun} decided")).small().color(if state == pal::BORDER { pal::DIM } else { state }));
+
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let mut fbtn = |ui: &mut egui::Ui, d: Decision, label: &str, on: bool, tip: &str| {
+                                let text = if on {
+                                    RichText::new(label).color(Color32::BLACK).strong()
+                                } else {
+                                    RichText::new(label).color(decision_color(d))
+                                };
+                                let mut b = egui::Button::new(text);
+                                if on {
+                                    b = b.fill(decision_color(d));
+                                }
+                                if ui.add(b).on_hover_text(tip).clicked() {
+                                    file_act = Some((fi, d));
+                                }
+                            };
+                            fbtn(ui, Decision::Comment, "Comment on file", f.file_mode == Some(Decision::Comment), "A note about the whole file (Shift+C)");
+                            fbtn(ui, Decision::Reject, "Reject file", f.all(Decision::Reject), "Reject every hunk with one reason (Shift+R)");
+                            fbtn(ui, Decision::Approve, "Approve file", f.all(Decision::Approve), "Approve every hunk (Shift+A)");
+                        });
+                    });
+
+                    if let Some(mode) = f.file_mode {
+                        let hint = if mode == Decision::Reject {
+                            "Why is this whole file rejected? (sent to the agent once, for all its hunks)"
+                        } else {
+                            "Comment about the whole file (sent to the agent)"
+                        };
+                        let r = ui.add(
+                            TextEdit::multiline(&mut f.note)
+                                .hint_text(hint)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if self.focus_file_note == Some(fi) {
+                            r.request_focus();
+                            self.focus_file_note = None;
+                        }
+                    }
+
+                    if collapsed {
+                        let noun = if total == 1 { "hunk" } else { "hunks" };
+                        ui.label(RichText::new(format!("{total} {noun} folded (Space or click the arrow to expand)")).small().color(pal::DIM));
+                        return;
+                    }
                     ui.add_space(4.0);
-                    ui.label(RichText::new(&f.path).monospace().strong().size(14.0));
-                    let kind = match f.status {
-                        crate::git::Status::Modified => "modified",
-                        crate::git::Status::Deleted => "deleted",
-                        crate::git::Status::Untracked => "new file",
-                    };
-                    ui.label(RichText::new(kind).small().color(pal::DIM));
-                    if let Some(hl) = &f.hl {
-                        ui.label(RichText::new(&hl.lang).small().color(pal::DIM));
+
+                    // Hunks, indented, joined by a rail in the gutter.
+                    let mut dots: Vec<(f32, Color32)> = Vec::new();
+                    let file_rejected = f.file_mode == Some(Decision::Reject);
+                    let FileDiff { hunks, hl, binary, .. } = f;
+                    let binary = *binary;
+                    let inner = egui::Frame::new()
+                        .inner_margin(egui::Margin { left: 20, right: 0, top: 0, bottom: 0 })
+                        .show(ui, |ui| {
+                            for (hi, h) in hunks.iter_mut().enumerate() {
+                                let selected = sel_pair == Some((fi, hi));
+                                let ctx = HunkCtx {
+                                    hl: hl.as_ref(),
+                                    binary,
+                                    selected,
+                                    row_h,
+                                    char_w,
+                                    mono: &mono,
+                                    label: (total > 1).then(|| format!("{}/{total}", hi + 1)),
+                                    file_reason: file_rejected,
+                                    focus_note: selected && std::mem::take(&mut self.focus_note),
+                                    focus_edit: selected && std::mem::take(&mut self.focus_edit),
+                                };
+                                let out = hunk_ui(ui, h, ctx);
+                                let col = if h.decision == Decision::Pending { pal::DIM } else { decision_color(h.decision) };
+                                dots.push((out.rect.top() + 14.0, col));
+                                if out.clicked {
+                                    new_sel = Some((fi, hi));
+                                }
+                                if let Some(d) = out.action {
+                                    new_sel = Some((fi, hi));
+                                    action = Some(d);
+                                }
+                                if selected && self.scroll_to_sel {
+                                    ui.scroll_to_rect(out.rect, Some(Align::Min));
+                                    self.scroll_to_sel = false;
+                                }
+                                if hi + 1 < total {
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        });
+                    let x = inner.response.rect.left() + 8.0;
+                    let painter = ui.painter();
+                    if let (Some(first), Some(last)) = (dots.first(), dots.last()) {
+                        if dots.len() > 1 {
+                            painter.line_segment([pos2(x, first.0), pos2(x, last.0)], Stroke::new(2.0, pal::BORDER));
+                        }
+                    }
+                    for (y, col) in dots {
+                        painter.circle_filled(pos2(x, y), 4.0, col);
                     }
                 });
-                let FileDiff { hunks, hl, binary, .. } = f;
-                let binary = *binary;
-                for (hi, h) in hunks.iter_mut().enumerate() {
-                    let selected = sel_pair == Some((fi, hi));
-                    let ctx = HunkCtx {
-                        hl: hl.as_ref(),
-                        binary,
-                        selected,
-                        row_h,
-                        char_w,
-                        mono: &mono,
-                        focus_note: selected && std::mem::take(&mut self.focus_note),
-                        focus_edit: selected && std::mem::take(&mut self.focus_edit),
-                    };
-                    let out = hunk_ui(ui, h, ctx);
-                    if out.clicked {
-                        new_sel = Some((fi, hi));
-                    }
-                    if let Some(d) = out.action {
-                        new_sel = Some((fi, hi));
-                        action = Some(d);
-                    }
-                    if selected && self.scroll_to_sel {
-                        ui.scroll_to_rect(out.rect, Some(Align::Min));
-                        self.scroll_to_sel = false;
-                    }
-                    ui.add_space(8.0);
+                if file_sel && collapsed && self.scroll_to_sel {
+                    ui.scroll_to_rect(file_resp.response.rect, Some(Align::Min));
+                    self.scroll_to_sel = false;
                 }
-                ui.add_space(10.0);
+                ui.add_space(12.0);
             }
         });
 
+        if let Some(fi) = toggle_fold {
+            if !self.collapsed.remove(&fi) {
+                self.collapsed.insert(fi);
+            }
+        }
+        if let Some((fi, d)) = file_act {
+            if let Some(i) = self.flat.iter().position(|p| p.0 == fi) {
+                if self.cur_file() != Some(fi) {
+                    self.sel = i;
+                }
+            }
+            self.file_action(fi, d);
+        }
         if let Some(p) = new_sel {
             if let Some(i) = self.flat.iter().position(|&q| q == p) {
                 self.sel = i;
@@ -489,6 +687,10 @@ struct HunkCtx<'a> {
     row_h: f32,
     char_w: f32,
     mono: &'a FontId,
+    /// "2/3" position within the file, when it has several hunks.
+    label: Option<String>,
+    /// The file is rejected as a whole, so its reason covers this hunk.
+    file_reason: bool,
     focus_note: bool,
     focus_edit: bool,
 }
@@ -514,6 +716,9 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                if let Some(l) = &c.label {
+                    ui.label(RichText::new(l).monospace().strong().color(pal::TEXT));
+                }
                 ui.label(RichText::new(&h.header).monospace().color(pal::DIM));
                 ui.add_space(12.0);
                 let mut btn = |ui: &mut egui::Ui, d: Decision, label: &str, enabled: bool| {
@@ -543,6 +748,13 @@ fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
             }
 
             match h.decision {
+                Decision::Reject if c.file_reason => {
+                    ui.add(
+                        TextEdit::singleline(&mut h.note)
+                            .hint_text("Covered by the file reason. Optional: extra detail for this hunk")
+                            .desired_width(f32::INFINITY),
+                    );
+                }
                 Decision::Reject | Decision::Comment => {
                     let hint = if h.decision == Decision::Reject {
                         "Why is this rejected? What should it do instead? (sent to the agent)"

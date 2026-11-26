@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Syntax highlighting registry: builtin languages/themes plus user extensions.
 //!
 //! Layout of the config dir (`$XDG_CONFIG_HOME/verdict`, default `~/.config/verdict`):

@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 mod git;
 mod highlight;
 mod model;
+mod session;
 mod tm;
 mod ui;
 
@@ -180,8 +182,14 @@ fn git_dir(repo: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(out).ok()?.trim()))
 }
 
-/// Claude Code Stop hook. Exit 0 with no output lets the agent stop; printing
-/// {"decision":"block","reason":...} makes it continue with `reason` as instructions.
+/// Claude Code hook entry point, for two events:
+///
+/// - `UserPromptSubmit`: snapshot the working tree for this session (prints nothing,
+///   since stdout from this event would be added to the prompt).
+/// - `Stop`: review only the files this session changed during the turn. Exit 0 with
+///   no output lets the agent stop; printing {"decision":"block","reason":...} makes it
+///   continue with `reason` as instructions.
+///
 /// Any failure on our side must never wedge the agent, so every error path exits 0 silently.
 fn hook() -> ExitCode {
     let mut input = String::new();
@@ -198,11 +206,51 @@ fn hook() -> ExitCode {
     let Some(repo) = git::toplevel(&cwd) else {
         return ExitCode::SUCCESS;
     };
-    let files = match model::load(&repo) {
+    let Some(sess) = v["session_id"].as_str() else {
+        return ExitCode::SUCCESS;
+    };
+
+    if v["hook_event_name"].as_str() == Some("UserPromptSubmit") {
+        if let Ok(snap) = session::snapshot(&repo) {
+            session::save(&repo, sess, &snap);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Stop. Without a snapshot from the start of this turn we can't tell this
+    // session's changes from anyone else's, so stay out of the way.
+    let Some(base) = session::load(&repo, sess) else {
+        return ExitCode::SUCCESS;
+    };
+    let Ok(now) = session::snapshot(&repo) else {
+        return ExitCode::SUCCESS;
+    };
+    let mut touched = session::touched(&base, &now);
+    // Cross-check with what this session actually did: another session working in
+    // the same repo during this turn would otherwise show up here.
+    let activity = v["transcript_path"]
+        .as_str()
+        .map(|t| session::turn_activity(Path::new(t), &repo))
+        .unwrap_or(session::Activity::Unknown);
+    match activity {
+        session::Activity::NoEdits => touched.clear(),
+        session::Activity::Paths(p) => touched.retain(|f| p.contains(f)),
+        session::Activity::Any | session::Activity::Unknown => {}
+    }
+    if touched.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let files = match model::load_only(&repo, Some(&touched)) {
         Ok(f) if !f.is_empty() => f,
         _ => return ExitCode::SUCCESS,
     };
-    match ui::run(repo, files, ui::Mode::Hook) {
+    let outcome = ui::run(repo.clone(), files, ui::Mode::Hook);
+    // Whatever happened, the reviewed state is the new baseline: if the agent
+    // continues, the next Stop shows only what it changes in response.
+    if let Ok(snap) = session::snapshot(&repo) {
+        session::save(&repo, sess, &snap);
+    }
+    match outcome {
         Ok(Some(ui::Outcome { message: Some(m) })) => {
             println!(
                 "{}",

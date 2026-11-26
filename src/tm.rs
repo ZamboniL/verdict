@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Loading the VS Code / TextMate ecosystem into syntect:
 //! - TextMate grammars (`.tmLanguage.json`, `.tmLanguage` plist) are converted to
 //!   Sublime's `.sublime-syntax` model, which is what syntect understands.

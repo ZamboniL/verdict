@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Diff model: files -> hunks, per-hunk decisions, applying them to index/worktree,
 //! and rendering the feedback message for the agent.
 
@@ -56,6 +57,11 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
     /// Filled in by the background highlighter.
     pub hl: Option<FileHl>,
+    /// A whole-file action is active: `Reject` (every hunk rejected with one reason)
+    /// or `Comment` (a note about the file, hunks decided individually).
+    pub file_mode: Option<Decision>,
+    /// The reason / comment for the whole file.
+    pub note: String,
 }
 
 pub struct FileHl {
@@ -66,6 +72,17 @@ pub struct FileHl {
 }
 
 impl FileDiff {
+    /// The whole-file note, if one is active and non-empty.
+    pub fn file_note(&self) -> Option<&str> {
+        let n = self.note.trim();
+        (self.file_mode.is_some() && !n.is_empty()).then_some(n)
+    }
+
+    /// Every hunk has decision `d`.
+    pub fn all(&self, d: Decision) -> bool {
+        self.hunks.iter().all(|h| h.decision == d)
+    }
+
     /// Highest line number each side needs highlighted to render all hunks.
     pub fn needed_lines(&self) -> (usize, usize) {
         let mut o = 0;
@@ -98,8 +115,19 @@ fn is_binary(b: &[u8]) -> bool {
 }
 
 pub fn load(repo: &Path) -> git::Result<Vec<FileDiff>> {
+    load_only(repo, None)
+}
+
+/// Like `load`, restricted to `only` (repo-relative paths) when given.
+pub fn load_only(
+    repo: &Path,
+    only: Option<&std::collections::HashSet<String>>,
+) -> git::Result<Vec<FileDiff>> {
     let mut files = Vec::new();
     for e in git::changed(repo)? {
+        if only.is_some_and(|o| !o.contains(&e.path)) {
+            continue;
+        }
         if let Some(f) = load_file(repo, e)? {
             files.push(f);
         }
@@ -151,6 +179,8 @@ fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
         new_bytes,
         hunks: Vec::new(),
         hl: None,
+        file_mode: None,
+        note: String::new(),
     };
     if binary {
         f.hunks.push(Hunk {
@@ -407,7 +437,8 @@ pub fn counts(files: &[FileDiff]) -> Counts {
 pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
     let c = counts(files);
     let general = general.trim();
-    if c.reject + c.edit + c.comment == 0 && general.is_empty() {
+    let file_notes = files.iter().filter(|f| f.file_note().is_some()).count();
+    if c.reject + c.edit + c.comment + file_notes == 0 && general.is_empty() {
         return None;
     }
     let mut s = String::new();
@@ -427,15 +458,51 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
         let _ = writeln!(s, "## General feedback\n\n{general}\n");
     }
 
+    // Where a whole-file note goes: with the rejection if the file was rejected as a
+    // whole, otherwise under comments.
+    let note_in_reject = |f: &FileDiff| {
+        f.file_mode == Some(Decision::Reject) && f.hunks.iter().any(|h| h.decision == Decision::Reject)
+    };
+
     let section = |s: &mut String, title: &str, want: Decision| {
         let mut first = true;
         for f in files {
-            for h in f.hunks.iter().filter(|h| h.decision == want) {
-                if first {
-                    let _ = writeln!(s, "## {title}\n");
-                    first = false;
+            let hunks: Vec<(usize, &Hunk)> =
+                f.hunks.iter().enumerate().filter(|(_, h)| h.decision == want).collect();
+            let note_here = match want {
+                Decision::Reject => note_in_reject(f).then(|| f.file_note()).flatten(),
+                Decision::Comment => (!note_in_reject(f)).then(|| f.file_note()).flatten(),
+                _ => None,
+            };
+            if hunks.is_empty() && note_here.is_none() {
+                continue;
+            }
+            if first {
+                let _ = writeln!(s, "## {title}\n");
+                first = false;
+            }
+            let total = f.hunks.len();
+            let whole = !hunks.is_empty() && hunks.len() == total;
+            let scope = if whole && total > 1 {
+                format!(" (whole file, all {total} hunks)")
+            } else if whole {
+                " (whole file)".to_owned()
+            } else if !hunks.is_empty() {
+                format!(" ({} of {total} hunks)", hunks.len())
+            } else {
+                String::new()
+            };
+            let _ = writeln!(s, "### `{}`{scope}\n", f.path);
+            if let Some(n) = note_here {
+                let label = if want == Decision::Reject { "Why the file was rejected" } else { "About the whole file" };
+                let _ = writeln!(s, "**{label}:** {n}\n");
+            }
+            for (i, h) in hunks {
+                if total > 1 {
+                    let _ = writeln!(s, "Hunk {}/{total} {}\n", i + 1, h.header);
+                } else {
+                    let _ = writeln!(s, "{}\n", h.header);
                 }
-                let _ = writeln!(s, "### `{}` {}\n", f.path, h.header);
                 let diff = hunk_diff(h);
                 let fe = fence(&diff);
                 if want == Decision::Edit {
@@ -455,7 +522,7 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
                 };
                 if !note.is_empty() {
                     let _ = writeln!(s, "**{label}:** {note}\n");
-                } else if want == Decision::Reject {
+                } else if want == Decision::Reject && note_here.is_none() {
                     let _ = writeln!(s, "**{label}:** (no reason given; reconsider the approach)\n");
                 }
             }
@@ -463,7 +530,7 @@ pub fn feedback(files: &[FileDiff], general: &str) -> Option<String> {
     };
     section(&mut s, "Rejected (reverted in the working tree)", Decision::Reject);
     section(&mut s, "Edited by the reviewer (already applied)", Decision::Edit);
-    section(&mut s, "Comments on kept changes (still unstaged; adjust as asked)", Decision::Comment);
+    section(&mut s, "Comments (kept changes are still unstaged; adjust as asked)", Decision::Comment);
     Some(s)
 }
 
@@ -484,6 +551,8 @@ mod tests {
             new_bytes: new.into(),
             hunks: compute_hunks(&o, &n),
             hl: None,
+            file_mode: None,
+            note: String::new(),
             old: o,
             new: n,
         }
@@ -567,6 +636,31 @@ mod tests {
         // Everything decided -> nothing left to review.
         assert!(load(&dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whole_file_feedback() {
+        let mut f = file(OLD, NEW);
+        for h in &mut f.hunks {
+            h.decision = Decision::Reject;
+        }
+        f.file_mode = Some(Decision::Reject);
+        f.note = "wrong file entirely".into();
+        let m = feedback(std::slice::from_ref(&f), "").unwrap();
+        assert!(m.contains("(whole file, all 2 hunks)"), "{m}");
+        assert_eq!(m.matches("wrong file entirely").count(), 1);
+        assert!(m.contains("Hunk 1/2") && m.contains("Hunk 2/2"));
+        assert!(!m.contains("no reason given"));
+
+        // A file comment with everything approved still produces feedback.
+        let mut g = file(OLD, NEW);
+        for h in &mut g.hunks {
+            h.decision = Decision::Approve;
+        }
+        g.file_mode = Some(Decision::Comment);
+        g.note = "split this module later".into();
+        let m = feedback(std::slice::from_ref(&g), "").unwrap();
+        assert!(m.contains("About the whole file:** split this module later"), "{m}");
     }
 
     #[test]

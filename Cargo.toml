@@ -2,6 +2,12 @@
 name = "verdict"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Hunk-by-hunk review of AI-written code changes, fed back to the agent"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+keywords = ["code-review", "git", "diff", "ai", "claude"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"] }

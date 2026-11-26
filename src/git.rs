@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Thin wrapper around the `git` CLI. We shell out instead of linking libgit2:
 //! zero build deps, and git itself is always the source of truth.
 
@@ -28,7 +29,7 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-fn run_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
+pub fn run_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     let mut child = git(repo)
         .args(args)
         .stdin(Stdio::piped())
