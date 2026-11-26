@@ -31,14 +31,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the tag matches Cargo.toml
+      # The tag is the version: write it into Cargo.toml and Cargo.lock for this
+      # build, so releasing doesn't need a version-bump commit.
+      - name: Set the version from the tag
         shell: bash
         run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME isn't v<semver>"
             exit 1
           fi
+          perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
+          perl -0pi -e 's/(name = "verdict"\nversion = )"[^"]*"/$1"'"$version"'"/' Cargo.lock
+          grep -m1 '^version' Cargo.toml
+          grep -A1 '^name = "verdict"$' Cargo.lock
 
       - uses: dtolnay/rust-toolchain@stable
         with:

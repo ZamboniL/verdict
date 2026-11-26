@@ -139,7 +139,7 @@ verdict is a good tool for that.
 
 ## Releasing
 
-For maintainers: bump `version` in `Cargo.toml`, commit, then tag and push:
+For maintainers: tag a commit on `main` and push the tag:
 
 ```sh
 git tag v0.2.0
@@ -149,8 +149,8 @@ git push origin v0.2.0
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 `verdict` for Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel). It
 publishes a GitHub release with a `.tar.gz` and a SHA-256 checksum for each,
-plus generated release notes. The build fails if the tag doesn't match the
-version in `Cargo.toml`.
+plus generated release notes. The version comes from the tag: the workflow
+writes it into `Cargo.toml` for the build, so there's no version bump to commit.
 
 ## License
 
