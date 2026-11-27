@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Clear, Widget};
 
 /// How a file's code lines are drawn.
 #[derive(Clone, Copy)]
@@ -49,6 +49,18 @@ impl App {
             self.visible.push((r.fi, r.hi, r.lines()));
             self.render_row(buf, rect, r, sel == Some((r.fi, r.hi)));
         }
+        // The file and hunk the top rows belong to keep their headers in sight.
+        for (i, at) in sticky(&rows, self.scroll, h).into_iter().enumerate() {
+            let r = &rows[at];
+            let rect = Rect {
+                y: area.y + i as u16,
+                height: 1,
+                ..area
+            };
+            Clear.render(rect, buf);
+            self.visible[i] = (r.fi, r.hi, r.lines());
+            self.render_row(buf, rect, r, sel == Some((r.fi, r.hi)));
+        }
         // Scroll position, when it doesn't all fit.
         if rows.len() > h && h > 0 {
             let pct = (self.scroll * 100) / rows.len().saturating_sub(h).max(1);
@@ -70,9 +82,10 @@ impl App {
                     && [r.lines().0, r.lines().1].contains(&Some(l.cursor))
             })
         });
+        let hidden = |scroll: usize, at: usize| at < scroll + sticky(rows, scroll, h).len();
         if let Some(at) = cursor {
-            if at < self.scroll {
-                self.scroll = at;
+            if hidden(self.scroll, at) {
+                self.scroll = top_for(rows, at, h);
             } else if at + 1 > self.scroll + h {
                 self.scroll = (at + 1).saturating_sub(h);
             }
@@ -93,10 +106,10 @@ impl App {
         } else {
             first
         };
-        if first < self.scroll {
-            self.scroll = first;
+        if hidden(self.scroll, first) {
+            self.scroll = top_for(rows, first, h);
         } else if last + 1 > self.scroll + h {
-            self.scroll = (last + 1).saturating_sub(h).min(first);
+            self.scroll = (last + 1).saturating_sub(h).min(top_for(rows, first, h));
         }
     }
 
@@ -402,6 +415,50 @@ fn hunk_header(buf: &mut Buffer, rect: Rect, bar: Span<'static>, f: &FileDiff, h
     Line::from(badge).right_aligned().render(rect, buf);
 }
 
+/// The headers pinned over the top of the view when scrolled from `scroll`, as row
+/// indices: the file header of the top row, then the header of its hunk. A header
+/// already at its own place isn't repeated.
+fn sticky(rows: &[Row], scroll: usize, h: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let Some(top) = rows.get(scroll) else {
+        return out;
+    };
+    let file = rows[..scroll]
+        .iter()
+        .rposition(|r| r.fi == top.fi && matches!(r.kind, RowKind::FileHeader));
+    let Some(file) = file else {
+        return out;
+    };
+    if h < 2 {
+        return out;
+    }
+    out.push(file);
+    // The hunk of the row under the pinned file header.
+    let Some(below) = rows.get(scroll + 1) else {
+        return out;
+    };
+    if h < 4 || below.fi != top.fi || matches!(below.kind, RowKind::HunkHeader) {
+        return out;
+    }
+    let Some(hi) = below.hi else {
+        return out;
+    };
+    let hunk = rows[..=scroll]
+        .iter()
+        .rposition(|r| r.fi == top.fi && r.hi == Some(hi) && matches!(r.kind, RowKind::HunkHeader));
+    out.extend(hunk);
+    out
+}
+
+/// The scroll nearest `at` that shows it below the pinned headers.
+fn top_for(rows: &[Row], at: usize, h: usize) -> usize {
+    let mut s = at;
+    while s > 0 && at < s + sticky(rows, s, h).len() {
+        s -= 1;
+    }
+    s
+}
+
 /// The row after its one-column selection bar.
 fn after_bar(rect: Rect) -> Rect {
     Rect {
@@ -415,4 +472,48 @@ fn after_bar(rect: Rect) -> Rect {
 fn num(n: Option<usize>, digits: usize) -> String {
     let n = n.map(|n| n.to_string()).unwrap_or_default();
     format!("{n:>digits$}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(kind: RowKind, fi: usize, hi: Option<usize>) -> Row {
+        Row { kind, fi, hi }
+    }
+
+    /// File 0: header, hunk 0 (header, 3 lines), blank, hunk 1 (header, 3 lines), blank.
+    fn rows() -> Vec<Row> {
+        let mut v = vec![row(RowKind::FileHeader, 0, None)];
+        for hi in 0..2 {
+            v.push(row(RowKind::HunkHeader, 0, Some(hi)));
+            for li in 0..3 {
+                v.push(row(RowKind::Diff(li), 0, Some(hi)));
+            }
+        }
+        v.push(row(RowKind::Blank, 0, None));
+        v
+    }
+
+    #[test]
+    fn pins_file_and_hunk_headers() {
+        let rows = rows();
+        assert!(sticky(&rows, 0, 20).is_empty());
+        // Top row is hunk 0's header: only the file is pinned over it.
+        assert_eq!(sticky(&rows, 1, 20), [0, 1]);
+        assert_eq!(sticky(&rows, 2, 20), [0, 1]);
+        // Hunk 1's header sits right under the file header: not repeated.
+        assert_eq!(sticky(&rows, 4, 20), [0]);
+        assert_eq!(sticky(&rows, 6, 20), [0, 5]);
+        // A short view pins less.
+        assert_eq!(sticky(&rows, 6, 3), [0]);
+    }
+
+    #[test]
+    fn scrolls_a_hunk_header_below_the_pinned_file_header() {
+        let rows = rows();
+        assert_eq!(top_for(&rows, 5, 20), 4);
+        assert_eq!(top_for(&rows, 7, 20), 5);
+        assert_eq!(top_for(&rows, 0, 20), 0);
+    }
 }

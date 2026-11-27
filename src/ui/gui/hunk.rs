@@ -6,7 +6,7 @@ use super::code::{editor_job, rows_ui};
 use super::theme::{decision_color, decision_label, pal, tint};
 use super::widgets::{Look, button, caption, decision_button, note_box, pill};
 use crate::model::{self, Decision, FileHl, Hunk};
-use eframe::egui::{self, Align, FontId, Rect, RichText, Stroke, TextEdit, vec2};
+use eframe::egui::{self, Align, FontId, Rect, RichText, Sense, Stroke, TextEdit, UiBuilder, vec2};
 
 #[derive(Clone)]
 pub(super) struct HunkCtx<'a> {
@@ -40,6 +40,9 @@ pub(super) struct HunkCtx<'a> {
     pub scroll_to_cursor: bool,
     /// Focus this line comment's text box.
     pub focus_comment: Option<usize>,
+    /// How much of the view's top the pinned headers cover: rows scrolled into view
+    /// stop below it.
+    pub pinned_h: f32,
 }
 
 impl HunkCtx<'_> {
@@ -50,6 +53,8 @@ impl HunkCtx<'_> {
 
 pub(super) struct HunkOut {
     pub rect: Rect,
+    /// The header's rect.
+    pub head: Rect,
     pub clicked: bool,
     pub action: Option<Decision>,
     /// A line number was clicked: pick that line.
@@ -61,6 +66,7 @@ pub(super) struct HunkOut {
 pub(super) fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
     let mut out = HunkOut {
         rect: Rect::NOTHING,
+        head: Rect::NOTHING,
         clicked: false,
         action: None,
         line_click: None,
@@ -70,6 +76,10 @@ pub(super) fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
     let inner = ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let head = hunk_header(ui, h, &c, &mut out.action);
+        let c = HunkCtx {
+            pinned_h: c.pinned_h + head.height(),
+            ..c.clone()
+        };
         hunk_rows(ui, h, &c, &mut out);
         if !matches!(h.decision, Decision::Pending | Decision::Approve) {
             hunk_note(ui, h, &c);
@@ -77,9 +87,50 @@ pub(super) fn hunk_ui(ui: &mut egui::Ui, h: &mut Hunk, c: HunkCtx) -> HunkOut {
         head
     });
     out.rect = inner.response.rect;
-    let head = Rect::from_x_y_ranges(out.rect.x_range(), inner.inner.y_range());
-    paint_frame(ui, bg_idx, out.rect, head, h.decision, c.selected);
+    out.head = Rect::from_x_y_ranges(out.rect.x_range(), inner.inner.y_range());
+    paint_frame(ui, bg_idx, out.rect, out.head, h.decision, c.selected);
     out
+}
+
+/// The hunk's header again, pinned at `at` over the top of the view while the hunk
+/// scrolls under it. Returns whether its background was clicked, and the decision
+/// clicked.
+pub(super) fn pinned_hunk_header(
+    ui: &mut egui::Ui,
+    h: &Hunk,
+    c: &HunkCtx,
+    at: Rect,
+) -> (bool, Option<Decision>) {
+    let mut ui = pinned_ui(ui, at, "pinned hunk");
+    let clicked = ui
+        .interact(at, ui.scope_id().with("bg"), Sense::click())
+        .clicked();
+    let p = ui.painter().clone();
+    p.rect_filled(at, 0, head_fill(c.selected));
+    let mut action = None;
+    hunk_header(&mut ui, h, c, &mut action);
+    p.hline(at.x_range(), at.bottom(), Stroke::new(1.0, pal::SOFT));
+    if h.decision != Decision::Pending {
+        let stripe = Rect::from_min_size(at.left_top(), vec2(3.0, at.height()));
+        p.rect_filled(stripe, 0, decision_color(h.decision));
+    }
+    if c.selected {
+        let stroke = Stroke::new(1.5, pal::ACCENT);
+        p.vline(at.left() + 1.75, at.y_range(), stroke);
+        p.vline(at.right() - 1.75, at.y_range(), stroke);
+    }
+    (clicked, action)
+}
+
+/// A child of `ui` at `at` for a pinned header. Drawn after what it covers, it's on
+/// top of it, and so are its widgets for the pointer.
+pub(super) fn pinned_ui(ui: &mut egui::Ui, at: Rect, salt: &str) -> egui::Ui {
+    ui.new_child(
+        UiBuilder::new()
+            .max_rect(at)
+            .id_salt(salt)
+            .layout(egui::Layout::top_down(Align::Min)),
+    )
 }
 
 /// The label, the `@@` header, the decision pill and the decision buttons.
@@ -254,12 +305,10 @@ fn paint_frame(
     selected: bool,
 ) {
     let p = ui.painter();
-    let head_fill = if selected {
-        tint(pal::CARD, pal::ACCENT, 0.08)
-    } else {
-        pal::HUNK_HEAD
-    };
-    p.set(bg_idx, egui::epaint::RectShape::filled(head, 0, head_fill));
+    p.set(
+        bg_idx,
+        egui::epaint::RectShape::filled(head, 0, head_fill(selected)),
+    );
     p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, pal::SOFT));
     p.hline(rect.x_range(), head.bottom(), Stroke::new(1.0, pal::SOFT));
     if decision != Decision::Pending {
@@ -273,6 +322,14 @@ fn paint_frame(
             Stroke::new(1.5, pal::ACCENT),
             egui::StrokeKind::Inside,
         );
+    }
+}
+
+fn head_fill(selected: bool) -> egui::Color32 {
+    if selected {
+        tint(pal::CARD, pal::ACCENT, 0.08)
+    } else {
+        pal::HUNK_HEAD
     }
 }
 

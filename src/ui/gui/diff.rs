@@ -3,7 +3,7 @@
 //! hunks (and, in the full-file view, the unchanged code between them).
 
 use super::code::{gap_ui, max_chars};
-use super::hunk::{HunkCtx, hunk_ui};
+use super::hunk::{HunkCtx, hunk_ui, pinned_hunk_header, pinned_ui};
 use super::theme::pal;
 use super::widgets::{
     Look, button, caption, decision_button, note_box, pill, split_path, status_badge,
@@ -149,6 +149,7 @@ fn file_card(
         pal::BORDER
     };
     let mut header_rect = Rect::NOTHING;
+    let mut head = Rect::NOTHING;
     let mut header_bg = None;
     let resp = egui::Frame::new()
         .fill(pal::CARD)
@@ -158,13 +159,14 @@ fn file_card(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             header_bg = Some(ui.painter().add(egui::Shape::Noop));
-            header_rect = file_header(ui, f, card, view, clicks);
+            head = file_header(ui, f, card, view, clicks);
+            header_rect = head;
             if let Some(mode) = f.file_mode {
                 let note = file_note(ui, f, mode, focus.take_file_note(card.fi), view);
                 header_rect = header_rect.union(note);
             }
             if !card.collapsed {
-                file_hunks(ui, f, card, view, focus, clicks);
+                file_hunks(ui, f, card, view, head.height(), focus, clicks);
                 ui.add_space(6.0);
             }
         })
@@ -195,6 +197,22 @@ fn file_card(
             strip.bottom(),
             Stroke::new(1.0, pal::BORDER),
         );
+    }
+    // Once its header scrolls off, it stays at the top while the card's under it.
+    let top = ui.clip_rect().top();
+    if !card.collapsed && head.top() < top && inner.bottom() > top {
+        let y = top.min(inner.bottom() - head.height());
+        let strip = Rect::from_x_y_ranges(inner.x_range(), y..=y + head.height());
+        let at = Rect::from_x_y_ranges(head.left()..=strip.right(), strip.y_range());
+        let mut ui = pinned_ui(ui, at, "pinned file");
+        ui.interact(strip, ui.scope_id().with("bg"), Sense::click());
+        ui.painter().rect_filled(strip, 0, pal::HEADER);
+        ui.painter().hline(
+            strip.x_range(),
+            strip.bottom(),
+            Stroke::new(1.0, pal::BORDER),
+        );
+        file_header(&mut ui, f, card, view, clicks);
     }
     if card.selected && card.collapsed && focus.scroll_to_sel {
         ui.scroll_to_rect(resp.rect, Some(Align::Min));
@@ -400,10 +418,13 @@ fn file_hunks(
     f: &mut FileDiff,
     card: &Card,
     view: &View,
+    file_head_h: f32,
     focus: &mut Focus,
     clicks: &mut Clicks,
 ) {
     let fi = card.fi;
+    // Hunk headers stick below the file header pinned there.
+    let pin = ui.clip_rect().top() + file_head_h;
     let total = f.hunks.len();
     let digits = f.old.len().max(f.new.len()).to_string().len().max(3);
     let file_reason = f.file_mode == Some(Decision::Reject);
@@ -438,6 +459,7 @@ fn file_hunks(
         cursor: None,
         scroll_to_cursor: false,
         focus_comment: None,
+        pinned_h: file_head_h,
     };
     for (hi, h) in hunks.iter_mut().enumerate() {
         if let Some(g) = gaps.and_then(|g| g.get(hi)) {
@@ -470,7 +492,18 @@ fn file_hunks(
             focus_comment,
             ..gap_ctx.clone()
         };
-        let out = hunk_ui(ui, h, ctx);
+        let out = hunk_ui(ui, h, ctx.clone());
+        if out.head.top() < pin && out.rect.bottom() > pin {
+            let y = pin.min(out.rect.bottom() - out.head.height());
+            let at = out.head.translate(vec2(0.0, y - out.head.top()));
+            let (clicked, action) = pinned_hunk_header(ui, h, &ctx, at);
+            if clicked || action.is_some() {
+                clicks.select = Some((fi, hi));
+            }
+            if action.is_some() {
+                clicks.decision = action;
+            }
+        }
         if scroll_to_cursor {
             focus.scroll_to_sel = false;
         }
@@ -488,7 +521,8 @@ fn file_hunks(
             clicks.decision = Some(d);
         }
         if selected && focus.scroll_to_sel {
-            ui.scroll_to_rect(out.rect, Some(Align::Min));
+            let under_file = out.rect.with_min_y(out.rect.top() - file_head_h);
+            ui.scroll_to_rect(under_file, Some(Align::Min));
             focus.scroll_to_sel = false;
         }
     }

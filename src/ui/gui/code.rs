@@ -162,7 +162,7 @@ fn diff_lines(
         let top = rect.top() + i as f32 * c.row_h;
         let row = Rect::from_min_size(pos2(rect.left(), top), vec2(width, c.row_h));
         if c.scroll_to_cursor && c.cursor == Some(li) {
-            ui.scroll_to_rect(row, None);
+            ui.scroll_to_rect(row.with_min_y(row.top() - c.pinned_h), None);
         }
         if !clip.intersects(row) {
             continue;
@@ -202,10 +202,8 @@ fn split_lines(
     for (i, &(left, right)) in pairs.iter().enumerate() {
         let top = rect.top() + i as f32 * c.row_h;
         if c.scroll_to_cursor && c.cursor.is_some() && [left, right].contains(&c.cursor) {
-            ui.scroll_to_rect(
-                Rect::from_min_size(pos2(rect.left(), top), vec2(half * 2.0, c.row_h)),
-                None,
-            );
+            let row = Rect::from_min_size(pos2(rect.left(), top), vec2(half * 2.0, c.row_h));
+            ui.scroll_to_rect(row.with_min_y(top - c.pinned_h), None);
         }
         for (side, idx) in [(0.0, left), (1.0, right)] {
             let x0 = rect.left() + side * half;
