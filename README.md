@@ -88,6 +88,11 @@ This installs the `verdict` binary into `~/.cargo/bin`.
 - **macOS:** expected to work, but not tested yet.
 - **Native Windows:** not supported yet. Use WSL2.
 
+The window draws its own title bar, the same on every system: drag the top bar
+to move it, double-click it to maximize, and resize from the edges. On macOS
+the system's window buttons stay, at the top bar's left.
+`VERDICT_TITLE_BAR=system` uses the system's title bar instead.
+
 ## Quick start
 
 Run it inside any git repository that has uncommitted changes:

@@ -3,6 +3,7 @@
 
 mod backend;
 mod capture;
+mod chrome;
 mod code;
 mod diff;
 mod hunk;
@@ -41,12 +42,15 @@ pub fn run(repo: PathBuf, mut review: Review, mode: Mode) -> Result<Option<Outco
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let frame = chrome::Frame::pick();
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("verdict: {name}"))
-            .with_app_id("verdict")
-            .with_inner_size([1280.0, 860.0])
-            .with_min_inner_size([640.0, 400.0]),
+        viewport: frame.viewport(
+            egui::ViewportBuilder::default()
+                .with_title(format!("verdict: {name}"))
+                .with_app_id("verdict")
+                .with_inner_size([1280.0, 860.0])
+                .with_min_inner_size([640.0, 400.0]),
+        ),
         event_loop_builder: event_loop_hook(),
         ..Default::default()
     };
@@ -75,6 +79,7 @@ pub fn run(repo: PathBuf, mut review: Review, mode: Mode) -> Result<Option<Outco
                 capture,
                 drafts,
                 notice,
+                frame,
             }))
         }),
     )
@@ -102,6 +107,8 @@ struct App {
     drafts: Drafts,
     /// Something to tell the reviewer, shown in the bottom bar until dismissed.
     notice: Option<String>,
+    /// Who draws the window's frame.
+    frame: chrome::Frame,
 }
 
 /// Text boxes to focus and scrolling to do on the next frame, asked for by a key or
@@ -272,9 +279,12 @@ impl eframe::App for App {
                 .fill(pal::PANEL)
                 .inner_margin(egui::Margin::symmetric(x, y))
         };
-        egui::Panel::top("top")
-            .frame(bar(14, 8))
-            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top").frame(bar(14, 8)).show(ui, |ui| {
+            if self.frame.is_drawn() {
+                chrome::drag_area(ui, ui.max_rect().expand2(egui::vec2(14.0, 8.0)));
+            }
+            self.top_bar(ui)
+        });
         egui::Panel::bottom("bottom")
             .frame(bar(14, 8))
             .show(ui, |ui| self.bottom_bar(ui));
@@ -307,6 +317,9 @@ impl eframe::App for App {
                 bottom: 0,
             }))
             .show(ui, |ui| self.diff_view(ui));
+        if self.frame == chrome::Frame::Own {
+            chrome::edges(&ctx);
+        }
         if !self.done {
             self.drafts.save(&self.r);
         }

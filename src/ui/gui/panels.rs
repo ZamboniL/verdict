@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The panels around the diff: the top bar, the bottom bar and the file list.
 
-use super::App;
 use super::theme::{decision_color, pal, tint};
 use super::widgets::{
     Look, button, caption, key_hint, note_box, paint_badge, pill, progress_bar, split_path,
 };
+use super::{App, chrome};
 use crate::model::{Decision, FileDiff};
 use crate::ui::{Mode, REG};
 use eframe::egui::{
@@ -20,6 +20,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.set_min_height(30.0);
             ui.spacing_mut().item_spacing.x = 6.0;
+            if self.frame.left_inset() > 0.0 {
+                ui.add_space(self.frame.left_inset());
+            }
             ui.label(
                 RichText::new("verdict")
                     .size(14.0)
@@ -69,6 +72,10 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if self.frame == chrome::Frame::Own {
+                    ui.scope(chrome::window_buttons);
+                    ui.add_space(10.0);
+                }
                 let label = match (self.mode, will_send) {
                     (Mode::Hook, true) => "Send feedback",
                     (Mode::Hook, false) => "Let agent finish",
