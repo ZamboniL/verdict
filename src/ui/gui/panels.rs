@@ -9,6 +9,7 @@ use super::widgets::{
 };
 use super::{App, chrome};
 use crate::model::{Decision, FileDiff};
+use crate::ui::keys::{HELP, Where};
 use crate::ui::{Mode, REG};
 use eframe::egui::{
     self, Align, Color32, FontId, Rect, RichText, Sense, TextFormat, pos2, text::LayoutJob, vec2,
@@ -276,27 +277,18 @@ impl App {
 
 /// Every keyboard shortcut, for the keyboard icon's tooltip.
 fn shortcuts(ui: &mut egui::Ui, agent: bool) {
-    ui.set_max_width(260.0);
-    let rows: &[(&str, &str)] = &[
-        ("j k", "move"),
-        ("a r e c", "approve · reject · edit · comment"),
-        ("A R C", "whole file"),
-        ("x", "clear"),
-        ("v", "pick lines"),
-        ("n", "next pending"),
-        ("[ ]", "files"),
-        ("f", "full file"),
-        ("s", "split"),
-        ("Space", "fold"),
-        ("t", "agent's message"),
-        ("Esc", "leave text box"),
-        ("Ctrl+Enter", "submit"),
-    ];
-    for (keys, what) in rows {
-        if *keys == "t" && !agent {
+    ui.set_max_width(400.0);
+    for r in HELP.iter().filter(|r| r.on != Where::Tui) {
+        if r.keys == "t" && !agent {
             continue;
         }
-        ui.horizontal(|ui| key_hint(ui, keys, what));
+        ui.horizontal(|ui| {
+            // Line mode's keys sit under its row.
+            if r.keys.starts_with("  ") {
+                ui.add_space(16.0);
+            }
+            key_hint(ui, r.keys.trim(), r.what.trim());
+        });
     }
 }
 

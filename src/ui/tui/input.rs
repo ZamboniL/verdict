@@ -2,7 +2,8 @@
 //! Keys and the mouse.
 
 use super::{Action, App, Input, State, Target};
-use crate::model::{self, Decision};
+use crate::model;
+use crate::ui::keys::{self, Command, Key};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -29,7 +30,9 @@ impl App {
             }
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && matches!(k.code, KeyCode::Enter | KeyCode::Char('s')) {
+        let cmd = key_of(k.code).and_then(|key| keys::command(key, ctrl, self.r.lines.is_some()));
+        // Submitting works from anywhere, a text box included.
+        if cmd == Some(Command::Submit) {
             if let State::Input(inp) = std::mem::replace(&mut self.state, State::Normal) {
                 self.set_text(inp.target, inp.buf.iter().collect());
             }
@@ -40,12 +43,10 @@ impl App {
         if !matches!(self.state, State::Normal) {
             return self.modal_key(k);
         }
-        if self.r.lines.is_some() {
-            if let Some(a) = self.line_key(k.code) {
-                return a;
-            }
+        match cmd {
+            Some(c) => self.run(c),
+            None => Action::None,
         }
-        self.normal_key(k)
     }
 
     /// A key while a text box, a question or a box over the review is open.
@@ -83,82 +84,62 @@ impl App {
         Action::None
     }
 
-    /// A key in line mode. `None` for keys line mode leaves to the usual handling.
-    fn line_key(&mut self, code: KeyCode) -> Option<Action> {
-        match code {
-            KeyCode::Char('j') | KeyCode::Down => self.r.move_line(true, false),
-            KeyCode::Char('k') | KeyCode::Up => self.r.move_line(false, false),
-            KeyCode::Char('J') => self.r.move_line(true, true),
-            KeyCode::Char('K') => self.r.move_line(false, true),
-            KeyCode::Char('c' | 'i') | KeyCode::Enter => {
-                let e = self.r.comment_lines();
-                return Some(self.effect(e));
-            }
-            KeyCode::Esc => self.r.lines = None,
-            _ => return None,
-        }
-        Some(Action::None)
-    }
-
-    fn normal_key(&mut self, k: KeyEvent) -> Action {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    /// Carry out a shortcut.
+    fn run(&mut self, c: Command) -> Action {
         let page = (self.main_area.height as isize / 2).max(1);
-        match k.code {
-            KeyCode::Char('c') if ctrl => self.ask_quit(),
-            KeyCode::Char('d') if ctrl => self.scroll_by(page),
-            KeyCode::Char('u') if ctrl => self.scroll_by(-page),
-            KeyCode::Char('a') if ctrl => self.r.approve_all_pending(),
-            _ if ctrl => {}
-            KeyCode::PageDown => self.scroll_by(page),
-            KeyCode::PageUp => self.scroll_by(-page),
-            KeyCode::Char('q') => self.ask_quit(),
-            // Next to A (approve file), so ask first. Ctrl+S submits at once.
-            KeyCode::Char('S') => self.state = State::ConfirmSubmit,
-            KeyCode::Char('?') => self.state = State::Help,
-            KeyCode::Char('t') => {
+        match c {
+            Command::Next => self.r.next(),
+            Command::Prev => self.r.prev(),
+            Command::First => self.r.first(),
+            Command::Last => self.r.last(),
+            Command::NextFile => self.r.next_file(),
+            Command::PrevFile => self.r.prev_file(),
+            Command::NextPending => self.r.next_pending(),
+            Command::Decide(d) => return self.set_decision(d),
+            Command::File(d) => return self.file_action(d),
+            Command::Clear => self.r.clear(),
+            Command::ApproveAllPending => self.r.approve_all_pending(),
+            Command::ToggleFull => {
+                if let Some(fi) = self.r.cur_file() {
+                    let e = self.r.toggle_full(fi);
+                    return self.effect(e);
+                }
+            }
+            Command::ToggleSplit => self.r.toggle_split(),
+            Command::ToggleFold => {
+                if let Some(fi) = self.r.cur_file() {
+                    self.r.toggle_fold(fi);
+                }
+            }
+            Command::ToggleLines => {
+                let e = self.r.toggle_lines();
+                return self.effect(e);
+            }
+            Command::MoveLine { down, extend } => self.r.move_line(down, extend),
+            Command::CommentLines => {
+                let e = self.r.comment_lines();
+                return self.effect(e);
+            }
+            Command::LeaveLines => self.r.lines = None,
+            Command::AgentMessage => {
                 if self.r.agent_message.is_some() {
                     self.state = State::Agent(0);
                 } else {
                     self.info("no message from the agent for this review");
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.r.next(),
-            KeyCode::Char('k') | KeyCode::Up => self.r.prev(),
-            KeyCode::Char('g') | KeyCode::Home => self.r.first(),
-            KeyCode::Char('G') | KeyCode::End => self.r.last(),
-            KeyCode::Char(']') | KeyCode::Tab => self.r.next_file(),
-            KeyCode::Char('[') | KeyCode::BackTab => self.r.prev_file(),
-            KeyCode::Char('h') | KeyCode::Left => self.hscroll = self.hscroll.saturating_sub(8),
-            KeyCode::Char('l') | KeyCode::Right => self.hscroll += 8,
-            KeyCode::Char('0') => self.hscroll = 0,
-            KeyCode::Char('n') => self.r.next_pending(),
-            KeyCode::Char('a') => return self.set_decision(Decision::Approve),
-            KeyCode::Char('r') => return self.set_decision(Decision::Reject),
-            KeyCode::Char('e') => return self.set_decision(Decision::Edit),
-            KeyCode::Char('c') => return self.set_decision(Decision::Comment),
-            KeyCode::Char('A') => return self.file_action(Decision::Approve),
-            KeyCode::Char('R') => return self.file_action(Decision::Reject),
-            KeyCode::Char('C') => return self.file_action(Decision::Comment),
-            KeyCode::Char('x') => self.r.clear(),
-            KeyCode::Char('f') => {
-                if let Some(fi) = self.r.cur_file() {
-                    let e = self.r.toggle_full(fi);
-                    return self.effect(e);
-                }
+            Command::Note => self.edit_note(),
+            Command::GeneralNote => self.open_input(Target::General),
+            Command::ScrollPage { down } => self.scroll_by(if down { page } else { -page }),
+            Command::ScrollSideways { right: true } => self.hscroll += 8,
+            Command::ScrollSideways { right: false } => {
+                self.hscroll = self.hscroll.saturating_sub(8);
             }
-            KeyCode::Char('s') => self.r.toggle_split(),
-            KeyCode::Char(' ') => {
-                if let Some(fi) = self.r.cur_file() {
-                    self.r.toggle_fold(fi);
-                }
-            }
-            KeyCode::Char('m') => self.open_input(Target::General),
-            KeyCode::Char('v') => {
-                let e = self.r.toggle_lines();
-                return self.effect(e);
-            }
-            KeyCode::Enter | KeyCode::Char('i') => self.edit_note(),
-            _ => {}
+            Command::ScrollHome => self.hscroll = 0,
+            Command::Help => self.state = State::Help,
+            Command::AskSubmit => self.state = State::ConfirmSubmit,
+            Command::Submit => self.submit(),
+            Command::Quit => self.ask_quit(),
         }
         Action::None
     }
@@ -298,4 +279,24 @@ impl Input {
             _ => {}
         }
     }
+}
+
+/// The shortcut key for a terminal key code, if it can be one.
+fn key_of(code: KeyCode) -> Option<Key> {
+    Some(match code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        _ => return None,
+    })
 }

@@ -15,10 +15,11 @@ mod widgets;
 use crate::draft::Drafts;
 use crate::model::{Decision, FileHl};
 use crate::review::{Effect, Review};
+use crate::ui::keys::{self, Command};
 use crate::ui::{Mode, Outcome, hl_jobs, run_highlighter};
 use backend::event_loop_hook;
 use capture::Capture;
-use eframe::egui::{self, Event, Key, Modifiers, RichText};
+use eframe::egui::{self, Event, Key, RichText};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -182,83 +183,129 @@ impl App {
         }
     }
 
+    /// The first key press this frame that's a shortcut, carried out. While a text
+    /// box has focus only submitting counts: every other key is typing.
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
-            self.submit(ctx);
-            return;
-        }
-        if ctx.text_edit_focused() || self.r.sel_pair().is_none() {
-            return;
-        }
-        let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
-        let shifted = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, k));
-        let cur = self.r.cur_file();
-        let mut handled = true;
+        let typing = ctx.text_edit_focused();
         let line_mode = self.r.lines.is_some();
-        // Line mode: j/k move by line, J/K extend, c or Enter comments.
-        if line_mode && shifted(Key::J) {
-            self.r.move_line(true, true);
-        } else if line_mode && shifted(Key::K) {
-            self.r.move_line(false, true);
-        } else if line_mode && (pressed(Key::J) || pressed(Key::ArrowDown)) {
-            self.r.move_line(true, false);
-        } else if line_mode && (pressed(Key::K) || pressed(Key::ArrowUp)) {
-            self.r.move_line(false, false);
-        } else if line_mode && (pressed(Key::C) || pressed(Key::Enter)) {
-            let e = self.r.comment_lines();
-            self.effect(e);
-        } else if line_mode && pressed(Key::Escape) {
-            self.r.lines = None;
-        } else if pressed(Key::V) {
-            let e = self.r.toggle_lines();
-            self.effect(e);
-        // Shift variants first: plain-key matching ignores Shift.
-        } else if let (Some(fi), true) = (cur, shifted(Key::A)) {
-            self.file_action(fi, Decision::Approve);
-        } else if let (Some(fi), true) = (cur, shifted(Key::R)) {
-            self.file_action(fi, Decision::Reject);
-        } else if let (Some(fi), true) = (cur, shifted(Key::C)) {
-            self.file_action(fi, Decision::Comment);
-        } else if pressed(Key::J) || pressed(Key::ArrowDown) {
-            self.r.next();
-        } else if pressed(Key::K) || pressed(Key::ArrowUp) {
-            self.r.prev();
-        } else if let (Some(fi), true) = (cur, pressed(Key::F)) {
-            self.r.toggle_full(fi);
-        } else if pressed(Key::S) {
-            self.r.toggle_split();
-        } else if pressed(Key::T) {
-            self.show_agent = !self.show_agent && self.r.agent_message.is_some();
-        } else if let (Some(fi), true) = (cur, pressed(Key::Space)) {
-            self.r.toggle_fold(fi);
-        } else if pressed(Key::N) {
-            self.r.next_pending();
-        } else if shifted(Key::G) || pressed(Key::End) {
-            self.r.last();
-        } else if pressed(Key::G) || pressed(Key::Home) {
-            self.r.first();
-        } else if pressed(Key::CloseBracket) {
-            self.r.next_file();
-        } else if pressed(Key::OpenBracket) {
-            self.r.prev_file();
-        } else if pressed(Key::X) {
-            self.r.clear();
-        } else if pressed(Key::A) {
-            self.set_decision(Decision::Approve);
-        } else if pressed(Key::R) {
-            self.set_decision(Decision::Reject);
-        } else if pressed(Key::E) {
-            self.set_decision(Decision::Edit);
-        } else if pressed(Key::C) {
-            self.set_decision(Decision::Comment);
-        } else {
-            handled = false;
+        let found = ctx.input(|i| {
+            i.events.iter().enumerate().find_map(|(n, e)| {
+                let Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                else {
+                    return None;
+                };
+                if modifiers.alt {
+                    return None;
+                }
+                let k = key_of(*key, modifiers.shift)?;
+                let cmd = keys::command(k, modifiers.command, line_mode)?;
+                (!typing || cmd == Command::Submit).then_some((n, cmd))
+            })
+        });
+        let Some((n, cmd)) = found else {
+            return;
+        };
+        if cmd != Command::Submit && self.r.sel_pair().is_none() {
+            return;
         }
-        if handled {
-            // Don't let the shortcut letter leak into a text box we just focused.
-            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
+        if self.run(cmd, ctx) {
+            ctx.input_mut(|i| {
+                i.events.remove(n);
+                // Don't let the shortcut letter leak into a text box it just focused.
+                i.events.retain(|e| !matches!(e, Event::Text(_)));
+            });
         }
     }
+
+    /// Carry out a shortcut. False for the ones the window doesn't have (it has
+    /// buttons, a scroll bar and a close button for those).
+    fn run(&mut self, c: Command, ctx: &egui::Context) -> bool {
+        let cur = self.r.cur_file();
+        match c {
+            Command::Next => self.r.next(),
+            Command::Prev => self.r.prev(),
+            Command::First => self.r.first(),
+            Command::Last => self.r.last(),
+            Command::NextFile => self.r.next_file(),
+            Command::PrevFile => self.r.prev_file(),
+            Command::NextPending => self.r.next_pending(),
+            Command::Decide(d) => self.set_decision(d),
+            Command::File(d) => match cur {
+                Some(fi) => self.file_action(fi, d),
+                None => return false,
+            },
+            Command::Clear => self.r.clear(),
+            Command::ApproveAllPending => self.r.approve_all_pending(),
+            Command::ToggleFull => match cur {
+                Some(fi) => {
+                    let e = self.r.toggle_full(fi);
+                    self.effect(e);
+                }
+                None => return false,
+            },
+            Command::ToggleSplit => self.r.toggle_split(),
+            Command::ToggleFold => match cur {
+                Some(fi) => self.r.toggle_fold(fi),
+                None => return false,
+            },
+            Command::ToggleLines => {
+                let e = self.r.toggle_lines();
+                self.effect(e);
+            }
+            Command::MoveLine { down, extend } => self.r.move_line(down, extend),
+            Command::CommentLines => {
+                let e = self.r.comment_lines();
+                self.effect(e);
+            }
+            Command::LeaveLines => self.r.lines = None,
+            Command::AgentMessage => {
+                self.show_agent = !self.show_agent && self.r.agent_message.is_some();
+            }
+            Command::Submit => self.submit(ctx),
+            Command::Note
+            | Command::GeneralNote
+            | Command::ScrollPage { .. }
+            | Command::ScrollSideways { .. }
+            | Command::ScrollHome
+            | Command::Help
+            | Command::AskSubmit
+            | Command::Quit => return false,
+        }
+        true
+    }
+}
+
+/// The shortcut key for a window key press, if it can be one.
+fn key_of(key: Key, shift: bool) -> Option<keys::Key> {
+    use keys::Key as K;
+    Some(match key {
+        Key::Enter => K::Enter,
+        Key::Escape => K::Esc,
+        Key::Tab if shift => K::BackTab,
+        Key::Tab => K::Tab,
+        Key::ArrowUp => K::Up,
+        Key::ArrowDown => K::Down,
+        Key::ArrowLeft => K::Left,
+        Key::ArrowRight => K::Right,
+        Key::Home => K::Home,
+        Key::End => K::End,
+        Key::PageUp => K::PageUp,
+        Key::PageDown => K::PageDown,
+        Key::Space => K::Char(' '),
+        _ => {
+            let mut chars = key.symbol_or_name().chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return None;
+            };
+            let c = c.to_ascii_lowercase();
+            K::Char(if shift { c.to_ascii_uppercase() } else { c })
+        }
+    })
 }
 
 impl eframe::App for App {

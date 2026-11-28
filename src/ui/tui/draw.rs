@@ -5,6 +5,7 @@
 use super::theme::{fg, pal, status_color};
 use super::{App, Input, State, Target, cells};
 use crate::model::Decision;
+use crate::ui::keys::{HELP, Where};
 use crate::ui::{Mode, REG};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -374,49 +375,27 @@ fn agent_message(f: &mut Frame, area: Rect, msg: &str, scroll: &mut u16) {
 }
 
 fn help(f: &mut Frame, area: Rect) {
-    const KEYS: &[(&str, &str)] = &[
-        ("j / k, ↓ / ↑", "next / previous hunk"),
-        ("] / [, Tab", "next / previous file"),
-        ("g / G", "first / last hunk"),
-        ("n", "next undecided hunk"),
-        ("a", "approve hunk (stage it)"),
-        ("r", "reject hunk (revert it) and give a reason"),
-        ("e", "edit the hunk in $EDITOR"),
-        ("c", "comment on the hunk"),
-        ("v", "line mode: pick lines to comment on (or click a line)"),
-        ("  j / k", "  move to the next / previous line"),
-        ("  J / K", "  extend the picked lines down / up"),
-        ("  c, Enter", "  comment on the picked lines"),
-        ("  Esc", "  leave line mode"),
-        ("x", "clear the hunk's decision"),
-        ("A / R / C", "approve / reject / comment on the whole file"),
-        ("Enter, i", "write or change the note for the hunk or file"),
-        ("m", "general message to the agent"),
-        ("t", "what the agent said (from the hook)"),
-        ("Ctrl+A", "approve every pending hunk"),
-        ("f", "full file: show unchanged code between hunks"),
-        ("s", "split view: old and new side by side"),
-        ("Space", "fold / unfold the file"),
-        ("h / l, ← / →, 0", "scroll sideways / back"),
-        ("Ctrl+D / Ctrl+U", "scroll half a page"),
-        ("S", "submit: apply and send the review (asks first)"),
-        ("Ctrl+S, Ctrl+Enter", "submit without asking"),
-        ("q, Ctrl+C", "quit without applying anything"),
+    // The shortcuts, then the text box's own keys.
+    const TEXT_BOX: &[(&str, &str)] = &[
         ("", ""),
         ("In a text box:", ""),
         ("Enter / Esc", "save / cancel"),
         ("Alt+Enter, Ctrl+J", "new line"),
         ("Ctrl+O", "write it in $EDITOR instead"),
     ];
-    let lines: Vec<Line> = KEYS
+    let keys = HELP
         .iter()
+        .filter(|r| r.on != Where::Gui)
+        .map(|r| (r.keys, r.what))
+        .chain(TEXT_BOX.iter().copied());
+    let lines: Vec<Line> = keys
         .map(|(k, d)| {
             Line::from(vec![
                 Span::styled(
                     format!(" {k:<20}"),
                     Style::new().fg(pal::ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(*d, fg(pal::TEXT)),
+                Span::styled(d, fg(pal::TEXT)),
             ])
         })
         .collect();

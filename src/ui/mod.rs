@@ -11,6 +11,7 @@ mod config;
 #[cfg(feature = "gui")]
 mod gui;
 mod highlighter;
+mod keys;
 mod launch;
 #[cfg(feature = "tui")]
 mod tui;
