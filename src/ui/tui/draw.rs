@@ -70,6 +70,7 @@ impl App {
             ),
             Span::styled(format!(" {} hunks", c.total), fg(pal::DIM)),
         ];
+        spans.extend(super::render::stat_spans(self.r.line_stats()));
         for (n, label, col) in [
             (c.approve, "approved", pal::GREEN),
             (c.reject, "rejected", pal::RED),

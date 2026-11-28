@@ -178,6 +178,11 @@ impl FileDiff {
         out
     }
 
+    /// Lines added and removed across the file's hunks.
+    pub fn line_stats(&self) -> LineStats {
+        line_stats(std::slice::from_ref(self))
+    }
+
     pub fn ext(&self) -> &str {
         Path::new(&self.path)
             .extension()
@@ -1006,6 +1011,30 @@ pub fn counts(files: &[FileDiff]) -> Counts {
     c
 }
 
+/// Lines added and removed, like `git diff --stat`'s `+5 -10`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct LineStats {
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Lines added and removed across every file's hunks. A binary file's placeholder
+/// lines don't count.
+pub fn line_stats(files: &[FileDiff]) -> LineStats {
+    let mut s = LineStats::default();
+    for l in files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines) {
+        if !l.is_code() {
+            continue;
+        }
+        match l.kind {
+            Kind::Add => s.added += 1,
+            Kind::Del => s.removed += 1,
+            Kind::Ctx => {}
+        }
+    }
+    s
+}
+
 /// Some hunk has a line comment with text in it.
 pub fn has_line_comments(files: &[FileDiff]) -> bool {
     files
@@ -1280,6 +1309,27 @@ mod tests {
 
     const OLD: &str = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\n";
     const NEW: &str = "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\nm\nn\n";
+
+    #[test]
+    fn line_stats_per_file_and_total() {
+        // b→B and l→L replace a line each; n is added at the end.
+        let a = file(OLD, NEW);
+        assert_eq!(
+            a.line_stats(),
+            LineStats {
+                added: 3,
+                removed: 2
+            }
+        );
+        let b = file("x\ny\n", "x\n");
+        assert_eq!(
+            line_stats(&[a, b]),
+            LineStats {
+                added: 3,
+                removed: 3
+            }
+        );
+    }
 
     #[test]
     fn two_hunks() {

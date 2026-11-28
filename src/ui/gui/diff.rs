@@ -7,7 +7,8 @@ use super::hunk::{HunkCtx, hunk_ui, pinned_hunk_header, pinned_ui};
 use super::icons::{self, Icon};
 use super::theme::pal;
 use super::widgets::{
-    Look, beside_icon, decision_button, icon_button, icon_pill, note_box, split_path, status_badge,
+    Look, beside_icon, decision_button, icon_button, icon_pill, line_stats, note_box, split_path,
+    status_badge,
 };
 use super::{App, Focus};
 use crate::model::{DLine, Decision, FileDiff};
@@ -258,6 +259,7 @@ fn file_header(
                     .response
                     .on_hover_text(format!("Renamed from {from}"));
                 }
+                line_stats(ui, f.line_stats(), 11.5);
                 if let Some(hl) = &f.hl {
                     ui.label(RichText::new(&hl.lang).size(11.5).color(pal::FAINT));
                 }

@@ -536,6 +536,10 @@ impl Review {
         model::counts(&self.files)
     }
 
+    pub fn line_stats(&self) -> model::LineStats {
+        model::line_stats(&self.files)
+    }
+
     /// Submitting would send the agent something to act on.
     pub fn will_send(&self) -> bool {
         let c = self.counts();

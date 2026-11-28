@@ -307,3 +307,35 @@ pub(super) fn decision_button(
     };
     icon_button(ui, icons::decision(d), tip, key, look, on, enabled)
 }
+
+/// "+5 −10" in green and red, like `git diff --stat`. A side that's zero is left
+/// out, and nothing is drawn when both are.
+pub(super) fn line_stats(ui: &mut egui::Ui, s: model::LineStats, size: f32) {
+    if s.added == 0 && s.removed == 0 {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        if s.added > 0 {
+            ui.label(
+                RichText::new(format!("+{}", s.added))
+                    .font(FontId::monospace(size))
+                    .color(pal::GREEN),
+            );
+        }
+        if s.removed > 0 {
+            ui.label(
+                RichText::new(format!("−{}", s.removed))
+                    .font(FontId::monospace(size))
+                    .color(pal::RED),
+            );
+        }
+    })
+    .response
+    .on_hover_text(format!(
+        "{} line{} added, {} removed",
+        s.added,
+        if s.added == 1 { "" } else { "s" },
+        s.removed
+    ));
+}

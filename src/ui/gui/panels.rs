@@ -4,8 +4,8 @@
 use super::icons::{self, Icon};
 use super::theme::{decision_color, pal, tint};
 use super::widgets::{
-    Look, icon_button, icon_pill, icon_text_button, key_hint, note_box, paint_badge, progress_bar,
-    split_path,
+    Look, icon_button, icon_pill, icon_text_button, key_hint, line_stats, note_box, paint_badge,
+    progress_bar, split_path,
 };
 use super::{App, chrome};
 use crate::model::{Decision, FileDiff};
@@ -56,6 +56,8 @@ impl App {
                  {} approved · {} rejected · {} edited · {} commented · {} pending",
                 c.total, c.approve, c.reject, c.edit, c.comment, c.pending
             ));
+            ui.add_space(6.0);
+            line_stats(ui, self.r.line_stats(), 12.0);
             if let Some(reg) = REG.get() {
                 if !reg.warnings.is_empty() {
                     ui.add_space(6.0);
