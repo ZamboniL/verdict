@@ -2,7 +2,7 @@
 //! Keys and the mouse.
 
 use super::{Action, App, Input, State, Target};
-use crate::model;
+use crate::diff;
 use crate::ui::keys::{self, Command, Key};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -216,7 +216,7 @@ impl App {
     }
 
     /// The hunk line whose line number is at column `col` of a diff row, if any.
-    fn gutter_hit(&self, fi: usize, col: u16, (left, right): model::Pair) -> Option<usize> {
+    fn gutter_hit(&self, fi: usize, col: u16, (left, right): diff::Pair) -> Option<usize> {
         let f = &self.r.files[fi];
         let digits = f.old.len().max(f.new.len()).to_string().len().max(3) as u16;
         if !self.r.split {

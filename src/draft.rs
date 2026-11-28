@@ -8,8 +8,8 @@
 //! reviews open in the same repo don't overwrite each other's drafts. Submitting, or
 //! discarding the review on purpose, removes its entries.
 
+use crate::diff::{Decision, FileDiff, LineComment};
 use crate::git::Source;
-use crate::model::{Decision, FileDiff, LineComment};
 use crate::review::Review;
 use crate::store;
 use serde::{Deserialize, Serialize};
@@ -331,8 +331,8 @@ impl Drafts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{compute_hunks, split_lines};
     use crate::git::Status;
-    use crate::model::{compute_hunks, split_lines};
 
     fn file(path: &str, old: &str, new: &str) -> FileDiff {
         let o = split_lines(old);

@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+mod commands;
+mod diff;
 mod draft;
 mod git;
 mod handoff;
 mod highlight;
-mod hook;
-mod info;
 mod langs;
-mod manual;
-mod model;
 mod review;
 mod session;
 mod store;
@@ -16,7 +14,8 @@ mod testutil;
 mod tm;
 mod ui;
 
-use manual::SessionArg;
+use commands::manual::{self, SessionArg};
+use commands::{hook, info};
 use std::path::Path;
 use std::process::ExitCode;
 

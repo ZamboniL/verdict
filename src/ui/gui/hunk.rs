@@ -6,7 +6,7 @@ use super::code::{editor_job, rows_ui};
 use super::icons::{self, Icon};
 use super::theme::{decision_color, pal, tint};
 use super::widgets::{Look, beside_icon, decision_button, icon_button, note_box};
-use crate::model::{self, Decision, FileHl, Hunk};
+use crate::diff::{self, Decision, FileHl, Hunk};
 use eframe::egui::{self, Align, FontId, Rect, RichText, Sense, Stroke, TextEdit, UiBuilder, vec2};
 
 #[derive(Clone)]
@@ -182,8 +182,8 @@ fn hunk_header(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx, action: &mut Option<Dec
 
 /// The rows, cut after each line that ends a comment so the comment sits under it.
 fn hunk_rows(ui: &mut egui::Ui, h: &mut Hunk, c: &HunkCtx, out: &mut HunkOut) {
-    let rows: Vec<model::Pair> = if c.split {
-        model::split_pairs(&h.lines)
+    let rows: Vec<diff::Pair> = if c.split {
+        diff::split_pairs(&h.lines)
     } else {
         (0..h.lines.len()).map(|i| (Some(i), Some(i))).collect()
     };

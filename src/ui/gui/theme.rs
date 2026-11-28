@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The window's colors and egui style.
 
+use crate::diff::Decision;
 use crate::git::Status;
-use crate::model::Decision;
 use eframe::egui::{self, Color32, CornerRadius, FontId, Stroke, TextStyle, vec2};
 
 pub(super) mod pal {

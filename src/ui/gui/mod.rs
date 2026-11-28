@@ -12,8 +12,8 @@ mod panels;
 mod theme;
 mod widgets;
 
+use crate::diff::{Decision, FileHl};
 use crate::draft::Drafts;
-use crate::model::{Decision, FileHl};
 use crate::review::{Effect, Review};
 use crate::ui::keys::{self, Command};
 use crate::ui::{Mode, Outcome, hl_jobs, run_highlighter};

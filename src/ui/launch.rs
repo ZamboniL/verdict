@@ -154,7 +154,7 @@ pub fn tui_child(repo: &Path, dir: &Path) -> std::process::ExitCode {
     let result = (|| -> Result<Option<Outcome>, String> {
         let list = std::fs::read_to_string(dir.join("files")).map_err(|e| e.to_string())?;
         let only = list.lines().map(String::from).collect();
-        let files = crate::model::load_only(repo, Some(&only))?;
+        let files = crate::diff::load(repo, &crate::git::Source::Worktree, Some(&only))?;
         if files.is_empty() {
             return Ok(None);
         }

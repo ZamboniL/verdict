@@ -3,7 +3,7 @@
 //! changes when it can tell whose they are.
 
 use crate::ui::{self, Choice};
-use crate::{git, handoff, model, review, session};
+use crate::{diff, git, handoff, review, session};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -92,7 +92,7 @@ pub fn run(
         None
     };
     let only = picked.as_ref().map(|(_, _, files)| files);
-    let files = model::load_source(&repo, &source, only).map_err(|e| e.to_string())?;
+    let files = diff::load(&repo, &source, only).map_err(|e| e.to_string())?;
     if files.is_empty() {
         let what = match &source {
             git::Source::Range { label, .. } => format!("changes in {label}"),

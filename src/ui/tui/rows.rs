@@ -4,7 +4,7 @@
 
 use super::App;
 use super::theme::{decision_color, fg, pal};
-use crate::model::{self, Decision, FileDiff, Hunk};
+use crate::diff::{self, Decision, FileDiff, Hunk};
 use ratatui::style::{Color, Modifier, Style};
 
 pub(super) enum RowKind {
@@ -34,7 +34,7 @@ pub(super) struct Row {
 impl Row {
     /// The hunk lines this row shows, left and right: the same line twice in the
     /// unified view.
-    pub fn lines(&self) -> model::Pair {
+    pub fn lines(&self) -> diff::Pair {
         match self.kind {
             RowKind::Diff(li) => (Some(li), Some(li)),
             RowKind::SplitDiff(l, r) => (l, r),
@@ -92,7 +92,7 @@ impl Rows<'_> {
     }
 
     /// The unchanged lines of gap `g` (full-file view).
-    fn gap(&mut self, g: usize, lines: &[model::DLine]) {
+    fn gap(&mut self, g: usize, lines: &[diff::DLine]) {
         for li in 0..lines.len() {
             self.push(RowKind::Gap(g, li), None);
         }
@@ -157,7 +157,7 @@ impl App {
             }
         };
         if self.r.split {
-            for (l, r) in model::split_pairs(&h.lines) {
+            for (l, r) in diff::split_pairs(&h.lines) {
                 rows.push(RowKind::SplitDiff(l, r), Some(hi));
                 let ends: Vec<usize> = l.into_iter().chain(r).collect();
                 comments_after(rows, &ends);

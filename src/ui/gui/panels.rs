@@ -8,7 +8,7 @@ use super::widgets::{
     progress_bar, split_path,
 };
 use super::{App, chrome};
-use crate::model::{Decision, FileDiff};
+use crate::diff::{Decision, FileDiff};
 use crate::ui::keys::{HELP, Where};
 use crate::ui::{Mode, REG};
 use eframe::egui::{

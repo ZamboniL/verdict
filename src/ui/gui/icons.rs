@@ -169,8 +169,8 @@ pub(super) fn label(ui: &mut egui::Ui, icon: Icon, color: Color32) -> egui::Resp
 }
 
 /// The icon for a decision.
-pub(super) fn decision(d: crate::model::Decision) -> Icon {
-    use crate::model::Decision::*;
+pub(super) fn decision(d: crate::diff::Decision) -> Icon {
+    use crate::diff::Decision::*;
     match d {
         Approve => Icon::Check,
         Reject => Icon::Cross,

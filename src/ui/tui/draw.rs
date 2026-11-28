@@ -4,7 +4,7 @@
 
 use super::theme::{fg, pal, status_color};
 use super::{App, Input, State, Target, cells};
-use crate::model::Decision;
+use crate::diff::Decision;
 use crate::ui::keys::{HELP, Where};
 use crate::ui::{Mode, REG};
 use ratatui::Frame;

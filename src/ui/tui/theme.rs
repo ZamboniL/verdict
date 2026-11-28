@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The terminal interface's colors.
 
+use crate::diff::{Decision, Kind};
 use crate::git::Status;
-use crate::model::{Decision, Kind};
 use ratatui::style::{Color, Style};
 
 pub(super) mod pal {

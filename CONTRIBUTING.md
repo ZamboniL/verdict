@@ -49,15 +49,16 @@ and set up the hooks as described in the README.
 
 | File | What it does |
 |---|---|
-| `src/main.rs` | CLI, Claude Code hook protocol |
+| `src/main.rs` | argument parsing, dispatch to a command |
+| `src/commands/` | each way of running verdict: `manual.rs` (a review by hand), `hook.rs` (the Claude Code hook protocol), `info.rs` (`langs`, `themes`, `lang`, `init`) |
 | `src/git.rs` | thin wrapper over the `git` CLI (no libgit2) |
-| `src/model.rs` | diffs, hunks, applying decisions, the feedback message |
+| `src/diff/` | the diff under review: its types (`mod.rs`), reading it from git (`load.rs`), cutting it into hunks (`hunks.rs`), applying decisions (`apply.rs`), the feedback message (`feedback.rs`) |
 | `src/session.rs` | per-session turn snapshots, transcript analysis |
 | `src/handoff.rs` | sending feedback to a session whose turn is over |
 | `src/review.rs` | review state shared by both interfaces: decisions, selection, folds, line mode |
 | `src/draft.rs` | saving unsubmitted reviews and restoring them |
 | `src/store.rs` | where verdict keeps its state (`.git/verdict`), written atomically |
-| `src/ui/` | choosing and starting the interface (`config.rs`, `launch.rs`), the background highlighter |
+| `src/ui/` | choosing and starting the interface (`config.rs`, `launch.rs`), the shared keymap (`keys.rs`), the background highlighter |
 | `src/ui/gui/` | the egui review window: `diff.rs` and `hunk.rs` draw the review, `code.rs` the code rows |
 | `src/ui/tui/` | the ratatui terminal interface: `rows.rs` lays out the review, `render.rs` draws it, `input.rs` handles keys |
 | `src/highlight.rs` | language and theme registry, user extensions, caching |
@@ -70,8 +71,9 @@ Some rules that keep it this way:
   rule goes in `review.rs` and is then wired into both `ui/gui/` and `ui/tui/`.
   A feature that only works in one interface needs a good reason, written in the
   pull request.
-- **Keys are the same in both interfaces.** A new or changed key goes in the
-  README's key tables and in the terminal's `?` help and hint bar.
+- **Keys are the same in both interfaces.** Bindings and their help live in
+  `ui/keys.rs`; both interfaces' help is built from it. A new or changed key goes
+  there, in the README's key tables, and in the terminal's hint bar.
 - **Git goes through `git.rs`,** which calls the `git` CLI. Don't add libgit2 or
   other git libraries.
 - **Nothing on disk changes until submit.** Staging and reverting happen only
@@ -84,7 +86,7 @@ Some rules that keep it this way:
 ## Tests
 
 Unit tests live in a `#[cfg(test)]` module at the bottom of each file. The
-`model.rs` and `session.rs` tests build real git repositories in a temp
+`diff/` and `session.rs` tests build real git repositories in a temp
 directory, so they exercise actual `git` behavior. Follow that pattern for
 anything that touches git, with the helpers in `src/testutil.rs`: `repo` makes a
 repository, `git` runs a command in it, and `temp_dir` makes a scratch directory.

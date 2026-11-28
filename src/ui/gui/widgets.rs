@@ -3,8 +3,8 @@
 
 use super::icons::{self, Icon};
 use super::theme::{decision_color, pal, status_color, tint};
+use crate::diff::{self, Decision};
 use crate::git::Status;
-use crate::model::{self, Decision};
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Stroke, TextEdit, pos2, vec2};
 
 #[derive(Clone, Copy)]
@@ -262,7 +262,7 @@ pub(super) fn split_path(path: &str) -> (&str, &str) {
 }
 
 /// Decision colors along a thin bar, in proportion.
-pub(super) fn progress_bar(ui: &mut egui::Ui, c: &model::Counts, width: f32) {
+pub(super) fn progress_bar(ui: &mut egui::Ui, c: &diff::Counts, width: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, 3, pal::RAISED);
@@ -310,7 +310,7 @@ pub(super) fn decision_button(
 
 /// "+5 −10" in green and red, like `git diff --stat`. A side that's zero is left
 /// out, and nothing is drawn when both are.
-pub(super) fn line_stats(ui: &mut egui::Ui, s: model::LineStats, size: f32) {
+pub(super) fn line_stats(ui: &mut egui::Ui, s: diff::LineStats, size: f32) {
     if s.added == 0 && s.removed == 0 {
         return;
     }

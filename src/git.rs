@@ -242,7 +242,7 @@ pub enum Status {
     Deleted,
     Untracked,
     /// Deleted at one path and added at another with similar content. verdict pairs
-    /// these itself (see `model::pair_renames`); git never reports it to us.
+    /// these itself (see `pair_renames` in `diff/load.rs`); git never reports it to us.
     Renamed,
 }
 

@@ -3,7 +3,7 @@
 
 use crate::session::{self, Snapshot};
 use crate::ui::{self, Choice};
-use crate::{git, handoff, model, review};
+use crate::{diff, git, handoff, review};
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -122,7 +122,7 @@ impl<'a> Hook<'a> {
             session::end_turn(repo, sess);
             return;
         };
-        let files = match model::load_only(repo, Some(&touched)) {
+        let files = match diff::load(repo, &git::Source::Worktree, Some(&touched)) {
             Ok(f) if !f.is_empty() => f,
             _ => {
                 session::end_turn(repo, sess);

@@ -11,8 +11,8 @@ mod rows;
 mod theme;
 mod tty;
 
+use crate::diff::{self, Decision, FileHl};
 use crate::draft::Drafts;
-use crate::model::{self, Decision, FileHl};
 use crate::review::{Effect, Review};
 use crate::ui::{Mode, Outcome, hl_jobs, run_highlighter};
 use crossterm::event;
@@ -77,7 +77,7 @@ struct App {
     main_area: Rect,
     list_area: Rect,
     /// File, hunk and hunk lines (see `Row::lines`) of each visible row.
-    visible: Vec<(usize, Option<usize>, model::Pair)>,
+    visible: Vec<(usize, Option<usize>, diff::Pair)>,
     list_top: usize,
     drafts: Drafts,
 }

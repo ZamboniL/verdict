@@ -4,7 +4,7 @@
 //! The help each interface shows comes from [`HELP`], next to the bindings, so the
 //! two can't drift apart.
 
-use crate::model::Decision;
+use crate::diff::Decision;
 
 /// A key press, whatever interface it came from. Letters keep their case: Shift+a
 /// is `Char('A')`.

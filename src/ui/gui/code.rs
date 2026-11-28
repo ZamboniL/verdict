@@ -4,8 +4,8 @@
 
 use super::hunk::HunkCtx;
 use super::theme::{pal, tint};
+use crate::diff::{self, DLine, Kind};
 use crate::highlight::{Line, Span};
-use crate::model::{self, DLine, Kind};
 use crate::ui::REG;
 use eframe::egui::{
     self, Color32, FontId, Rect, Sense, Stroke, TextFormat, pos2, text::LayoutJob, vec2,
@@ -25,7 +25,7 @@ pub(super) struct RowsOut {
 pub(super) fn rows_ui(
     ui: &mut egui::Ui,
     lines: &[DLine],
-    rows: &[model::Pair],
+    rows: &[diff::Pair],
     c: &HunkCtx,
     commented: &[bool],
 ) -> RowsOut {
@@ -139,7 +139,7 @@ fn paint_line(
 fn diff_lines(
     ui: &mut egui::Ui,
     lines: &[DLine],
-    rows: &[model::Pair],
+    rows: &[diff::Pair],
     c: &HunkCtx,
     commented: &[bool],
 ) -> (egui::Response, Rect, Vec<egui::Rangef>) {
@@ -178,7 +178,7 @@ fn diff_lines(
 fn split_lines(
     ui: &mut egui::Ui,
     lines: &[DLine],
-    pairs: &[model::Pair],
+    pairs: &[diff::Pair],
     c: &HunkCtx,
     commented: &[bool],
 ) -> (egui::Response, Rect, Vec<egui::Rangef>) {
@@ -309,7 +309,7 @@ fn paint_code(painter: &egui::Painter, at: egui::Pos2, code_dx: f32, l: &DLine, 
         _ => pal::DEL_EMPH,
     };
     let mut job = LayoutJob::default();
-    for (text, sp, inside) in model::cut_emph(segs, &l.emph) {
+    for (text, sp, inside) in diff::cut_emph(segs, &l.emph) {
         let bg = if inside { emph } else { Color32::TRANSPARENT };
         job.append(
             &text.replace('\t', "    "),
@@ -333,7 +333,7 @@ pub(super) fn editor_job(text: &str, syntax: Option<&str>, font: &FontId) -> Lay
         job.append(text, 0.0, plain);
         return job;
     };
-    let lines = model::split_lines(text);
+    let lines = diff::split_lines(text);
     let hl = reg.highlight(lang, &lines, lines.len());
     for (i, line) in lines.iter().enumerate() {
         let body = line.trim_end_matches(['\n', '\r']);

@@ -4,8 +4,8 @@
 use super::App;
 use super::rows::{Row, RowKind};
 use super::theme::{decision_color, decision_label, fg, line_bg, pal, status_color};
+use crate::diff::{self, DLine, Decision, FileDiff, FileHl, Kind};
 use crate::git::Status;
-use crate::model::{self, DLine, Decision, FileDiff, FileHl, Kind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -368,7 +368,7 @@ impl App {
             Kind::Add => pal::ADD_EMPH,
             _ => pal::DEL_EMPH,
         };
-        let segs = model::cut_emph(raw, &l.emph)
+        let segs = diff::cut_emph(raw, &l.emph)
             .into_iter()
             .map(|(text, st, inside)| {
                 let st = if inside { st.bg(emph) } else { st };
@@ -476,7 +476,7 @@ fn num(n: Option<usize>, digits: usize) -> String {
 }
 
 /// " · +5 −10" in green and red; a zero side is left out, and nothing when both are.
-pub(super) fn stat_spans(s: crate::model::LineStats) -> Vec<Span<'static>> {
+pub(super) fn stat_spans(s: crate::diff::LineStats) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     if s.added == 0 && s.removed == 0 {
         return out;

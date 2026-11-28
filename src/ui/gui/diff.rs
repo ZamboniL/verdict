@@ -11,7 +11,7 @@ use super::widgets::{
     status_badge,
 };
 use super::{App, Focus};
-use crate::model::{DLine, Decision, FileDiff};
+use crate::diff::{DLine, Decision, FileDiff};
 use crate::review::{LineSel, Review};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, TextFormat,

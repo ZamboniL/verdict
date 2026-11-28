@@ -4,8 +4,8 @@
 //! only draw it and turn input into these calls; an `Effect` tells them what to
 //! focus or open next.
 
+use crate::diff::{self, DLine, Decision, FileDiff, Hunk, LineComment};
 use crate::git::Source;
-use crate::model::{self, DLine, Decision, FileDiff, Hunk, LineComment};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -347,7 +347,7 @@ impl Review {
         let start = code
             .iter()
             .copied()
-            .find(|&i| h.lines[i].kind != model::Kind::Ctx)
+            .find(|&i| h.lines[i].kind != diff::Kind::Ctx)
             .or(code.first().copied());
         let Some(li) = start else {
             return Effect::NoLines;
@@ -532,12 +532,12 @@ impl Review {
 
     // ---- outcome ----------------------------------------------------------
 
-    pub fn counts(&self) -> model::Counts {
-        model::counts(&self.files)
+    pub fn counts(&self) -> diff::Counts {
+        diff::counts(&self.files)
     }
 
-    pub fn line_stats(&self) -> model::LineStats {
-        model::line_stats(&self.files)
+    pub fn line_stats(&self) -> diff::LineStats {
+        diff::line_stats(&self.files)
     }
 
     /// Submitting would send the agent something to act on.
@@ -546,24 +546,24 @@ impl Review {
         c.reject + c.edit + c.comment > 0
             || !self.general.trim().is_empty()
             || self.files.iter().any(|f| f.file_note().is_some())
-            || model::has_line_comments(&self.files)
+            || diff::has_line_comments(&self.files)
     }
 
     /// Apply every decision to the index and working tree (unless the review is read
     /// only); return the feedback.
     pub fn submit(&self, repo: &Path) -> Result<Option<String>, String> {
         if !self.source.read_only() {
-            model::apply(repo, &self.files)?;
+            diff::apply(repo, &self.files)?;
         }
-        Ok(model::feedback(&self.files, &self.general, &self.source))
+        Ok(diff::feedback(&self.files, &self.general, &self.source))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{compute_hunks, split_lines};
     use crate::git::Status;
-    use crate::model::{compute_hunks, split_lines};
 
     fn file(path: &str, old: &str, new: &str) -> FileDiff {
         let o = split_lines(old);
@@ -801,7 +801,7 @@ mod tests {
         r.last();
         assert_eq!(r.toggle_lines(), Effect::Binary);
         r.files[1].binary = false;
-        r.files[1].hunks[0].lines = vec![DLine::new(model::Kind::Ctx, None, None, "x".into())];
+        r.files[1].hunks[0].lines = vec![DLine::new(diff::Kind::Ctx, None, None, "x".into())];
         assert_eq!(r.toggle_lines(), Effect::NoLines);
     }
 }

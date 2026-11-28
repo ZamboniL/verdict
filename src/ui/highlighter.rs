@@ -2,8 +2,8 @@
 //! The background highlighter both interfaces use: loads the language registry
 //! and highlights files one by one, so the review appears before highlighting ends.
 
+use crate::diff::{FileDiff, FileHl};
 use crate::highlight::Registry;
-use crate::model::{FileDiff, FileHl};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
