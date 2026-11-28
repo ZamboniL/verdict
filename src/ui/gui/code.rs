@@ -329,16 +329,12 @@ pub(super) fn editor_job(text: &str, syntax: Option<&str>, font: &FontId) -> Lay
         color: pal::TEXT,
         ..Default::default()
     };
-    let syn = REG
-        .get()
-        .zip(syntax)
-        .and_then(|(r, n)| r.ss.find_syntax_by_name(n).map(|s| (r, s)));
-    let Some((reg, syn)) = syn.filter(|_| text.len() < 64 * 1024) else {
+    let Some((reg, lang)) = REG.get().zip(syntax).filter(|_| text.len() < 64 * 1024) else {
         job.append(text, 0.0, plain);
         return job;
     };
     let lines = model::split_lines(text);
-    let hl = reg.highlight(syn, &lines, lines.len());
+    let hl = reg.highlight(lang, &lines, lines.len());
     for (i, line) in lines.iter().enumerate() {
         let body = line.trim_end_matches(['\n', '\r']);
         match hl.get(i) {

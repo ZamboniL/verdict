@@ -43,13 +43,13 @@ pub fn run_highlighter(jobs: Vec<HlJob>, tx: mpsc::Sender<(usize, FileHl)>, wake
     wake();
     for j in jobs {
         let first = j.new.first().or(j.old.first()).map(String::as_str);
-        let Some(syn) = reg.syntax_for(&j.path, first) else {
+        let Some(lang) = reg.lang_for(&j.path, first) else {
             continue;
         };
         let hl = FileHl {
-            lang: syn.name.clone(),
-            old: reg.highlight(syn, &j.old, j.upto.0),
-            new: reg.highlight(syn, &j.new, j.upto.1),
+            old: reg.highlight(&lang, &j.old, j.upto.0),
+            new: reg.highlight(&lang, &j.new, j.upto.1),
+            lang,
         };
         if tx.send((j.file, hl)).is_err() {
             return;

@@ -349,8 +349,10 @@ session's transcript tells it whether that session could have made the change:
 
 ## Syntax highlighting
 
-bat's collection of syntaxes and themes is built in. Run `verdict langs` and
-`verdict themes` to see what's available.
+verdict highlights with [giallo](https://github.com/getzola/giallo), which runs
+VS Code's TextMate grammars and themes as they are, so code looks the way it does
+in VS Code. Its 220+ grammars and ~65 themes come from shiki's curated set. Run
+`verdict langs` and `verdict themes` to see what's available.
 
 ### Extending it
 
@@ -359,9 +361,14 @@ Run `verdict init` to create `~/.config/verdict` (or `$XDG_CONFIG_HOME/verdict`)
 | Path | Accepts |
 |---|---|
 | `config.toml` | interface choice, theme and file associations |
-| `grammars/` | `.sublime-syntax`, `.tmLanguage`, `.tmLanguage.json` |
-| `themes/` | `.tmTheme`, VS Code color themes (`.json`) |
+| `grammars/` | TextMate grammars: `.tmLanguage`, `.tmLanguage.json` |
+| `themes/` | VS Code color themes (`.json`), `.tmTheme` |
 | `extensions/` | unpacked VS Code extensions |
+
+Grammars and themes load without any conversion. JSON may have comments and
+trailing commas, themes may `include` another, and a grammar may embed any other
+language by its scope (`source.js`). Sublime's `.sublime-syntax` format isn't
+supported.
 
 **VS Code extensions.** A `.vsix` file is a zip archive. Unzip it into
 `extensions/`:
@@ -382,16 +389,17 @@ verdict reads the `contributes` section of each extension's `package.json`:
 
 ```toml
 [highlight]
-theme = "OneHalfDark"
+theme = "one-dark-pro"
 
-[languages]                                # like VS Code's files.associations
-"*.mdx" = "Markdown"                       # no "/": matches the file name
-"Justfile" = "Makefile"
-"docker/**/*.env" = "source.shell.bash"    # with "/": repo-relative path
+[languages]                          # like VS Code's files.associations
+"*.mdx" = "markdown"                 # no "/": matches the file name
+"Justfile" = "make"
+"docker/**/*.env" = "shellscript"    # with "/": repo-relative path
 ```
 
-Association values can be a language name, a scope (`source.ts`) or an
-extension (`ts`).
+Association values can be a language name or alias from `verdict langs`, an
+extension (`ts`), or the scope of a grammar you added (`source.svelte`).
+`verdict langs` warns about values that match nothing.
 
 **How a language is chosen:**
 
@@ -404,20 +412,13 @@ Languages you add take priority over builtin ones.
 
 `verdict lang path/to/file` shows which language a file gets.
 
-**How TextMate grammars load.** The highlighting engine,
-[syntect](https://github.com/trishume/syntect), reads Sublime's format, so
-verdict converts TextMate grammars when it loads them:
+**Known limits:**
 
-- `begin`/`end` rules become push/pop contexts.
-- The repository becomes named contexts.
-- Cross-grammar `include`s resolve against every grammar verdict knows about.
-
-Rules that can't be converted are skipped and listed by `verdict langs`. Known
-limits:
-
-- `while` rules are approximated.
-- Injection grammars are skipped.
-- `$1`-style scope names are dropped.
+- A grammar you add replaces a builtin one for its own files, but builtin
+  grammars that embed that language keep using the builtin version.
+- Vue templates aren't fully highlighted: `{{ }}` and directive values like
+  `:class="…"` show as plain text and strings. The Vue grammars as packaged
+  target a scope name the main Vue grammar doesn't use.
 
 Compiled user grammars are cached in `~/.cache/verdict` and rebuild automatically
 when a file changes.

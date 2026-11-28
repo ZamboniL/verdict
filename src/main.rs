@@ -3,6 +3,7 @@ mod draft;
 mod git;
 mod handoff;
 mod highlight;
+mod langs;
 mod model;
 mod review;
 mod session;
@@ -53,9 +54,10 @@ INTERFACE:
   From a hook, the terminal interface opens in tmux (a popup, or a split or window:
   `tmux` in [ui]), or in the terminal emulator set by `terminal` in [ui].
 
-Syntax highlighting is extensible: drop grammars into ~/.config/verdict/grammars
-(.sublime-syntax, .tmLanguage, .tmLanguage.json), themes into .../themes
-(.tmTheme, VS Code .json), or unpacked VS Code extensions into .../extensions.
+Syntax highlighting uses VS Code's grammars and themes and is extensible: drop
+TextMate grammars into ~/.config/verdict/grammars (.tmLanguage, .tmLanguage.json),
+themes into .../themes (VS Code .json, .tmTheme), or unpacked VS Code extensions
+into .../extensions.
 
 The git index is the 'approved' state: approving stages a hunk, rejecting reverts it
 in the working tree. Nothing is written until you submit.
@@ -302,21 +304,18 @@ fn print_warnings(reg: &highlight::Registry) {
 fn langs() -> ExitCode {
     let reg = highlight::Registry::load();
     println!("Config dir: {}\n", highlight::config_dir().display());
-    let mut syns: Vec<_> = reg.ss.syntaxes().iter().filter(|s| !s.hidden).collect();
-    syns.sort_by_key(|s| s.name.to_lowercase());
-    syns.dedup_by(|a, b| a.name == b.name);
-    for s in syns {
-        let user = if reg.user_names.contains(&s.name) {
+    for (name, aliases) in reg.grammars() {
+        let user = if reg.user_names.contains(&name) {
             "  [user]"
         } else {
             ""
         };
-        let mut exts = s.file_extensions.join(" ");
-        if exts.len() > 60 {
-            exts.truncate(57);
-            exts.push_str("...");
+        let mut aliases = aliases.join(" ");
+        if aliases.len() > 60 {
+            aliases.truncate(57);
+            aliases.push_str("...");
         }
-        println!("{:<34} {:<60}{user}", s.name, exts);
+        println!("{name:<34} {aliases:<60}{user}");
     }
     print_warnings(&reg);
     ExitCode::SUCCESS
@@ -352,8 +351,8 @@ fn lang(file: &str) -> ExitCode {
             .map(|r| r.to_string_lossy().into_owned())
     })
     .unwrap_or_else(|| file.to_owned());
-    match reg.syntax_for(&rel, first.as_deref()) {
-        Some(s) => println!("{} ({})", s.name, s.scope.build_string()),
+    match reg.lang_for(&rel, first.as_deref()) {
+        Some(l) => println!("{l}"),
         None => println!("plain text (no language matched)"),
     }
     ExitCode::SUCCESS
