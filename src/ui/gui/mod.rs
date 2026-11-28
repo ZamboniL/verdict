@@ -7,6 +7,7 @@ mod chrome;
 mod code;
 mod diff;
 mod hunk;
+mod icons;
 mod panels;
 mod theme;
 mod widgets;
@@ -23,7 +24,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 use theme::{pal, setup_style};
-use widgets::caption;
 
 pub fn run(repo: PathBuf, mut review: Review, mode: Mode) -> Result<Option<Outcome>, String> {
     let result: Rc<RefCell<Option<Outcome>>> = Rc::default();
@@ -294,7 +294,8 @@ impl eframe::App for App {
                 .default_size(380.0)
                 .frame(bar(14, 10))
                 .show(ui, |ui| {
-                    caption(ui, "WHAT THE AGENT SAID", pal::FAINT);
+                    icons::label(ui, icons::Icon::Message, pal::FAINT)
+                        .on_hover_text("What the agent said at the end of its turn");
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.add(

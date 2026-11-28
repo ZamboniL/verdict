@@ -60,16 +60,6 @@ pub(super) fn decision_color(d: Decision) -> Color32 {
     }
 }
 
-pub(super) fn decision_label(d: Decision) -> &'static str {
-    match d {
-        Decision::Pending => "Pending",
-        Decision::Approve => "Approved",
-        Decision::Reject => "Rejected",
-        Decision::Edit => "Edited",
-        Decision::Comment => "Commented",
-    }
-}
-
 /// `c` mixed into `base`, opaque.
 pub(super) fn tint(base: Color32, c: Color32, t: f32) -> Color32 {
     base.lerp_to_gamma(c, t)

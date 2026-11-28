@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Small widgets drawn by hand: buttons, pills, badges, text boxes.
 
+use super::icons::{self, Icon};
 use super::theme::{decision_color, pal, status_color, tint};
 use crate::git::Status;
 use crate::model::{self, Decision};
@@ -20,11 +21,40 @@ pub(super) enum Look {
     Plain,
 }
 
-/// A compact button with an optional key hint after the label.
-pub(super) fn button(
+/// A square button showing only `icon`. `tip` (with the key, if any) shows on hover.
+pub(super) fn icon_button(
     ui: &mut egui::Ui,
-    label: &str,
+    icon: Icon,
+    tip: &str,
     key: Option<&str>,
+    look: Look,
+    on: bool,
+    enabled: bool,
+) -> egui::Response {
+    let tip = match key {
+        Some(k) => format!("{tip}  ({k})"),
+        None => tip.to_owned(),
+    };
+    any_button(ui, Some(icon), "", look, on, enabled).on_hover_text(tip)
+}
+
+/// A button with `icon` before its label.
+pub(super) fn icon_text_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    look: Look,
+    on: bool,
+    enabled: bool,
+) -> egui::Response {
+    any_button(ui, Some(icon), label, look, on, enabled)
+}
+
+/// A compact button: an icon, a label, or both.
+fn any_button(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    label: &str,
     look: Look,
     on: bool,
     enabled: bool,
@@ -35,12 +65,14 @@ pub(super) fn button(
         FontId::proportional(13.0),
         Color32::PLACEHOLDER,
     );
-    let key_g = key.map(|k| {
-        ui.painter()
-            .layout_no_wrap(k.to_owned(), FontId::monospace(11.0), Color32::PLACEHOLDER)
-    });
-    let pad = 10.0;
-    let w = galley.size().x + pad * 2.0 + key_g.as_ref().map_or(0.0, |g| g.size().x + 7.0);
+    let icon_only = icon.is_some() && label.is_empty();
+    let pad = if icon_only { 6.0 } else { 10.0 };
+    let icon_w = match (icon, label.is_empty()) {
+        (None, _) => 0.0,
+        (Some(_), true) => 16.0,
+        (Some(_), false) => 20.0,
+    };
+    let w = galley.size().x + icon_w + pad * 2.0;
     let sense = if enabled {
         Sense::click()
     } else {
@@ -81,11 +113,6 @@ pub(super) fn button(
         (Look::Toggle, false) => (Color32::TRANSPARENT, pal::RAISED, pal::BORDER, pal::DIM),
         (Look::Plain, _) => (Color32::TRANSPARENT, pal::RAISED, pal::BORDER, pal::TEXT),
     };
-    let key_col = if on || matches!(look, Look::Primary) {
-        text.gamma_multiply(0.55)
-    } else {
-        pal::FAINT
-    };
     let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.35) };
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
@@ -97,13 +124,13 @@ pub(super) fn button(
             Stroke::new(1.0, fade(stroke)),
             egui::StrokeKind::Inside,
         );
-        let gw = galley.size().x;
-        let y = rect.center().y - galley.size().y / 2.0;
-        p.galley(pos2(rect.left() + pad, y), galley, fade(text));
-        if let Some(g) = key_g {
-            let ky = rect.center().y - g.size().y / 2.0;
-            p.galley(pos2(rect.left() + pad + gw + 7.0, ky), g, fade(key_col));
+        if let Some(i) = icon {
+            let c = pos2(rect.left() + pad + 8.0, rect.center().y);
+            icons::paint(p, c, i, fade(text));
         }
+        let x = rect.left() + pad + icon_w;
+        let y = rect.center().y - galley.size().y / 2.0;
+        p.galley(pos2(x, y), galley, fade(text));
     }
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -112,16 +139,33 @@ pub(super) fn button(
     }
 }
 
-/// A small rounded label in a tint of `color`.
-pub(super) fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+/// A small rounded label in a tint of `color`, with an icon before the text (or
+/// alone, if the text is empty).
+pub(super) fn icon_pill(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    text: &str,
+    color: Color32,
+) -> egui::Response {
     let g = ui
         .painter()
         .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
-    let size = g.size() + vec2(14.0, 4.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(size.x, size.y.max(18.0)), Sense::hover());
+    let icon_w = match (icon, text.is_empty()) {
+        (None, _) => 0.0,
+        (Some(_), true) => 14.0,
+        (Some(_), false) => 17.0,
+    };
+    let pad = if text.is_empty() { 4.0 } else { 7.0 };
+    let w = g.size().x + icon_w + pad * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, g.size().y.max(18.0) + 2.0), Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, 9, color.gamma_multiply(0.16));
-    p.galley(rect.center() - g.size() / 2.0, g, color);
+    if let Some(i) = icon {
+        let c = pos2(rect.left() + pad + 7.0, rect.center().y);
+        icons::paint(p, c, i, color);
+    }
+    let gy = rect.center().y - g.size().y / 2.0;
+    p.galley(pos2(rect.left() + pad + icon_w, gy), g, color);
     resp
 }
 
@@ -164,15 +208,24 @@ pub(super) fn key_hint(ui: &mut egui::Ui, keys: &str, what: &str) {
     ui.add_space(8.0);
 }
 
-/// Small uppercase heading.
-pub(super) fn caption(ui: &mut egui::Ui, text: &str, color: Color32) {
-    ui.label(
-        RichText::new(text)
-            .size(10.5)
-            .strong()
-            .color(color)
-            .extra_letter_spacing(0.6),
-    );
+/// `icon` in `color` at the top left, `tip` on hover, and `add` beside it taking
+/// the rest of the width: an icon standing in for a heading.
+pub(super) fn beside_icon<R>(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    color: Color32,
+    tip: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.vertical(|ui| {
+            ui.add_space(6.0);
+            icons::label(ui, icon, color).on_hover_text(tip);
+        });
+        ui.vertical(add).inner
+    })
+    .inner
 }
 
 /// A text box outlined in a tint of `color`.
@@ -236,11 +289,11 @@ pub(super) fn progress_bar(ui: &mut egui::Ui, c: &model::Counts, width: f32) {
     }
 }
 
-/// A decision button, in that decision's color: outlined when its row is selected,
-/// neutral until hovered when not.
+/// A decision's icon button, in that decision's color: outlined when its row is
+/// selected, neutral until hovered when not. `tip` names it on hover.
 pub(super) fn decision_button(
     ui: &mut egui::Ui,
-    label: &str,
+    tip: &str,
     key: Option<&str>,
     d: Decision,
     on: bool,
@@ -252,5 +305,5 @@ pub(super) fn decision_button(
     } else {
         Look::Quiet(decision_color(d))
     };
-    button(ui, label, key, look, on, enabled)
+    icon_button(ui, icons::decision(d), tip, key, look, on, enabled)
 }

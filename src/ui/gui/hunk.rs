@@ -3,8 +3,9 @@
 //! under them, and the note or editor its decision asks for.
 
 use super::code::{editor_job, rows_ui};
-use super::theme::{decision_color, decision_label, pal, tint};
-use super::widgets::{Look, button, caption, decision_button, note_box, pill};
+use super::icons::{self, Icon};
+use super::theme::{decision_color, pal, tint};
+use super::widgets::{Look, beside_icon, decision_button, icon_button, note_box};
 use crate::model::{self, Decision, FileHl, Hunk};
 use eframe::egui::{self, Align, FontId, Rect, RichText, Sense, Stroke, TextEdit, UiBuilder, vec2};
 
@@ -23,7 +24,7 @@ pub(super) struct HunkCtx<'a> {
     /// The visible width of the diff area.
     pub view_w: f32,
     pub mono: &'a FontId,
-    /// "Hunk 2/3".
+    /// "2/3", when the file has more than one hunk.
     pub label: Option<String>,
     /// The file is rejected as a whole, so its reason covers this hunk.
     pub file_reason: bool,
@@ -157,16 +158,13 @@ fn hunk_header(ui: &mut egui::Ui, h: &Hunk, c: &HunkCtx, action: &mut Option<Dec
                         .size(12.0)
                         .color(pal::FAINT),
                 );
-                if h.decision != Decision::Pending {
-                    pill(ui, decision_label(h.decision), decision_color(h.decision));
-                }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     for (d, label, key, enabled) in [
-                        (Decision::Comment, "Comment", "c", true),
-                        (Decision::Edit, "Edit", "e", c.editable),
-                        (Decision::Reject, "Reject", "r", true),
-                        (Decision::Approve, "Approve", "a", true),
+                        (Decision::Comment, "Comment on this hunk", "c", true),
+                        (Decision::Edit, "Edit this hunk", "e", c.editable),
+                        (Decision::Reject, "Reject this hunk", "r", true),
+                        (Decision::Approve, "Approve this hunk", "a", true),
                     ] {
                         let on = h.decision == d;
                         if decision_button(ui, label, Some(key), d, on, enabled, c.selected)
@@ -229,40 +227,46 @@ fn hunk_note(ui: &mut egui::Ui, h: &mut Hunk, c: &HunkCtx) {
         .show(ui, |ui| {
             ui.set_max_width(c.view_w - 28.0);
             ui.spacing_mut().item_spacing.y = 4.0;
+            let icon = icons::decision(h.decision);
             match h.decision {
                 Decision::Reject if c.file_reason => {
-                    caption(ui, "COVERED BY THE FILE'S REASON", col);
-                    let hint = "Optional: extra detail for this hunk";
-                    note_box(ui, &mut h.note, hint, col, 1);
+                    let tip = "Rejected with the whole file: its reason covers this hunk";
+                    beside_icon(ui, icon, col, tip, |ui| {
+                        let hint = "Covered by the file's reason. Optional: extra detail";
+                        note_box(ui, &mut h.note, hint, col, 1);
+                    });
                 }
                 Decision::Reject | Decision::Comment => {
                     let has_lines = !h.comments.is_empty();
-                    let (title, hint) = match (h.decision, has_lines) {
+                    let (tip, hint) = match (h.decision, has_lines) {
                         (Decision::Reject, false) => (
-                            "WHY IT'S REJECTED",
-                            "What should it do instead? Sent to the agent",
+                            "Why it's rejected",
+                            "Why is it rejected? What should it do instead?",
                         ),
                         (Decision::Reject, true) => (
-                            "WHY IT'S REJECTED",
+                            "Why it's rejected",
                             "Optional with line comments: a reason for the whole hunk",
                         ),
-                        (_, false) => ("COMMENT", "Sent to the agent"),
-                        (_, true) => ("COMMENT ON THE HUNK", "Optional: about the whole hunk"),
+                        (_, false) => ("Comment on the hunk", "A comment, sent to the agent"),
+                        (_, true) => ("Comment on the hunk", "Optional: about the whole hunk"),
                     };
-                    caption(ui, title, col);
-                    let r = note_box(ui, &mut h.note, hint, col, 2);
+                    let r = beside_icon(ui, icon, col, tip, |ui| {
+                        note_box(ui, &mut h.note, hint, col, 2)
+                    });
                     if c.focus_note {
                         r.request_focus();
                     }
                 }
                 Decision::Edit => {
-                    caption(ui, "YOUR REPLACEMENT FOR THE + LINES", col);
-                    let r = edit_box(ui, h, c);
-                    if c.focus_edit {
-                        r.request_focus();
-                    }
-                    ui.add_space(2.0);
-                    note_box(ui, &mut h.note, "Optional: why you changed it", col, 1);
+                    let tip = "Your replacement for the + lines";
+                    beside_icon(ui, icon, col, tip, |ui| {
+                        let r = edit_box(ui, h, c);
+                        if c.focus_edit {
+                            r.request_focus();
+                        }
+                        ui.add_space(2.0);
+                        note_box(ui, &mut h.note, "Optional: why you changed it", col, 1);
+                    });
                 }
                 Decision::Pending | Decision::Approve => {}
             }
@@ -349,13 +353,21 @@ fn comment_ui(ui: &mut egui::Ui, h: &mut Hunk, ci: usize, c: &HunkCtx) -> bool {
             ui.set_max_width(c.view_w - 28.0);
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.horizontal(|ui| {
-                caption(
-                    ui,
-                    &format!("COMMENT ON {}", label.to_uppercase()),
-                    pal::AMBER,
-                );
+                ui.spacing_mut().item_spacing.x = 6.0;
+                icons::label(ui, Icon::Bubble, pal::AMBER);
+                ui.label(RichText::new(&label).size(11.5).color(pal::AMBER))
+                    .on_hover_text(format!("Comment on {label}"));
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    delete = button(ui, "Delete", None, Look::Plain, false, true).clicked();
+                    delete = icon_button(
+                        ui,
+                        Icon::Trash,
+                        "Delete this comment",
+                        None,
+                        Look::Plain,
+                        false,
+                        true,
+                    )
+                    .clicked();
                 });
             });
             let r = note_box(

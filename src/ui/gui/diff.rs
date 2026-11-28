@@ -4,9 +4,10 @@
 
 use super::code::{gap_ui, max_chars};
 use super::hunk::{HunkCtx, hunk_ui, pinned_hunk_header, pinned_ui};
+use super::icons::{self, Icon};
 use super::theme::pal;
 use super::widgets::{
-    Look, button, caption, decision_button, note_box, pill, split_path, status_badge,
+    Look, beside_icon, decision_button, icon_button, icon_pill, note_box, split_path, status_badge,
 };
 use super::{App, Focus};
 use crate::model::{DLine, Decision, FileDiff};
@@ -249,53 +250,58 @@ fn file_header(
                     clicks.fold = Some(fi);
                 }
                 if let Some(from) = &f.old_path {
-                    ui.label(
-                        RichText::new(format!("renamed from {from}"))
-                            .size(12.0)
-                            .color(pal::DIM),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        icons::label(ui, Icon::From, pal::DIM);
+                        ui.label(RichText::new(from).size(12.0).color(pal::DIM));
+                    })
+                    .response
+                    .on_hover_text(format!("Renamed from {from}"));
                 }
                 if let Some(hl) = &f.hl {
                     ui.label(RichText::new(&hl.lang).size(11.5).color(pal::FAINT));
                 }
-                if let Some((text, col)) = file_state(f) {
-                    pill(ui, &text, col);
-                }
+                file_state(ui, f);
 
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    for (d, label, on, tip) in [
+                    for (d, on, tip, key) in [
                         (
                             Decision::Comment,
-                            "Comment",
                             f.file_mode == Some(Decision::Comment),
-                            "A note about the whole file (Shift+C)",
+                            "Comment on the whole file",
+                            "Shift+C",
                         ),
                         (
                             Decision::Reject,
-                            "Reject file",
                             f.all(Decision::Reject),
-                            "Reject every hunk with one reason (Shift+R)",
+                            "Reject the whole file, with one reason",
+                            "Shift+R",
                         ),
                         (
                             Decision::Approve,
-                            "Approve file",
                             f.all(Decision::Approve),
-                            "Approve every hunk (Shift+A)",
+                            "Approve the whole file",
+                            "Shift+A",
                         ),
                     ] {
-                        if decision_button(ui, label, None, d, on, true, card.selected)
-                            .on_hover_text(tip)
-                            .clicked()
+                        if decision_button(ui, tip, Some(key), d, on, true, card.selected).clicked()
                         {
                             clicks.file_action = Some((fi, d));
                         }
                     }
                     ui.add_space(8.0);
                     let is_full = card.gaps.is_some();
-                    if button(ui, "Full file", Some("f"), Look::Toggle, is_full, !f.binary)
-                        .on_hover_text("Show the whole file around the hunks")
-                        .clicked()
+                    if icon_button(
+                        ui,
+                        Icon::Expand,
+                        "Show the whole file around the hunks",
+                        Some("f"),
+                        Look::Toggle,
+                        is_full,
+                        !f.binary,
+                    )
+                    .clicked()
                     {
                         clicks.full = Some(fi);
                     }
@@ -349,30 +355,32 @@ fn path_job(path: &str) -> LayoutJob {
 }
 
 /// How far the file's review is, for the header pill. `None` for a file with no hunks.
-fn file_state(f: &FileDiff) -> Option<(String, Color32)> {
+fn file_state(ui: &mut egui::Ui, f: &FileDiff) {
     let total = f.hunks.len();
     if total == 0 {
-        return None;
+        return;
     }
     let count = |p: fn(Decision) -> bool| f.hunks.iter().filter(|h| p(h.decision)).count();
     let decided = count(|d| d != Decision::Pending);
     let rejected = count(|d| d == Decision::Reject);
-    Some(if f.all(Decision::Approve) {
-        ("Approved".to_owned(), pal::GREEN)
+    if f.all(Decision::Approve) {
+        icon_pill(ui, Some(Icon::Check), "", pal::GREEN).on_hover_text("Every hunk approved");
     } else if f.all(Decision::Reject) {
-        ("Rejected".to_owned(), pal::RED)
-    } else if decided == total && rejected > 0 {
-        (format!("Reviewed · {rejected} rejected"), pal::RED)
-    } else if decided == total {
-        ("Reviewed".to_owned(), pal::BLUE)
-    } else if rejected > 0 {
-        (
-            format!("{decided}/{total} decided · {rejected} rejected"),
-            pal::RED,
-        )
+        icon_pill(ui, Some(Icon::Cross), "", pal::RED).on_hover_text("Every hunk rejected");
     } else {
-        (format!("{decided}/{total} decided"), pal::DIM)
-    })
+        let (text, col) = if decided == total {
+            (String::new(), pal::BLUE)
+        } else {
+            (format!("{decided}/{total}"), pal::DIM)
+        };
+        let icon = (decided == total).then_some(Icon::Check);
+        icon_pill(ui, icon, &text, col)
+            .on_hover_text(format!("{decided} of {total} hunks decided"));
+        if rejected > 0 {
+            icon_pill(ui, Some(Icon::Cross), &rejected.to_string(), pal::RED)
+                .on_hover_text(format!("{rejected} rejected"));
+        }
+    }
 }
 
 /// The reason for rejecting the whole file, or a comment on it. Returns its rect.
@@ -383,14 +391,18 @@ fn file_note(
     focus: bool,
     view: &View,
 ) -> Rect {
-    let (title, hint, col) = if mode == Decision::Reject {
+    let (tip, hint, col) = if mode == Decision::Reject {
         (
-            "WHY THE WHOLE FILE IS REJECTED",
-            "Sent to the agent once, for all its hunks",
+            "Why the whole file is rejected",
+            "Why is the whole file rejected? Sent to the agent once, for all its hunks",
             pal::RED,
         )
     } else {
-        ("COMMENT ON THE FILE", "Sent to the agent", pal::AMBER)
+        (
+            "Comment on the whole file",
+            "A comment on the whole file, sent to the agent",
+            pal::AMBER,
+        )
     };
     egui::Frame::new()
         .inner_margin(egui::Margin {
@@ -402,8 +414,9 @@ fn file_note(
         .show(ui, |ui| {
             ui.set_max_width(view.view_w - 26.0);
             ui.spacing_mut().item_spacing.y = 4.0;
-            caption(ui, title, col);
-            let r = note_box(ui, &mut f.note, hint, col, 2);
+            let r = beside_icon(ui, icons::decision(mode), col, tip, |ui| {
+                note_box(ui, &mut f.note, hint, col, 2)
+            });
             if focus {
                 r.request_focus();
             }
@@ -476,13 +489,13 @@ fn file_hunks(
             _ => None,
         };
         let label = if total > 1 {
-            format!("Hunk {}/{total}", hi + 1)
+            Some(format!("{}/{total}", hi + 1))
         } else {
-            "Hunk".to_owned()
+            None
         };
         let ctx = HunkCtx {
             selected,
-            label: Some(label),
+            label,
             focus_note: selected && std::mem::take(&mut focus.hunk_note),
             focus_edit: selected && std::mem::take(&mut focus.hunk_edit),
             gap: false,

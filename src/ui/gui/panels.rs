@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The panels around the diff: the top bar, the bottom bar and the file list.
 
+use super::icons::{self, Icon};
 use super::theme::{decision_color, pal, tint};
 use super::widgets::{
-    Look, button, caption, key_hint, note_box, paint_badge, pill, progress_bar, split_path,
+    Look, icon_button, icon_pill, icon_text_button, key_hint, note_box, paint_badge, progress_bar,
+    split_path,
 };
 use super::{App, chrome};
 use crate::model::{Decision, FileDiff};
@@ -34,41 +36,46 @@ impl App {
             ui.label(RichText::new(name).size(14.0).strong().color(pal::TEXT));
             if self.r.source.read_only() {
                 ui.add_space(4.0);
-                pill(
-                    ui,
-                    &format!("{} · feedback only", self.r.source.describe()),
-                    pal::ACCENT,
-                )
-                .on_hover_text("Nothing in git changes when you submit; hunks can't be edited");
+                icon_pill(ui, Some(Icon::Eye), &self.r.source.describe(), pal::ACCENT)
+                    .on_hover_text(
+                        "Feedback only: nothing in git changes when you submit, \
+                         and hunks can't be edited",
+                    );
             }
             ui.add_space(18.0);
             progress_bar(ui, &c, 120.0);
             ui.add_space(2.0);
             let decided = c.total - c.pending;
             ui.label(
-                RichText::new(format!("{decided} of {} decided", c.total))
+                RichText::new(format!("{decided}/{}", c.total))
                     .size(12.5)
                     .color(pal::DIM),
             )
             .on_hover_text(format!(
-                "{} approved · {} rejected · {} edited · {} commented · {} pending",
-                c.approve, c.reject, c.edit, c.comment, c.pending
+                "{decided} of {} hunks decided\n\
+                 {} approved · {} rejected · {} edited · {} commented · {} pending",
+                c.total, c.approve, c.reject, c.edit, c.comment, c.pending
             ));
             if let Some(reg) = REG.get() {
                 if !reg.warnings.is_empty() {
                     ui.add_space(6.0);
-                    pill(
+                    icon_pill(
                         ui,
-                        &format!("{} highlight warning(s)", reg.warnings.len()),
+                        Some(Icon::Warning),
+                        &reg.warnings.len().to_string(),
                         pal::AMBER,
                     )
-                    .on_hover_text(reg.warnings.join("\n"));
+                    .on_hover_text(format!(
+                        "Syntax highlighting warnings:\n{}",
+                        reg.warnings.join("\n")
+                    ));
                 }
             }
             if let Some(s) = &self.r.session {
                 ui.add_space(6.0);
-                pill(ui, &format!("session {s}"), pal::ACCENT)
-                    .on_hover_text("Your feedback goes back to this agent session");
+                let short: String = s.chars().take(8).collect();
+                icon_pill(ui, Some(Icon::Link), &short, pal::ACCENT)
+                    .on_hover_text(format!("Your feedback goes back to agent session {s}"));
             }
 
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -76,18 +83,30 @@ impl App {
                     ui.scope(chrome::window_buttons);
                     ui.add_space(10.0);
                 }
-                let label = match (self.mode, will_send) {
-                    (Mode::Hook, true) => "Send feedback",
-                    (Mode::Hook, false) => "Let agent finish",
-                    (Mode::Session, true) => "Send to agent",
-                    (Mode::Session, false) | (Mode::Manual, _) => "Submit",
+                let (icon, label, tip) = match (self.mode, will_send) {
+                    (Mode::Hook, true) => (Icon::Send, "Send", "Send your feedback to the agent"),
+                    (Mode::Hook, false) => (
+                        Icon::Check,
+                        "Done",
+                        "Nothing to send: let the agent finish its turn",
+                    ),
+                    (Mode::Session, true) => {
+                        (Icon::Send, "Send", "Send your feedback to the agent")
+                    }
+                    (Mode::Session, false) | (Mode::Manual, _) => {
+                        (Icon::Check, "Submit", "Apply your decisions")
+                    }
                 };
-                if button(ui, label, Some("Ctrl+Enter"), Look::Primary, true, true).clicked() {
+                if icon_text_button(ui, icon, label, Look::Primary, true, true)
+                    .on_hover_text(format!("{tip}  (Ctrl+Enter)"))
+                    .clicked()
+                {
                     self.submit(ui.ctx());
                 }
-                if button(
+                if icon_button(
                     ui,
-                    "Approve all pending",
+                    Icon::CheckAll,
+                    "Approve every pending hunk",
                     None,
                     Look::Plain,
                     false,
@@ -99,29 +118,43 @@ impl App {
                 }
                 ui.add_space(10.0);
                 if self.r.agent_message.is_some()
-                    && button(
+                    && icon_button(
                         ui,
-                        "Agent's message",
+                        Icon::Message,
+                        "What the agent said at the end of its turn",
                         Some("t"),
                         Look::Toggle,
                         self.show_agent,
                         true,
                     )
-                    .on_hover_text("What the agent said at the end of its turn")
                     .clicked()
                 {
                     self.show_agent = !self.show_agent;
                 }
-                if button(ui, "Split", Some("s"), Look::Toggle, self.r.split, true)
-                    .on_hover_text("Old and new side by side")
-                    .clicked()
+                if icon_button(
+                    ui,
+                    Icon::Split,
+                    "Old and new side by side",
+                    Some("s"),
+                    Look::Toggle,
+                    self.r.split,
+                    true,
+                )
+                .clicked()
                 {
                     self.r.toggle_split();
                 }
                 ui.add_space(10.0);
-                if button(ui, "Skip", None, Look::Plain, false, true)
-                    .on_hover_text("Close without changing anything, and forget this review")
-                    .clicked()
+                if icon_button(
+                    ui,
+                    Icon::Skip,
+                    "Skip: close without changing anything, and forget this review",
+                    None,
+                    Look::Plain,
+                    false,
+                    true,
+                )
+                .clicked()
                 {
                     self.drafts.discard();
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -138,7 +171,8 @@ impl App {
             let mut dismiss = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(n).color(pal::AMBER));
-                dismiss = button(ui, "Dismiss", None, Look::Plain, false, true).clicked();
+                dismiss = icon_button(ui, Icon::Cross, "Dismiss", None, Look::Plain, false, true)
+                    .clicked();
             });
             if dismiss {
                 self.notice = None;
@@ -149,24 +183,28 @@ impl App {
             let what = self.r.files[l.fi].hunks[l.hi].lines_label(a, b);
             let (mut comment, mut done) = (false, false);
             ui.horizontal(|ui| {
-                let mut label = what.clone();
-                if let Some(c) = label.get_mut(..1) {
-                    c.make_ascii_uppercase();
-                }
-                pill(ui, &format!("Picked: {label}"), pal::ACCENT);
-                comment = button(
+                icon_pill(ui, Some(Icon::Lines), &what, pal::ACCENT)
+                    .on_hover_text("Picked lines: j k move, J K or Shift+click extend");
+                comment = icon_button(
                     ui,
-                    "Comment",
+                    Icon::Bubble,
+                    "Comment on these lines",
                     Some("c"),
                     Look::Tinted(pal::AMBER),
                     false,
                     true,
                 )
                 .clicked();
-                done = button(ui, "Done", Some("Esc"), Look::Plain, false, true).clicked();
-                key_hint(ui, "j k", "move");
-                key_hint(ui, "J K", "extend");
-                key_hint(ui, "Shift+click", "extend");
+                done = icon_button(
+                    ui,
+                    Icon::Cross,
+                    "Stop picking lines",
+                    Some("Esc"),
+                    Look::Plain,
+                    false,
+                    true,
+                )
+                .clicked();
             });
             if comment {
                 let e = self.r.comment_lines();
@@ -175,42 +213,34 @@ impl App {
                 self.r.lines = None;
             }
         }
-        note_box(
-            ui,
-            &mut self.r.general,
-            "General feedback for the agent (optional)",
-            pal::BORDER_HI,
-            2,
-        );
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
-            key_hint(ui, "j k", "move");
-            key_hint(ui, "a r e c", "approve · reject · edit · comment");
-            key_hint(ui, "A R C", "whole file");
-            key_hint(ui, "x", "clear");
-            key_hint(ui, "v", "lines");
-            key_hint(ui, "n", "next pending");
-            key_hint(ui, "[ ]", "files");
-            key_hint(ui, "f", "full file");
-            key_hint(ui, "s", "split");
-            key_hint(ui, "Space", "fold");
-            if self.r.agent_message.is_some() {
-                key_hint(ui, "t", "agent");
-            }
-            key_hint(ui, "Esc", "leave text box");
-            key_hint(ui, "Ctrl+Enter", "submit");
+        let agent = self.r.agent_message.is_some();
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
+                icons::label(ui, Icon::Keyboard, pal::FAINT).on_hover_ui(|ui| shortcuts(ui, agent));
+                note_box(
+                    ui,
+                    &mut self.r.general,
+                    "General feedback for the agent (optional)",
+                    pal::BORDER_HI,
+                    2,
+                );
+            });
         });
     }
 
     pub(super) fn file_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            caption(ui, "FILES", pal::FAINT);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_space(4.0);
+            icons::label(ui, Icon::Files, pal::FAINT);
             ui.label(
                 RichText::new(self.r.files.len().to_string())
                     .size(11.0)
                     .color(pal::FAINT),
             );
-        });
+        })
+        .response
+        .on_hover_text("Changed files");
         ui.add_space(2.0);
         let mut jump = None;
         egui::ScrollArea::vertical()
@@ -240,6 +270,32 @@ impl App {
         if let Some(fi) = jump {
             self.r.select_file(fi);
         }
+    }
+}
+
+/// Every keyboard shortcut, for the keyboard icon's tooltip.
+fn shortcuts(ui: &mut egui::Ui, agent: bool) {
+    ui.set_max_width(260.0);
+    let rows: &[(&str, &str)] = &[
+        ("j k", "move"),
+        ("a r e c", "approve · reject · edit · comment"),
+        ("A R C", "whole file"),
+        ("x", "clear"),
+        ("v", "pick lines"),
+        ("n", "next pending"),
+        ("[ ]", "files"),
+        ("f", "full file"),
+        ("s", "split"),
+        ("Space", "fold"),
+        ("t", "agent's message"),
+        ("Esc", "leave text box"),
+        ("Ctrl+Enter", "submit"),
+    ];
+    for (keys, what) in rows {
+        if *keys == "t" && !agent {
+            continue;
+        }
+        ui.horizontal(|ui| key_hint(ui, keys, what));
     }
 }
 
