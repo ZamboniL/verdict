@@ -11,8 +11,7 @@ use super::{App, chrome};
 use crate::model::{Decision, FileDiff};
 use crate::ui::{Mode, REG};
 use eframe::egui::{
-    self, Align, Color32, FontId, Rect, RichText, Sense, Stroke, TextFormat, pos2, text::LayoutJob,
-    vec2,
+    self, Align, Color32, FontId, Rect, RichText, Sense, TextFormat, pos2, text::LayoutJob, vec2,
 };
 
 impl App {
@@ -362,11 +361,11 @@ fn paint_pips(p: &egui::Painter, f: &FileDiff, right: f32, y: f32) -> f32 {
     if n <= 8 {
         for (i, h) in f.hunks.iter().enumerate() {
             let c = pos2(right - pips_w + 4.0 + i as f32 * 9.0, y);
-            if h.decision == Decision::Pending {
-                p.circle_stroke(c, 3.0, Stroke::new(1.2, pal::FAINT));
-            } else {
-                p.circle_filled(c, 3.5, decision_color(h.decision));
-            }
+            let col = match h.decision {
+                Decision::Pending => pal::FAINT,
+                d => decision_color(d),
+            };
+            p.circle_filled(c, 3.5, col);
         }
     } else {
         let decided = f
