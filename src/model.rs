@@ -2,7 +2,7 @@
 //! Diff model: files -> hunks, per-hunk decisions, applying them to index/worktree,
 //! and rendering the feedback message for the agent.
 
-use crate::git::{self, Status};
+use crate::git::{self, Mode, Status};
 use similar::{
     Algorithm, DiffOp, DiffTag, capture_diff_slices, capture_diff_slices_deadline, group_diff_ops,
 };
@@ -112,7 +112,7 @@ pub struct FileDiff {
     /// Where the file was before it was renamed (`status` is `Renamed`).
     pub old_path: Option<String>,
     pub status: Status,
-    pub mode: String,
+    pub mode: Mode,
     pub binary: bool,
     pub new_exists: bool,
     pub old_bytes: Vec<u8>,
@@ -208,55 +208,74 @@ pub fn load_only(
     repo: &Path,
     only: Option<&std::collections::HashSet<String>>,
 ) -> git::Result<Vec<FileDiff>> {
-    let mut files = Vec::new();
-    for e in git::changed(repo)? {
-        if only.is_some_and(|o| !o.contains(&e.path)) {
-            continue;
-        }
-        if let Some(f) = load_file(repo, e)? {
-            files.push(f);
-        }
-    }
-    let mut files = pair_renames(files);
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
-}
+    let entries: Vec<git::Entry> = git::changed(repo)?
+        .into_iter()
+        .filter(|e| only.is_none_or(|o| o.contains(&e.path)))
+        .collect();
+    let tracked: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.status != Status::Untracked)
+        .map(|e| e.path.as_str())
+        .collect();
+    let index = git::items(repo, "", &tracked)?;
 
-fn load_file(repo: &Path, e: git::Entry) -> git::Result<Option<FileDiff>> {
-    let full = repo.join(&e.path);
-    let meta = std::fs::symlink_metadata(&full).ok();
-    if let Some(m) = &meta {
-        if m.file_type().is_symlink() || m.is_dir() {
-            return Ok(None); // symlinks & submodules: out of scope
+    // Each file's mode and the blob of its index version, then every blob at once.
+    let mut wanted = Vec::new();
+    for e in entries {
+        let meta = std::fs::symlink_metadata(repo.join(&e.path)).ok();
+        if meta
+            .as_ref()
+            .is_some_and(|m| m.file_type().is_symlink() || m.is_dir())
+        {
+            continue; // symlinks & submodules: out of scope
         }
-    }
-    let mode = match e.status {
-        Status::Untracked => {
+        let (mode, oid) = if e.status == Status::Untracked {
             use std::os::unix::fs::PermissionsExt;
             let exec = meta
                 .as_ref()
                 .is_some_and(|m| m.permissions().mode() & 0o111 != 0);
-            if exec { "100755" } else { "100644" }.to_owned()
+            let mode = if exec {
+                Mode::Executable
+            } else {
+                Mode::Regular
+            };
+            (mode, None)
+        } else {
+            let Some(item) = index.get(&e.path) else {
+                return Err(git::Error::Invalid(format!("{}: not in the index", e.path)));
+            };
+            (item.mode, Some(item.oid.as_str()))
+        };
+        if mode.is_file() {
+            wanted.push((e, mode, oid, meta.is_some()));
         }
-        _ => git::index_mode(repo, &e.path).unwrap_or_else(|| "100644".into()),
-    };
-    if mode == "120000" || mode == "160000" {
-        return Ok(None);
     }
-    let old_bytes = match e.status {
-        Status::Untracked => Vec::new(),
-        _ => git::index_blob(repo, &e.path)?,
-    };
-    let new_exists = meta.is_some();
-    let new_bytes = if new_exists {
-        std::fs::read(&full).map_err(|err| format!("{}: {err}", e.path))?
-    } else {
-        Vec::new()
-    };
+    let oids: Vec<&str> = wanted.iter().filter_map(|w| w.2).collect();
+    let mut blobs = git::blobs(repo, &oids)?.into_iter();
 
-    Ok(build(
-        e.path, None, e.status, mode, old_bytes, new_bytes, new_exists,
-    ))
+    let mut files = Vec::new();
+    for (e, mode, oid, exists) in wanted {
+        let old = match oid {
+            Some(_) => blobs.next().unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let new = if exists {
+            Some(std::fs::read(repo.join(&e.path)).map_err(git::Error::io(&e.path))?)
+        } else {
+            None
+        };
+        files.extend(build(Versions {
+            path: e.path,
+            old_path: None,
+            status: e.status,
+            mode,
+            old,
+            new,
+        }));
+    }
+    let mut files = pair_renames(files);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
 }
 
 /// Load the files changed in `source`, restricted to `only` when given.
@@ -269,33 +288,69 @@ pub fn load_source(
         return load_only(repo, only);
     }
     let (old_rev, new_rev) = source.revs();
+    let entries: Vec<git::Entry> = git::changed_in(repo, source)?
+        .into_iter()
+        .filter(|e| only.is_none_or(|o| o.contains(&e.path)))
+        .collect();
+    let paths = |skip: Status| -> Vec<&str> {
+        entries
+            .iter()
+            .filter(|e| e.status != skip)
+            .map(|e| e.path.as_str())
+            .collect()
+    };
+    // Added files have no old side and deleted files no new side.
+    let old_items = git::items(repo, old_rev, &paths(Status::Untracked))?;
+    let new_items = git::items(repo, new_rev, &paths(Status::Deleted))?;
+    let missing = |rev: &str, p: &str| {
+        let rev = if rev.is_empty() { "the index" } else { rev };
+        git::Error::Invalid(format!("{p}: not in {rev}"))
+    };
+
+    let mut wanted = Vec::new();
+    for e in entries {
+        let old = match e.status {
+            Status::Untracked => None,
+            _ => Some(
+                old_items
+                    .get(&e.path)
+                    .ok_or_else(|| missing(old_rev, &e.path))?,
+            ),
+        };
+        let new = match e.status {
+            Status::Deleted => None,
+            _ => Some(
+                new_items
+                    .get(&e.path)
+                    .ok_or_else(|| missing(new_rev, &e.path))?,
+            ),
+        };
+        // The mode of the side the file is on now.
+        let mode = new.or(old).map_or(Mode::Regular, |i| i.mode);
+        if mode.is_file() {
+            wanted.push((e, mode, old, new));
+        }
+    }
+    let oids: Vec<&str> = wanted
+        .iter()
+        .flat_map(|w| [w.2, w.3])
+        .flatten()
+        .map(|i| i.oid.as_str())
+        .collect();
+    let mut blobs = git::blobs(repo, &oids)?.into_iter();
+
     let mut files = Vec::new();
-    for e in git::changed_in(repo, source)? {
-        if only.is_some_and(|o| !o.contains(&e.path)) {
-            continue;
-        }
-        let side = if e.status == Status::Deleted {
-            old_rev
-        } else {
-            new_rev
-        };
-        let mode = git::mode_at(repo, side, &e.path).unwrap_or_else(|| "100644".into());
-        if mode == "120000" || mode == "160000" {
-            continue; // symlinks & submodules: out of scope
-        }
-        let old_bytes = match e.status {
-            Status::Untracked => Vec::new(),
-            _ => git::blob(repo, old_rev, &e.path)?,
-        };
-        let new_exists = e.status != Status::Deleted;
-        let new_bytes = if new_exists {
-            git::blob(repo, new_rev, &e.path)?
-        } else {
-            Vec::new()
-        };
-        files.extend(build(
-            e.path, None, e.status, mode, old_bytes, new_bytes, new_exists,
-        ));
+    for (e, mode, old, new) in wanted {
+        let old = old.map(|_| blobs.next().unwrap_or_default());
+        let new = new.map(|_| blobs.next().unwrap_or_default());
+        files.extend(build(Versions {
+            path: e.path,
+            old_path: None,
+            status: e.status,
+            mode,
+            old: old.unwrap_or_default(),
+            new,
+        }));
     }
     let mut files = pair_renames(files);
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -330,19 +385,17 @@ fn pair_renames(files: Vec<FileDiff>) -> Vec<FileDiff> {
     let mut slots: Vec<Option<FileDiff>> = files.into_iter().map(Some).collect();
     let mut out = Vec::new();
     for (_, d, a) in cands {
-        if slots[d].is_none() || slots[a].is_none() {
+        let (Some(del), Some(add)) = (slots[d].take(), slots[a].take()) else {
             continue;
-        }
-        let (del, add) = (slots[d].take().unwrap(), slots[a].take().unwrap());
-        out.extend(build(
-            add.path,
-            Some(del.path),
-            Status::Renamed,
-            add.mode,
-            del.old_bytes,
-            add.new_bytes,
-            true,
-        ));
+        };
+        out.extend(build(Versions {
+            path: add.path,
+            old_path: Some(del.path),
+            status: Status::Renamed,
+            mode: add.mode,
+            old: del.old_bytes,
+            new: Some(add.new_bytes),
+        }));
     }
     out.extend(slots.into_iter().flatten());
     out
@@ -372,17 +425,32 @@ fn similarity(del: &FileDiff, add: &FileDiff) -> f32 {
     2.0 * same as f32 / total
 }
 
-/// A file's diff from its two versions. `None` when they don't differ (unless it was
-/// renamed: the move alone is something to review).
-fn build(
+/// The two versions of a file, to diff.
+struct Versions {
     path: String,
+    /// Where it was before a rename.
     old_path: Option<String>,
     status: Status,
-    mode: String,
-    old_bytes: Vec<u8>,
-    new_bytes: Vec<u8>,
-    new_exists: bool,
-) -> Option<FileDiff> {
+    mode: Mode,
+    /// Empty for an added file.
+    old: Vec<u8>,
+    /// `None` when the file was deleted.
+    new: Option<Vec<u8>>,
+}
+
+/// A file's diff from its two versions. `None` when they don't differ (unless it was
+/// renamed: the move alone is something to review).
+fn build(v: Versions) -> Option<FileDiff> {
+    let Versions {
+        path,
+        old_path,
+        status,
+        mode,
+        old: old_bytes,
+        new,
+    } = v;
+    let new_exists = new.is_some();
+    let new_bytes = new.unwrap_or_default();
     let binary = is_binary(&old_bytes) || is_binary(&new_bytes);
     let mut f = FileDiff {
         path,
@@ -424,8 +492,10 @@ fn build(
         });
         return Some(f);
     }
-    f.old = split_lines(std::str::from_utf8(&f.old_bytes).unwrap());
-    f.new = split_lines(std::str::from_utf8(&f.new_bytes).unwrap());
+    // Not binary, so both sides are UTF-8.
+    let text = |b: &[u8]| split_lines(std::str::from_utf8(b).unwrap_or_default());
+    f.old = text(&f.old_bytes);
+    f.new = text(&f.new_bytes);
     f.hunks = compute_hunks(&f.old, &f.new);
     if f.hunks.is_empty() {
         let from = f.old_path.as_ref()?;
@@ -570,7 +640,7 @@ pub fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>)
     let offsets = |t: &[&str]| -> Vec<usize> {
         let mut v = vec![0];
         for tok in t {
-            v.push(v.last().unwrap() + tok.len());
+            v.push(v[v.len() - 1] + tok.len());
         }
         v
     };
@@ -718,96 +788,172 @@ fn edited_lines(f: &FileDiff, h: &Hunk) -> Vec<String> {
     split_lines(&text)
 }
 
+/// A change to one file in the working tree.
+enum FsOp<'a> {
+    /// Write `bytes` to `path`, creating its directory if needed; make it executable
+    /// when `exec`.
+    Write {
+        path: &'a str,
+        bytes: Vec<u8>,
+        exec: bool,
+    },
+    Remove(&'a str),
+}
+
+impl FsOp<'_> {
+    fn run(&self, repo: &Path) -> git::Result<()> {
+        match self {
+            FsOp::Write { path, bytes, exec } => {
+                let full = repo.join(path);
+                if let Some(dir) = full.parent() {
+                    std::fs::create_dir_all(dir).map_err(git::Error::io(path))?;
+                }
+                std::fs::write(&full, bytes).map_err(git::Error::io(path))?;
+                if *exec {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755));
+                }
+                Ok(())
+            }
+            FsOp::Remove(path) => {
+                std::fs::remove_file(repo.join(path)).map_err(git::Error::io(path))
+            }
+        }
+    }
+}
+
+/// What submitting does to one file.
+#[derive(Default)]
+struct Plan<'a> {
+    index: Vec<git::IndexOp>,
+    worktree: Vec<FsOp<'a>>,
+}
+
+impl<'a> Plan<'a> {
+    /// Put `content` in the index as `f`. Staging a renamed file stages the move: the
+    /// old path leaves the index.
+    fn stage(&mut self, repo: &Path, f: &FileDiff, content: &[u8]) -> git::Result<()> {
+        let oid = git::hash_object(repo, content)?;
+        self.index.push(git::IndexOp::Set {
+            path: f.path.clone(),
+            mode: f.mode,
+            oid,
+        });
+        if let Some(from) = &f.old_path {
+            self.index.push(git::IndexOp::Remove { path: from.clone() });
+        }
+        Ok(())
+    }
+
+    fn unstage(&mut self, path: &str) {
+        self.index.push(git::IndexOp::Remove {
+            path: path.to_owned(),
+        });
+    }
+
+    /// Write `bytes` as `f` in the working tree. A deleted executable comes back
+    /// executable.
+    fn write(&mut self, f: &'a FileDiff, bytes: Vec<u8>) {
+        self.worktree.push(FsOp::Write {
+            path: &f.path,
+            bytes,
+            exec: !f.new_exists && f.mode == Mode::Executable,
+        });
+    }
+
+    /// A rename rejected as a whole: the file goes back to its old path.
+    fn unrename(&mut self, repo: &Path, f: &'a FileDiff, from: &'a str) {
+        self.worktree.push(FsOp::Write {
+            path: from,
+            bytes: f.old_bytes.clone(),
+            exec: git::index_mode(repo, from) == Some(Mode::Executable),
+        });
+        self.worktree.push(FsOp::Remove(&f.path));
+    }
+}
+
+/// Work out what submitting does to `f`. Nothing anyone can see changes yet.
+fn plan<'a>(repo: &Path, f: &'a FileDiff) -> git::Result<Plan<'a>> {
+    let mut p = Plan::default();
+    if f.binary {
+        match f.hunks[0].decision {
+            Decision::Approve if f.new_exists => p.stage(repo, f, &f.new_bytes)?,
+            Decision::Approve => p.unstage(&f.path),
+            Decision::Reject => match &f.old_path {
+                Some(from) => p.unrename(repo, f, from),
+                None if f.status == Status::Untracked => p.worktree.push(FsOp::Remove(&f.path)),
+                None => p.write(f, f.old_bytes.clone()),
+            },
+            _ => {}
+        }
+        return Ok(p);
+    }
+
+    let any = |want: [Decision; 2]| f.hunks.iter().any(|h| want.contains(&h.decision));
+    if any([Decision::Approve, Decision::Edit]) {
+        if !f.new_exists && f.all(Decision::Approve) {
+            p.unstage(&f.path);
+        } else {
+            let idx = mix(f, |h| match h.decision {
+                Decision::Approve => Pick::New,
+                Decision::Edit => Pick::Custom(edited_lines(f, h)),
+                _ => Pick::Old,
+            });
+            p.stage(repo, f, idx.concat().as_bytes())?;
+        }
+    }
+    if any([Decision::Reject, Decision::Edit]) {
+        let all_rejected = f.all(Decision::Reject);
+        match &f.old_path {
+            Some(from) if all_rejected => p.unrename(repo, f, from),
+            _ => {
+                let wt = mix(f, |h| match h.decision {
+                    Decision::Reject => Pick::Old,
+                    Decision::Edit => Pick::Custom(edited_lines(f, h)),
+                    _ => Pick::New,
+                });
+                if f.status == Status::Untracked && wt.is_empty() && all_rejected {
+                    p.worktree.push(FsOp::Remove(&f.path));
+                } else {
+                    p.write(f, wt.concat().into_bytes());
+                }
+            }
+        }
+    }
+    Ok(p)
+}
+
 /// Apply all decisions: approved/edited hunks go into the index, rejected hunks are
 /// reverted in the working tree, edited hunks are written to the working tree.
+///
+/// Every change is worked out before any is made. The index is then updated in one
+/// step that either fully happens or doesn't, and only then is the working tree
+/// written. If a write fails, the error says which files were done.
 pub fn apply(repo: &Path, files: &[FileDiff]) -> git::Result<()> {
-    for f in files {
-        let full = repo.join(&f.path);
-        let write = |bytes: &[u8]| -> git::Result<()> {
-            std::fs::write(&full, bytes).map_err(|e| format!("{}: {e}", f.path))?;
-            if !f.new_exists && f.mode == "100755" {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755));
-            }
-            Ok(())
-        };
-        let remove = || std::fs::remove_file(&full).map_err(|e| format!("{}: {e}", f.path));
-        // Staging a renamed file stages the move: the old path leaves the index.
-        let stage = |content: &[u8]| -> git::Result<()> {
-            git::stage(repo, &f.path, content, &f.mode)?;
-            match &f.old_path {
-                Some(from) => git::unstage_remove(repo, from),
-                None => Ok(()),
-            }
-        };
-        // A rename rejected as a whole is moved back.
-        let unrename = |from: &str| -> git::Result<()> {
-            let dst = repo.join(from);
-            let err = |e: std::io::Error| format!("{from}: {e}");
-            if let Some(dir) = dst.parent() {
-                std::fs::create_dir_all(dir).map_err(err)?;
-            }
-            std::fs::write(&dst, &f.old_bytes).map_err(err)?;
-            if git::index_mode(repo, from).as_deref() == Some("100755") {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
-            }
-            remove()
-        };
-
-        if f.binary {
-            match f.hunks[0].decision {
-                Decision::Approve => {
-                    if f.new_exists {
-                        stage(&f.new_bytes)?
-                    } else {
-                        git::unstage_remove(repo, &f.path)?
-                    }
-                }
-                Decision::Reject => match &f.old_path {
-                    Some(from) => unrename(from)?,
-                    None if f.status == Status::Untracked => remove()?,
-                    None => write(&f.old_bytes)?,
-                },
-                _ => {}
-            }
-            continue;
-        }
-
-        let d = |h: &Hunk| h.decision;
-        if f.hunks
-            .iter()
-            .any(|h| matches!(d(h), Decision::Approve | Decision::Edit))
-        {
-            if !f.new_exists && f.hunks.iter().all(|h| d(h) == Decision::Approve) {
-                git::unstage_remove(repo, &f.path)?;
-            } else {
-                let idx = mix(f, |h| match h.decision {
-                    Decision::Approve => Pick::New,
-                    Decision::Edit => Pick::Custom(edited_lines(f, h)),
-                    _ => Pick::Old,
+    let mut plans = files
+        .iter()
+        .map(|f| plan(repo, f))
+        .collect::<git::Result<Vec<_>>>()?;
+    let index: Vec<git::IndexOp> = plans
+        .iter_mut()
+        .flat_map(|p| std::mem::take(&mut p.index))
+        .collect();
+    git::update_index(repo, &index)?;
+    let touched: Vec<(&FileDiff, &Plan)> = files
+        .iter()
+        .zip(&plans)
+        .filter(|(_, p)| !p.worktree.is_empty())
+        .collect();
+    for (i, (_, p)) in touched.iter().enumerate() {
+        for op in &p.worktree {
+            if let Err(err) = op.run(repo) {
+                let names =
+                    |s: &[(&FileDiff, &Plan)]| s.iter().map(|(f, _)| f.path.clone()).collect();
+                return Err(git::Error::Partial {
+                    err: Box::new(err),
+                    done: names(&touched[..i]),
+                    left: names(&touched[i..]),
                 });
-                stage(idx.concat().as_bytes())?;
-            }
-        }
-        if f.hunks
-            .iter()
-            .any(|h| matches!(d(h), Decision::Reject | Decision::Edit))
-        {
-            let all_rejected = f.hunks.iter().all(|h| d(h) == Decision::Reject);
-            if let (Some(from), true) = (&f.old_path, all_rejected) {
-                unrename(from)?;
-                continue;
-            }
-            let wt = mix(f, |h| match h.decision {
-                Decision::Reject => Pick::Old,
-                Decision::Edit => Pick::Custom(edited_lines(f, h)),
-                _ => Pick::New,
-            });
-            if f.status == Status::Untracked && wt.is_empty() && all_rejected {
-                remove()?;
-            } else {
-                write(wt.concat().as_bytes())?;
             }
         }
     }
@@ -882,8 +1028,35 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
         return None;
     }
     let read_only = source.read_only();
+    let mut s = intro(&c, source);
+    if !general.is_empty() {
+        let _ = writeln!(s, "## General feedback\n\n{general}\n");
+    }
+    let sections: &[(&str, Decision)] = if read_only {
+        &[
+            ("Rejected", Decision::Reject),
+            ("Comments", Decision::Comment),
+        ]
+    } else {
+        &[
+            ("Rejected (reverted in the working tree)", Decision::Reject),
+            ("Edited by the reviewer (already applied)", Decision::Edit),
+            (
+                "Comments (kept changes are still unstaged; adjust as asked)",
+                Decision::Comment,
+            ),
+        ]
+    };
+    for &(title, want) in sections {
+        section(&mut s, files, title, want, read_only);
+    }
+    Some(s)
+}
+
+/// The title, what the reviewer's decisions did, and the counts.
+fn intro(c: &Counts, source: &git::Source) -> String {
     let mut s = String::new();
-    if read_only {
+    if source.read_only() {
         let _ = writeln!(s, "# Code review of {}\n", source.describe());
         s.push_str(
             "The reviewer went through this diff hunk by hunk. Nothing was changed in git: \
@@ -908,164 +1081,175 @@ pub fn feedback(files: &[FileDiff], general: &str, source: &git::Source) -> Opti
             c.approve, c.reject, c.edit, c.comment, c.pending
         );
     }
-    if !general.is_empty() {
-        let _ = writeln!(s, "## General feedback\n\n{general}\n");
+    s
+}
+
+/// The hunks of `f` that go in the `want` section, with their indices. Line comments
+/// on a hunk that's approved or undecided go with the comments.
+fn section_hunks(f: &FileDiff, want: Decision) -> Vec<(usize, &Hunk)> {
+    f.hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| {
+            h.decision == want
+                || (want == Decision::Comment
+                    && matches!(h.decision, Decision::Approve | Decision::Pending)
+                    && h.written_comments().next().is_some())
+        })
+        .collect()
+}
+
+/// The whole-file note of `f` if it goes in the `want` section: with the rejection
+/// if the file was rejected as a whole, otherwise under comments.
+fn section_note(f: &FileDiff, want: Decision) -> Option<&str> {
+    let in_reject = f.file_mode == Some(Decision::Reject)
+        && f.hunks.iter().any(|h| h.decision == Decision::Reject);
+    match want {
+        Decision::Reject if in_reject => f.file_note(),
+        Decision::Comment if !in_reject => f.file_note(),
+        _ => None,
     }
+}
 
-    // Where a whole-file note goes: with the rejection if the file was rejected as a
-    // whole, otherwise under comments.
-    let note_in_reject = |f: &FileDiff| {
-        f.file_mode == Some(Decision::Reject)
-            && f.hunks.iter().any(|h| h.decision == Decision::Reject)
-    };
-
-    let section = |s: &mut String, title: &str, want: Decision| {
-        let mut first = true;
-        for f in files {
-            let hunks: Vec<(usize, &Hunk)> = f
-                .hunks
-                .iter()
-                .enumerate()
-                .filter(|(_, h)| {
-                    h.decision == want
-                        // Line comments on a hunk that's approved or undecided go
-                        // with the comments.
-                        || (want == Decision::Comment
-                            && matches!(h.decision, Decision::Approve | Decision::Pending)
-                            && h.written_comments().next().is_some())
-                })
-                .collect();
-            let note_here = match want {
-                Decision::Reject => note_in_reject(f).then(|| f.file_note()).flatten(),
-                Decision::Comment => (!note_in_reject(f)).then(|| f.file_note()).flatten(),
-                _ => None,
-            };
-            if hunks.is_empty() && note_here.is_none() {
-                continue;
-            }
-            if first {
-                let _ = writeln!(s, "## {title}\n");
-                first = false;
-            }
-            let total = f.hunks.len();
-            let whole = !hunks.is_empty() && hunks.len() == total;
-            let scope = if whole && total > 1 {
-                format!(" (whole file, all {total} hunks)")
-            } else if whole {
-                " (whole file)".to_owned()
-            } else if !hunks.is_empty() {
-                format!(" ({} of {total} hunks)", hunks.len())
-            } else {
-                String::new()
-            };
-            match &f.old_path {
-                Some(from) => {
-                    let _ = writeln!(s, "### `{}` (renamed from `{from}`){scope}\n", f.path);
-                }
-                None => {
-                    let _ = writeln!(s, "### `{}`{scope}\n", f.path);
-                }
-            }
-            if want == Decision::Reject && !read_only && f.old_path.is_some() && whole {
-                let _ = writeln!(
-                    s,
-                    "The rename was reverted too: the file is back at its old path.\n"
-                );
-            }
-            if let Some(n) = note_here {
-                let label = if want == Decision::Reject {
-                    "Why the file was rejected"
-                } else {
-                    "About the whole file"
-                };
-                let _ = writeln!(s, "**{label}:** {n}\n");
-            }
-            for (i, h) in hunks {
-                let state = match (want, h.decision) {
-                    (Decision::Comment, Decision::Approve) if read_only => " (approved)",
-                    (Decision::Comment, Decision::Approve) => " (approved and staged)",
-                    (Decision::Comment, Decision::Pending) => " (not reviewed yet)",
-                    _ => "",
-                };
-                if total > 1 {
-                    let _ = writeln!(s, "Hunk {}/{total} {}{state}\n", i + 1, h.header);
-                } else {
-                    let _ = writeln!(s, "{}{state}\n", h.header);
-                }
-                let diff = hunk_diff(h);
-                let fe = fence(&diff);
-                if want == Decision::Edit {
-                    let _ = writeln!(s, "Your version:\n{fe}diff\n{diff}{fe}\n");
-                    let body = if h.edit_buf.is_empty() {
-                        "(removed)\n".to_owned()
-                    } else {
-                        h.edit_buf.clone()
-                    };
-                    let body = if body.ends_with('\n') {
-                        body
-                    } else {
-                        body + "\n"
-                    };
-                    let fe2 = fence(&body);
-                    let _ = writeln!(
-                        s,
-                        "Replaced by the reviewer with:\n{fe2}{}\n{body}{fe2}\n",
-                        f.ext()
-                    );
-                } else {
-                    let _ = writeln!(s, "{fe}diff\n{diff}{fe}\n");
-                }
-                let note = h.note.trim();
-                let label = match want {
-                    Decision::Reject => "Why it was rejected",
-                    Decision::Edit => "Reviewer's note",
-                    _ => "Comment",
-                };
-                if !note.is_empty() {
-                    let _ = writeln!(s, "**{label}:** {note}\n");
-                } else if want == Decision::Reject
-                    && note_here.is_none()
-                    && h.written_comments().next().is_none()
-                {
-                    let _ = writeln!(
-                        s,
-                        "**{label}:** (no reason given; reconsider the approach)\n"
-                    );
-                }
-                for c in h.written_comments() {
-                    let quote = lines_diff(&h.lines[c.first..=c.last.min(h.lines.len() - 1)]);
-                    let fe = fence(&quote);
-                    let _ = writeln!(
-                        s,
-                        "**On {}:** {}\n{fe}diff\n{quote}{fe}\n",
-                        h.lines_label(c.first, c.last),
-                        c.text.trim()
-                    );
-                }
-            }
+/// One section ("Rejected", "Comments", ...): every file with something in it.
+fn section(s: &mut String, files: &[FileDiff], title: &str, want: Decision, read_only: bool) {
+    let mut first = true;
+    for f in files {
+        let hunks = section_hunks(f, want);
+        let note = section_note(f, want);
+        if hunks.is_empty() && note.is_none() {
+            continue;
         }
-    };
-    if read_only {
-        section(&mut s, "Rejected", Decision::Reject);
-        section(&mut s, "Comments", Decision::Comment);
+        if first {
+            let _ = writeln!(s, "## {title}\n");
+            first = false;
+        }
+        file_entry(s, f, &hunks, note, want, read_only);
+    }
+}
+
+/// " (whole file)", " (2 of 3 hunks)", ...: how much of a file a section covers.
+fn scope_label(shown: usize, total: usize) -> String {
+    if shown == 0 {
+        String::new()
+    } else if shown < total {
+        format!(" ({shown} of {total} hunks)")
+    } else if total > 1 {
+        format!(" (whole file, all {total} hunks)")
     } else {
-        section(
-            &mut s,
-            "Rejected (reverted in the working tree)",
-            Decision::Reject,
-        );
-        section(
-            &mut s,
-            "Edited by the reviewer (already applied)",
-            Decision::Edit,
-        );
-        section(
-            &mut s,
-            "Comments (kept changes are still unstaged; adjust as asked)",
-            Decision::Comment,
+        " (whole file)".to_owned()
+    }
+}
+
+/// One file in a section: its heading, its whole-file note, then its hunks.
+fn file_entry(
+    s: &mut String,
+    f: &FileDiff,
+    hunks: &[(usize, &Hunk)],
+    note: Option<&str>,
+    want: Decision,
+    read_only: bool,
+) {
+    let total = f.hunks.len();
+    let whole = !hunks.is_empty() && hunks.len() == total;
+    let scope = scope_label(hunks.len(), total);
+    match &f.old_path {
+        Some(from) => {
+            let _ = writeln!(s, "### `{}` (renamed from `{from}`){scope}\n", f.path);
+        }
+        None => {
+            let _ = writeln!(s, "### `{}`{scope}\n", f.path);
+        }
+    }
+    if want == Decision::Reject && !read_only && f.old_path.is_some() && whole {
+        let _ = writeln!(
+            s,
+            "The rename was reverted too: the file is back at its old path.\n"
         );
     }
-    Some(s)
+    if let Some(n) = note {
+        let label = if want == Decision::Reject {
+            "Why the file was rejected"
+        } else {
+            "About the whole file"
+        };
+        let _ = writeln!(s, "**{label}:** {n}\n");
+    }
+    for &(i, h) in hunks {
+        hunk_entry(s, f, i, h, note.is_some(), want, read_only);
+    }
+}
+
+/// One hunk in a section: its header, its diff (and the reviewer's version for an
+/// edit), its note and its line comments. `file_note` says the file's own note
+/// already explains it.
+fn hunk_entry(
+    s: &mut String,
+    f: &FileDiff,
+    i: usize,
+    h: &Hunk,
+    file_note: bool,
+    want: Decision,
+    read_only: bool,
+) {
+    let total = f.hunks.len();
+    let state = match (want, h.decision) {
+        (Decision::Comment, Decision::Approve) if read_only => " (approved)",
+        (Decision::Comment, Decision::Approve) => " (approved and staged)",
+        (Decision::Comment, Decision::Pending) => " (not reviewed yet)",
+        _ => "",
+    };
+    if total > 1 {
+        let _ = writeln!(s, "Hunk {}/{total} {}{state}\n", i + 1, h.header);
+    } else {
+        let _ = writeln!(s, "{}{state}\n", h.header);
+    }
+    let diff = hunk_diff(h);
+    let fe = fence(&diff);
+    if want == Decision::Edit {
+        let _ = writeln!(s, "Your version:\n{fe}diff\n{diff}{fe}\n");
+        let mut body = if h.edit_buf.is_empty() {
+            "(removed)\n".to_owned()
+        } else {
+            h.edit_buf.clone()
+        };
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        let fe2 = fence(&body);
+        let _ = writeln!(
+            s,
+            "Replaced by the reviewer with:\n{fe2}{}\n{body}{fe2}\n",
+            f.ext()
+        );
+    } else {
+        let _ = writeln!(s, "{fe}diff\n{diff}{fe}\n");
+    }
+    let note = h.note.trim();
+    let label = match want {
+        Decision::Reject => "Why it was rejected",
+        Decision::Edit => "Reviewer's note",
+        _ => "Comment",
+    };
+    if !note.is_empty() {
+        let _ = writeln!(s, "**{label}:** {note}\n");
+    } else if want == Decision::Reject && !file_note && h.written_comments().next().is_none() {
+        let _ = writeln!(
+            s,
+            "**{label}:** (no reason given; reconsider the approach)\n"
+        );
+    }
+    for c in h.written_comments() {
+        let last = c.last.min(h.lines.len().saturating_sub(1));
+        let quote = lines_diff(h.lines.get(c.first..=last).unwrap_or_default());
+        let fe = fence(&quote);
+        let _ = writeln!(
+            s,
+            "**On {}:** {}\n{fe}diff\n{quote}{fe}\n",
+            h.lines_label(c.first, c.last),
+            c.text.trim()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1080,7 +1264,7 @@ mod tests {
             path: "t.txt".into(),
             old_path: None,
             status: Status::Modified,
-            mode: "100644".into(),
+            mode: Mode::Regular,
             binary: false,
             new_exists: true,
             old_bytes: old.into(),
@@ -1500,5 +1684,137 @@ mod tests {
             text: "  ".into(),
         });
         assert!(feedback(std::slice::from_ref(&g), "", &git::Source::Worktree).is_none());
+    }
+
+    /// Enough files that git's output fills a pipe before it has read all its
+    /// input, and more than one batch of pathspecs.
+    #[test]
+    fn many_files_load_and_apply() {
+        let dir = testutil::repo("many");
+        // Long paths, so the paths sent to git outgrow a pipe too (64 KiB on Linux).
+        let sub = "a_long_directory_name_so_that_every_path_sent_to_git_is_long";
+        std::fs::create_dir(dir.join(sub)).unwrap();
+        let name = |i: usize| format!("{sub}/file_number_{i:04}.txt");
+        let n = 3_000;
+        for i in 0..n {
+            std::fs::write(dir.join(name(i)), "old\n").unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+        for i in 0..n {
+            std::fs::write(dir.join(name(i)), format!("new {i}\n")).unwrap();
+        }
+        assert_eq!(crate::session::snapshot(&dir).unwrap().len(), n);
+        let mut files = load(&dir).unwrap();
+        assert_eq!(files.len(), n);
+        assert_eq!(files[7].old, ["old\n"]);
+        assert_eq!(files[7].new, ["new 7\n"]);
+        for f in &mut files {
+            f.hunks[0].decision = Decision::Approve;
+        }
+        apply(&dir, &files).unwrap();
+        assert!(load(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When a working-tree write fails, the index changes are all in and the error
+    /// names the files done and not done.
+    #[test]
+    fn apply_reports_where_it_stopped() {
+        let dir = testutil::repo("partial");
+        for p in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(dir.join(p), "one\n").unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+        for p in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(p), "two\n").unwrap();
+        }
+        std::fs::remove_file(dir.join("d.txt")).unwrap();
+        let mut files = load(&dir).unwrap();
+        for f in &mut files[..3] {
+            f.hunks[0].decision = Decision::Reject;
+        }
+        files[3].hunks[0].decision = Decision::Approve; // stage the deletion
+        // b.txt can't be written back once it's a directory.
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        std::fs::create_dir(dir.join("b.txt")).unwrap();
+
+        let err = apply(&dir, &files).unwrap_err();
+        let git::Error::Partial { done, left, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(done, &["a.txt"]);
+        assert_eq!(left, &["b.txt", "c.txt"]);
+        assert!(err.to_string().contains("b.txt"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(dir.join("c.txt")).unwrap(), "two\n");
+        assert!(git::index_blob(&dir, "d.txt").is_err(), "deletion staged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modes_parse() {
+        assert_eq!(Mode::parse("100644"), Some(Mode::Regular));
+        assert_eq!(Mode::parse("100664"), Some(Mode::Regular));
+        assert_eq!(Mode::parse("100755"), Some(Mode::Executable));
+        assert_eq!(Mode::parse("120000"), Some(Mode::Symlink));
+        assert_eq!(Mode::parse("160000"), Some(Mode::Gitlink));
+        assert_eq!(Mode::parse("040000"), None);
+        assert!(Mode::Executable.is_file() && !Mode::Symlink.is_file());
+    }
+
+    /// Every kind of feedback at once: a hunk rejected with a reason and one without,
+    /// an edit, a rename rejected as a whole, a whole-file comment, and line comments
+    /// on approved and undecided hunks.
+    fn feedback_fixture() -> Vec<FileDiff> {
+        let mut a = file(OLD, NEW);
+        a.path = "src/a.rs".into();
+        a.hunks[0].decision = Decision::Reject;
+        a.hunks[0].note = "keep b lowercase".into();
+        a.hunks[1].decision = Decision::Edit;
+        a.hunks[1].edit_buf = "j\nk\nl2\nm\nn".into();
+        a.hunks[1].note = "use l2".into();
+
+        let mut b = file("one\ntwo\n", "one\n2\n");
+        b.path = "new/b.txt".into();
+        b.old_path = Some("old/b.txt".into());
+        b.status = Status::Renamed;
+        b.hunks[0].decision = Decision::Reject;
+        b.file_mode = Some(Decision::Reject);
+        b.note = "don't move it".into();
+
+        let mut c = file(OLD, NEW);
+        c.path = "c.md".into();
+        c.hunks[0].decision = Decision::Approve;
+        c.hunks[0].comments.push(LineComment {
+            first: 1,
+            last: 2,
+            text: "why ```this```?".into(),
+        });
+        c.hunks[1].comments.push(LineComment {
+            first: 0,
+            last: 0,
+            text: "check".into(),
+        });
+        c.file_mode = Some(Decision::Comment);
+        c.note = "add docs".into();
+
+        let mut d = file("x\n", "y\n");
+        d.path = "d.txt".into();
+        d.hunks[0].decision = Decision::Reject;
+        vec![a, b, c, d]
+    }
+
+    /// The whole message, word for word, for changes applied to git and for a
+    /// read-only review. To update after an intended change, write the new output
+    /// over the files in src/testdata/ and check the diff.
+    #[test]
+    fn feedback_snapshots() {
+        let files = feedback_fixture();
+        let w = feedback(&files, " be careful ", &git::Source::Worktree).unwrap();
+        assert_eq!(w, include_str!("testdata/feedback_worktree.md"));
+        let r = feedback(&files, "", &git::Source::Staged).unwrap();
+        assert_eq!(r, include_str!("testdata/feedback_read_only.md"));
     }
 }

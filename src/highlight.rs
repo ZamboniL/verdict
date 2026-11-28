@@ -216,7 +216,9 @@ fn discover(
     let mut files = Vec::new();
     walk(&dir.join("extensions"), &mut files);
     for manifest in files.into_iter().filter(|p| name_of(p) == "package.json") {
-        let base = manifest.parent().unwrap().to_path_buf();
+        let Some(base) = manifest.parent().map(Path::to_path_buf) else {
+            continue;
+        };
         let pkg = match tm::read_doc(&manifest) {
             Ok(v) => v,
             Err(e) => {
@@ -489,7 +491,10 @@ impl Registry {
             .map(|k| (k.clone(), user_themes.contains(k)))
             .collect();
         themes.sort_by_key(|t| t.0.to_lowercase());
-        let theme = set.themes.remove(&theme_name).unwrap();
+        let theme = set
+            .themes
+            .remove(&theme_name)
+            .expect("theme_name is picked from set.themes above");
 
         Registry {
             ss: cached.ss,

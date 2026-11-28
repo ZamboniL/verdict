@@ -24,6 +24,11 @@ use std::time::Duration;
 use theme::pal;
 use tty::{Tty, install_panic_hook, run_editor};
 
+/// `n` as a terminal coordinate, held at `u16::MAX` instead of wrapping around.
+fn cells(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     Hunk(usize, usize),

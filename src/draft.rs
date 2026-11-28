@@ -341,7 +341,7 @@ mod tests {
             path: path.into(),
             old_path: None,
             status: Status::Modified,
-            mode: "100644".into(),
+            mode: crate::git::Mode::Regular,
             binary: false,
             new_exists: true,
             old_bytes: old.into(),

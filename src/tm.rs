@@ -122,7 +122,7 @@ fn s(x: impl Into<String>) -> Y {
 
 fn emit(y: &Y, out: &mut String) {
     match y {
-        Y::S(x) => out.push_str(&serde_json::to_string(x).unwrap()),
+        Y::S(x) => out.push_str(&serde_json::to_string(x).expect("a string always serializes")),
         Y::I(i) => out.push_str(&i.to_string()),
         Y::B(b) => out.push_str(if *b { "true" } else { "false" }),
         Y::L(v) => {
@@ -260,9 +260,10 @@ impl Conv<'_> {
                         chars.next();
                         probe.push_str("(?:)");
                     }
-                    Some(_) => {
+                    Some(&d) => {
+                        chars.next();
                         probe.push(c);
-                        probe.push(chars.next().unwrap());
+                        probe.push(d);
                     }
                     None => probe.push(c),
                 }

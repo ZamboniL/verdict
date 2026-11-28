@@ -42,7 +42,7 @@ impl App {
         let buf = f.buffer_mut();
         for (i, r) in rows.iter().skip(self.scroll).take(h).enumerate() {
             let rect = Rect {
-                y: area.y + i as u16,
+                y: area.y.saturating_add(super::cells(i)),
                 height: 1,
                 ..area
             };
@@ -53,7 +53,7 @@ impl App {
         for (i, at) in sticky(&rows, self.scroll, h).into_iter().enumerate() {
             let r = &rows[at];
             let rect = Rect {
-                y: area.y + i as u16,
+                y: area.y.saturating_add(super::cells(i)),
                 height: 1,
                 ..area
             };

@@ -33,17 +33,26 @@ pub fn snapshot(repo: &Path) -> git::Result<Snapshot> {
             present.push(e.path);
         }
     }
-    if !present.is_empty() {
-        let input = present.join("\n") + "\n";
+    // `--stdin-paths` reads one path per line and unquotes a leading '"', so the few
+    // paths it would misread are hashed one at a time.
+    let (odd, plain): (Vec<String>, Vec<String>) = present
+        .into_iter()
+        .partition(|p| p.contains(['\n', '\r']) || p.starts_with('"'));
+    if !plain.is_empty() {
+        let input = plain.join("\n") + "\n";
         let out = git::run_stdin(
             repo,
             &["hash-object", "--no-filters", "--stdin-paths"],
             input.as_bytes(),
         )?;
         let shas = String::from_utf8_lossy(&out);
-        for (p, sha) in present.into_iter().zip(shas.lines()) {
+        for (p, sha) in plain.into_iter().zip(shas.lines()) {
             snap.insert(p, sha.to_owned());
         }
+    }
+    for p in odd {
+        let out = git::run(repo, &["hash-object", "--no-filters", "--", &p])?;
+        snap.insert(p, String::from_utf8_lossy(&out).trim().to_owned());
     }
     Ok(snap)
 }
@@ -316,6 +325,22 @@ fn is_prompt(v: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::testutil::{self, git};
+
+    /// Paths `--stdin-paths` can't take one per line still get their own hash.
+    #[test]
+    fn snapshot_hashes_odd_paths() {
+        let dir = testutil::repo("odd");
+        let names = ["plain.txt", "two\nlines.txt", "\"quoted\".txt", "cr\r.txt"];
+        for (i, n) in names.iter().enumerate() {
+            std::fs::write(dir.join(n), format!("{i}\n")).unwrap();
+        }
+        let snap = snapshot(&dir).unwrap();
+        for (i, n) in names.iter().enumerate() {
+            let expect = crate::git::hash_object(&dir, format!("{i}\n").as_bytes()).unwrap();
+            assert_eq!(snap.get(*n), Some(&expect), "{n:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn last_reply_is_the_text_after_the_last_tool_call() {

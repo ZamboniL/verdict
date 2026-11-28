@@ -3,7 +3,7 @@
 //! and the help and agent-message boxes over the review.
 
 use super::theme::{fg, pal, status_color};
-use super::{App, Input, State, Target};
+use super::{App, Input, State, Target, cells};
 use crate::model::Decision;
 use crate::ui::{Mode, REG};
 use ratatui::Frame;
@@ -28,8 +28,11 @@ impl App {
             .iter()
             .map(|f| f.path.chars().count())
             .max()
-            .unwrap_or(0) as u16;
-        let list_w = (longest + 10).min(area.width / 3).min(48);
+            .unwrap_or(0);
+        let list_w = cells(longest)
+            .saturating_add(10)
+            .min(area.width / 3)
+            .min(48);
         if area.width >= 90 && self.r.files.len() > 1 {
             let [list, main] =
                 Layout::horizontal([Constraint::Length(list_w), Constraint::Min(1)]).areas(mid);
@@ -144,7 +147,7 @@ impl App {
             let prog = format!(" {decided}/{total}");
             let room = (inner.width as usize).saturating_sub(3 + prog.chars().count());
             let rect = Rect {
-                y: inner.y + row as u16,
+                y: inner.y.saturating_add(cells(row)),
                 height: 1,
                 ..inner
             };
@@ -202,7 +205,7 @@ impl App {
     /// The text box being typed in, after its prompt, with the cursor in it.
     fn text_box(&self, f: &mut Frame, area: Rect, inp: &Input) {
         let prompt = self.prompt(inp.target);
-        let pw = prompt.chars().count() as u16 + 1;
+        let pw = cells(prompt.chars().count()).saturating_add(1);
         // Newlines show as ↵; scroll sideways to keep the cursor in view.
         let shown: Vec<char> = inp
             .buf
@@ -223,7 +226,10 @@ impl App {
             area,
         );
         f.set_cursor_position(Position {
-            x: area.x + pw + (inp.cur - start) as u16,
+            x: area
+                .x
+                .saturating_add(pw)
+                .saturating_add(cells(inp.cur - start)),
             y: area.y,
         });
     }
@@ -350,7 +356,7 @@ fn agent_message(f: &mut Frame, area: Rect, msg: &str, scroll: &mut u16) {
     // Keep the last screenful reachable, and no further. (Borders and padding take 4
     // columns and 2 rows.)
     let wrapped = para.line_count(w.saturating_sub(4).max(1));
-    let max = wrapped.saturating_sub(h.saturating_sub(2) as usize) as u16;
+    let max = cells(wrapped.saturating_sub(usize::from(h.saturating_sub(2))));
     *scroll = (*scroll).min(max);
     let more = if max > 0 { " · j/k scroll" } else { "" };
     f.render_widget(Clear, rect);
@@ -414,7 +420,7 @@ fn help(f: &mut Frame, area: Rect) {
         })
         .collect();
     let w = 72.min(area.width);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let h = cells(lines.len()).saturating_add(2).min(area.height);
     let rect = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
