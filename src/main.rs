@@ -272,7 +272,10 @@ fn manual(args: &[String], staged: bool, flag: Option<Choice>, sess: SessionArg)
     match outcome {
         Ok(Some(ui::Outcome { message: Some(m) })) => {
             if let Some(p) = git::git_dir(&repo) {
-                let _ = std::fs::write(p.join("verdict-feedback.md"), &m);
+                let saved = p.join("verdict-feedback.md");
+                if let Err(e) = std::fs::write(&saved, &m) {
+                    eprintln!("verdict: could not save {}: {e}", saved.display());
+                }
             }
             match &picked {
                 Some((id, owner, _)) => {

@@ -84,6 +84,23 @@ pub struct Hunk {
 }
 
 impl Hunk {
+    /// A hunk that stands for a change with no lines to show (a binary file, a move
+    /// without edits): one placeholder line with `text`, to approve or reject whole.
+    fn placeholder(header: &str, text: String) -> Hunk {
+        Hunk {
+            old: 0..0,
+            new: 0..0,
+            ctx_old: 0..0,
+            ctx_new: 0..0,
+            header: header.to_owned(),
+            lines: vec![DLine::new(Kind::Ctx, None, None, text)],
+            decision: Decision::Pending,
+            note: String::new(),
+            edit_buf: String::new(),
+            comments: Vec::new(),
+        }
+    }
+
     /// Line comments that have something written in them.
     pub fn written_comments(&self) -> impl Iterator<Item = &LineComment> {
         self.comments.iter().filter(|c| !c.text.trim().is_empty())
@@ -474,27 +491,14 @@ fn build(v: Versions) -> Option<FileDiff> {
         note: String::new(),
     };
     if binary {
-        f.hunks.push(Hunk {
-            old: 0..0,
-            new: 0..0,
-            ctx_old: 0..0,
-            ctx_new: 0..0,
-            header: "binary file".into(),
-            lines: vec![DLine::new(
-                Kind::Ctx,
-                None,
-                None,
-                format!(
-                    "binary content: {} bytes -> {} bytes",
-                    f.old_bytes.len(),
-                    f.new_bytes.len()
-                ),
-            )],
-            decision: Decision::Pending,
-            note: String::new(),
-            edit_buf: String::new(),
-            comments: Vec::new(),
-        });
+        f.hunks.push(Hunk::placeholder(
+            "binary file",
+            format!(
+                "binary content: {} bytes -> {} bytes",
+                f.old_bytes.len(),
+                f.new_bytes.len()
+            ),
+        ));
         return Some(f);
     }
     // Not binary, so both sides are UTF-8.
@@ -505,23 +509,10 @@ fn build(v: Versions) -> Option<FileDiff> {
     if f.hunks.is_empty() {
         let from = f.old_path.as_ref()?;
         // Moved without a change: one hunk stands for the move, to approve or reject.
-        f.hunks.push(Hunk {
-            old: 0..0,
-            new: 0..0,
-            ctx_old: 0..0,
-            ctx_new: 0..0,
-            header: "renamed, content unchanged".into(),
-            lines: vec![DLine::new(
-                Kind::Ctx,
-                None,
-                None,
-                format!("{from} -> {}", f.path),
-            )],
-            decision: Decision::Pending,
-            note: String::new(),
-            edit_buf: String::new(),
-            comments: Vec::new(),
-        });
+        f.hunks.push(Hunk::placeholder(
+            "renamed, content unchanged",
+            format!("{from} -> {}", f.path),
+        ));
     }
     Some(f)
 }
@@ -816,7 +807,8 @@ impl FsOp<'_> {
                 std::fs::write(&full, bytes).map_err(git::Error::io(path))?;
                 if *exec {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755));
+                    std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755))
+                        .map_err(git::Error::io(path))?;
                 }
                 Ok(())
             }

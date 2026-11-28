@@ -475,6 +475,22 @@ fn num(n: Option<usize>, digits: usize) -> String {
     format!("{n:>digits$}")
 }
 
+/// " · +5 −10" in green and red; a zero side is left out, and nothing when both are.
+pub(super) fn stat_spans(s: crate::model::LineStats) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    if s.added == 0 && s.removed == 0 {
+        return out;
+    }
+    out.push(Span::styled(" ·", fg(pal::DIM)));
+    if s.added > 0 {
+        out.push(Span::styled(format!(" +{}", s.added), fg(pal::GREEN)));
+    }
+    if s.removed > 0 {
+        out.push(Span::styled(format!(" −{}", s.removed), fg(pal::RED)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,20 +533,4 @@ mod tests {
         assert_eq!(top_for(&rows, 7, 20), 5);
         assert_eq!(top_for(&rows, 0, 20), 0);
     }
-}
-
-/// " · +5 −10" in green and red; a zero side is left out, and nothing when both are.
-pub(super) fn stat_spans(s: crate::model::LineStats) -> Vec<Span<'static>> {
-    let mut out = Vec::new();
-    if s.added == 0 && s.removed == 0 {
-        return out;
-    }
-    out.push(Span::styled(" ·", fg(pal::DIM)));
-    if s.added > 0 {
-        out.push(Span::styled(format!(" +{}", s.added), fg(pal::GREEN)));
-    }
-    if s.removed > 0 {
-        out.push(Span::styled(format!(" −{}", s.removed), fg(pal::RED)));
-    }
-    out
 }
