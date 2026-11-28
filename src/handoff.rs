@@ -67,6 +67,17 @@ impl Owner {
     pub fn last_reply(&self) -> Option<String> {
         session::last_reply(Path::new(self.transcript.as_deref()?))
     }
+
+    /// Record `files` as left in `snap`: the content each is in now, or forgotten
+    /// when it's no longer changed (fully approved, or reverted).
+    pub fn track<'a>(&mut self, files: impl IntoIterator<Item = &'a String>, snap: &Snapshot) {
+        for f in files {
+            match snap.get(f) {
+                Some(sha) => self.files.insert(f.clone(), sha.clone()),
+                None => self.files.remove(f),
+            };
+        }
+    }
 }
 
 fn verdict_dir(repo: &Path, sub: &str) -> Option<PathBuf> {
